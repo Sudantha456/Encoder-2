@@ -1,0 +1,60 @@
+name: Run Encoder Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
+
+permissions:
+  contents: write   # temp Releases (worker mailbox + parts)
+  actions: write    # workers dispatch කරන්න
+
+# එකවර bot instance දෙකක් run වෙන එක වළක්වනවා (එකම token එකට conflict වෙනවා)
+concurrency:
+  group: encoder-bot
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Fast Install FFmpeg
+        run: |
+          curl -fsSL --retry 3 https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+            | tar -xJ --strip-components=1 -C /tmp --wildcards '*/ffmpeg' '*/ffprobe'
+          sudo mv /tmp/ffmpeg /tmp/ffprobe /usr/local/bin/
+          ffmpeg -hide_banner -encoders | grep -E "libx264|libx265"
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Telegram Bot
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}
+          PROGRESS_UPDATE_INTERVAL: ${{ vars.PROGRESS_UPDATE_INTERVAL || '3' }}
+          QUEUE_MAX: ${{ vars.QUEUE_MAX || '20' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DIST_WORKERS: ${{ vars.DIST_WORKERS || '4' }}   # default workers (/settings වලින් වෙනස් කරන්න පුළුවන්: 2-10)
+          DOWNLOAD_DIR: ${{ runner.temp }}/downloads
+        run: |
+          python3 -u bot.py
+
+  # Workers මෙතන නෑ — bot එක queue එක පටන් ගන්නකොට (video download වෙන අතරේ) encode-worker.yml
+  # dispatch කරනවා. Queue ඉවර වුණාම workers තනියම exit.
