@@ -1,0 +1,66 @@
+name: Encode Worker
+
+# Bot එක (run-bot.yml) queue එක පටන් ගන්නකොට මේක workflow_dispatch කරනවා. අතින් run කරන්න එපා.
+# Runners ready වෙලා queue එක ඉවර වෙනකම් hold → job එන්නම encode → queue හිස් වුණාම exit.
+on:
+  workflow_dispatch:
+    inputs:
+      session:
+        description: 'Queue session id'
+        required: true
+      indices:
+        description: 'Worker indices (JSON list, e.g. [0,1,2,3])'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        env:
+          INDICES: ${{ inputs.indices }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          idx = sorted({int(i) for i in json.loads(os.environ["INDICES"])})[:10]
+          print("matrix=" + json.dumps({"part": idx}, separators=(",", ":")))
+          PY
+
+  worker:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      # worker.py + transcoder.py විතරයි ඕනේ → sparse checkout (වේගවත්), stdlib විතරක් නිසා setup-python ඕනේ නෑ
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            worker.py
+            transcoder.py
+          sparse-checkout-cone-mode: false
+
+      - name: Fast Install FFmpeg
+        run: |
+          curl -fsSL --retry 3 https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+            | tar -xJ --strip-components=1 -C /tmp --wildcards '*/ffmpeg' '*/ffprobe'
+          sudo mv /tmp/ffmpeg /tmp/ffprobe /usr/local/bin/
+
+      - name: Worker ${{ matrix.part }} (ready → hold → encode on demand)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          SESSION: ${{ inputs.session }}
+          PART: ${{ matrix.part }}
+          WORKER_MODE: serve
+        run: python3 -u worker.py
