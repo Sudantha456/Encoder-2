@@ -51,8 +51,8 @@ jobs:
 
       - name: Fast Install FFmpeg
         run: |
-          curl -fsSL --retry 3 https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
-            | tar -xJ --strip-components=1 -C /tmp --wildcards '*/ffmpeg' '*/ffprobe'
+          curl -sL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz \
+            | tar -xJ --strip-components=2 -C /tmp --wildcards '*/bin/ffmpeg' '*/bin/ffprobe'
           sudo mv /tmp/ffmpeg /tmp/ffprobe /usr/local/bin/
 
       - name: Worker ${{ matrix.part }} (ready → hold → encode on demand)
