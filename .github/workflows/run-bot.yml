@@ -31,8 +31,8 @@ jobs:
 
       - name: Fast Install FFmpeg
         run: |
-          curl -sL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz \
-            | tar -xJ --strip-components=2 -C /tmp --wildcards '*/bin/ffmpeg' '*/bin/ffprobe'
+          curl -fsSL --retry 3 https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+            | tar -xJ --strip-components=1 -C /tmp --wildcards '*/ffmpeg' '*/ffprobe'
           sudo mv /tmp/ffmpeg /tmp/ffprobe /usr/local/bin/
           ffmpeg -hide_banner -encoders | grep -E "libx264|libx265"
 
@@ -47,11 +47,18 @@ jobs:
           API_HASH: ${{ secrets.API_HASH }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}
+          # 👤 Userbot relay: USER_STRINGS = session1,session2,session3 (secret එකක් විදිහට)
+          USER_STRINGS: ${{ secrets.USER_STRINGS }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}          # -100xxxxxxxxxx  (හෝ invite link)
+          UB_MAX_FLOOD_WAIT: ${{ vars.UB_MAX_FLOOD_WAIT || '30' }}
           PROGRESS_UPDATE_INTERVAL: ${{ vars.PROGRESS_UPDATE_INTERVAL || '3' }}
           QUEUE_MAX: ${{ vars.QUEUE_MAX || '20' }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          DIST_WORKERS: ${{ vars.DIST_WORKERS || '4' }}   # default workers (/settings වලින් වෙනස් කරන්න පුළුවන්: 2-10)
+          DIST_WORKERS: ${{ vars.DIST_WORKERS || '4' }}   # default workers (/settings වලින් වෙනස් කරන්න පුළුවන්: 2-16)
           DOWNLOAD_DIR: ${{ runner.temp }}/downloads
         run: |
           python3 -u bot.py
+
+  # Workers මෙතන නෑ — bot එක queue එක පටන් ගන්නකොට (video download වෙන අතරේ) encode-worker.yml
+  # dispatch කරනවා. Queue ඉවර වුණාම workers තනියම exit.
