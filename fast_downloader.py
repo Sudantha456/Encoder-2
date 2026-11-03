@@ -11,7 +11,8 @@ import logging
 import asyncio
 import random
 import re
-from typing import Optional, Callable, Dict
+from dataclasses import dataclass
+from typing import Any, Optional, Callable, Dict, List
 
 from telethon import TelegramClient
 from telethon.tl.functions.upload import GetFileRequest
@@ -27,7 +28,24 @@ logger = logging.getLogger("FastDL")
 CHUNK_SIZE = 1024 * 1024                                   # 1MB (Telegram max)
 DL_CONNECTIONS = getattr(_cfg, "DL_CONNECTIONS", 6)
 DL_WORKERS_PER_CONN = getattr(_cfg, "DL_WORKERS_PER_CONN", 4)
+BACKOFF_SCALE = 1.0                                        # retry backoff (tests වලදී අඩු කරන්න)
 SMALL_FILE = 4 * 1024 * 1024                               # මීට කුඩා නම් native
+
+
+@dataclass
+class Lane:
+    """එක userbot එකක් = එක 'lane' එකක්. Lanes ඔක්කොම එකම file එකේ chunks බෙදාගෙන එකවර download කරනවා."""
+    name: str
+    client: Any
+    location: Any
+    dc_id: Optional[int]
+    connections: int
+    pool: Any = None
+    flood_until: float = 0.0
+    dead: bool = False
+    got: int = 0                                  # මේ lane එකෙන් download කළ bytes
+    bad: int = 0                                  # දිගටම ආපු errors (සාර්ථක chunk එකකින් reset)
+    on_flood: Optional[Callable[[int], None]] = None   # (seconds) → userbot pool එකට දැනුම් දෙන්න
 
 
 class FastDownloader:
@@ -194,6 +212,171 @@ class FastDownloader:
         finally:
             os.close(fd)
             await pool.close()
+
+
+    # ═════════ Multi-userbot download: chunks lanes අතර බෙදනවා ═════════
+    async def download_lanes(self, lanes: List[Lane], total_size: int, save_path: str, download_id: str,
+                             progress_callback: Optional[Callable] = None, max_retries: int = 8,
+                             max_flood_wait: float = 30.0, workers_per_conn: Optional[int] = None) -> str:
+        """
+        • Shared chunk queue — හැම lane එකක්ම queue එකෙන් chunk අරන් ඒ ඒ userbot ගේ connections හරහා ගන්නවා.
+        • Lane එකක FloodWait ආවොත්: chunk එක queue එකට ආපහු දානවා (වෙන lanes ගන්නවා), ඒ lane එක විතරක් නතර වෙලා ඉන්නවා.
+          FloodWait > max_flood_wait නම් ඒ lane එක මේ job එකට dead (userbot එක cooldown).
+        • Lane එකක් fail වුණාට අනිත් ඒවා ඉවර කරනවා. ඔක්කොම dead වුණොත් විතරයි error.
+        """
+        wpc = workers_per_conn or DL_WORKERS_PER_CONN
+        self._cancel_flags[download_id] = False
+        loop = asyncio.get_running_loop()
+
+        # 1) pools (පොඩි stagger එකක් — එකවර connect කරද්දී flood වෙන එක අඩු කරන්න)
+        async def start_lane(i: int, ln: Lane):
+            await asyncio.sleep(i * 0.25)
+            ln.pool = SenderPool(ln.client, ln.dc_id, ln.connections, use_main=False)
+            await asyncio.wait_for(ln.pool.start(), timeout=60.0)
+
+        res = await asyncio.gather(*[start_lane(i, ln) for i, ln in enumerate(lanes)], return_exceptions=True)
+        for ln, r in zip(lanes, res):
+            if isinstance(r, BaseException):
+                ln.dead = True
+                logger.warning(f"[{ln.name}] lane start failed: {r!r}")
+                if isinstance(r, FloodWaitError) and ln.on_flood:
+                    ln.on_flood(r.seconds)
+        live = [ln for ln in lanes if not ln.dead]
+        if not live:
+            for ln in lanes:
+                if ln.pool:
+                    await ln.pool.close()
+            raise RuntimeError("Userbot lane එකක්වත් start වුණේ නෑ")
+
+        flags = os.O_RDWR | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
+        fd = os.open(save_path, flags)
+        os.ftruncate(fd, total_size)
+        has_pwrite = hasattr(os, "pwrite")
+        write_lock = asyncio.Lock()
+
+        queue: asyncio.Queue = asyncio.Queue()
+        for off in range(0, total_size, CHUNK_SIZE):
+            queue.put_nowait(off)
+        remaining = [queue.qsize()]
+        fails: Dict[int, int] = {}
+        done_ev = asyncio.Event()
+        fatal: asyncio.Future = loop.create_future()
+        fatal.add_done_callback(lambda f: f.cancelled() or f.exception())   # 'never retrieved' warning වළක්වන්න
+        downloaded = [0]
+        last_update = [0.0]
+
+        def _fatal(exc: BaseException):
+            if not fatal.done():
+                fatal.set_exception(exc)
+
+        def _prog(n: int):
+            downloaded[0] += n
+            now = time.monotonic()
+            if now - last_update[0] >= PROGRESS_UPDATE_INTERVAL or downloaded[0] >= total_size:
+                last_update[0] = now
+                if progress_callback:
+                    asyncio.create_task(progress_callback(downloaded[0], total_size))
+
+        async def write_at(off: int, data: bytes):
+            if has_pwrite:
+                os.pwrite(fd, data, off)
+            else:
+                async with write_lock:
+                    os.lseek(fd, off, os.SEEK_SET)
+                    os.write(fd, data)
+
+        def lane_died(ln: Lane, why: str):
+            if not ln.dead:
+                ln.dead = True
+                logger.warning(f"[{ln.name}] lane dropped: {why}")
+            if all(l.dead for l in lanes):
+                _fatal(RuntimeError("සියලුම userbot lanes fail වුණා: " + why))
+
+        async def worker(ln: Lane, widx: int):
+            while not done_ev.is_set() and not ln.dead:
+                if self.is_cancelled(download_id):
+                    raise asyncio.CancelledError("Cancelled")
+                wait = ln.flood_until - time.monotonic()
+                if wait > 0:                                   # මේ lane එක FloodWait pause එකක — chunk අල්ලන්නේ නෑ
+                    await asyncio.sleep(min(wait, 1.0))
+                    continue
+                try:
+                    off = await asyncio.wait_for(queue.get(), 0.5)
+                except asyncio.TimeoutError:
+                    continue
+                try:
+                    req = GetFileRequest(location=ln.location, offset=off, limit=CHUNK_SIZE)
+                    r = await asyncio.wait_for(ln.pool.send(req, widx), timeout=60.0)
+                    data = getattr(r, "bytes", None)
+                    if data is None:
+                        raise RuntimeError(f"Unexpected response: {type(r).__name__}")
+                    await write_at(off, data)
+                    ln.got += len(data)
+                    ln.bad = 0
+                    _prog(len(data))
+                    remaining[0] -= 1
+                    if remaining[0] <= 0:
+                        done_ev.set()
+                except asyncio.CancelledError:
+                    queue.put_nowait(off)
+                    raise
+                except FloodWaitError as e:
+                    queue.put_nowait(off)                      # chunk එක වෙන lane එකකට
+                    if ln.on_flood:
+                        ln.on_flood(e.seconds)
+                    if e.seconds > max_flood_wait and any(l is not ln and not l.dead for l in lanes):
+                        lane_died(ln, f"FloodWait {e.seconds}s (> {max_flood_wait:.0f}s)")
+                        return
+                    ln.flood_until = max(ln.flood_until, time.monotonic() + e.seconds + random.uniform(0.5, 1.5))
+                    logger.warning(f"[{ln.name}] FloodWait {e.seconds}s — lane paused, others continue")
+                except Exception as e:
+                    queue.put_nowait(off)
+                    n = fails[off] = fails.get(off, 0) + 1
+                    msg = str(e).lower()
+                    if "wait of" in msg:
+                        m = re.search(r'wait of (\d+)', msg)
+                        ln.flood_until = max(ln.flood_until, time.monotonic() + (int(m.group(1)) if m else 12) + 1)
+                        continue
+                    if n >= max_retries:
+                        _fatal(RuntimeError(f"Chunk {off} {n}× fail ({e!r})"))
+                        return
+                    ln.bad += 1
+                    if ln.bad >= 5 and any(l is not ln and not l.dead for l in lanes):
+                        lane_died(ln, f"දිගටම errors ({ln.bad}): {e!r}")      # වෙන lanes ඉතුරුයි → මේක අයින්
+                        return
+                    await asyncio.sleep(min(2 ** (n - 1), 8) * BACKOFF_SCALE)
+
+        # workers lanes අතර interleave (A,B,C,A,B,C…) — නැත්නම් මුල් lane එකේ workers ම chunks ඔක්කොම අල්ලගන්නවා
+        per = {ln.name: max(1, len(ln.pool.senders)) * wpc for ln in live}
+        order = [(ln, i) for i in range(max(per.values())) for ln in live if i < per[ln.name]]
+        tasks = [asyncio.create_task(worker(ln, i)) for ln, i in order]
+        done_task = asyncio.create_task(done_ev.wait())
+        try:
+            while True:
+                finished, _ = await asyncio.wait({done_task, fatal}, return_when=asyncio.FIRST_COMPLETED, timeout=1.0)
+                if self.is_cancelled(download_id):
+                    raise asyncio.CancelledError("Cancelled")
+                if fatal.done():
+                    fatal.result()                              # raises
+                for t in tasks:
+                    if t.done() and not t.cancelled() and t.exception():
+                        raise t.exception()
+                if done_ev.is_set():
+                    break
+            if downloaded[0] < total_size:
+                raise RuntimeError(f"Incomplete download {downloaded[0]}/{total_size}")
+            logger.info("lane summary: " + ", ".join(f"{l.name}={l.got / 1048576:.0f}MB" for l in lanes))
+            return save_path
+        except BaseException:
+            self.force_delete_file(save_path)
+            raise
+        finally:
+            done_task.cancel()
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(done_task, *tasks, return_exceptions=True)
+            os.close(fd)
+            await asyncio.gather(*[ln.pool.close() for ln in lanes if ln.pool], return_exceptions=True)
 
     async def _download_native(self, client, message, save_path, download_id, progress_callback, max_retries=10):
         last_update = [0.0]
