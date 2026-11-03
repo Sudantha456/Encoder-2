@@ -28,7 +28,7 @@ jobs:
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os
-          idx = sorted({int(i) for i in json.loads(os.environ["INDICES"])})[:10]
+          idx = sorted({int(i) for i in json.loads(os.environ["INDICES"])})[:16]
           print("matrix=" + json.dumps({"part": idx}, separators=(",", ":")))
           PY
 
@@ -51,8 +51,8 @@ jobs:
 
       - name: Fast Install FFmpeg
         run: |
-          curl -sL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz \
-            | tar -xJ --strip-components=2 -C /tmp --wildcards '*/bin/ffmpeg' '*/bin/ffprobe'
+          curl -fsSL --retry 3 https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+            | tar -xJ --strip-components=1 -C /tmp --wildcards '*/ffmpeg' '*/ffprobe'
           sudo mv /tmp/ffmpeg /tmp/ffprobe /usr/local/bin/
 
       - name: Worker ${{ matrix.part }} (ready → hold → encode on demand)
