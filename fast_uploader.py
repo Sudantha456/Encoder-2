@@ -40,6 +40,14 @@ CHUNK_SIZE = 512 * 1024
 UL_CONNECTIONS = getattr(_cfg, "UL_CONNECTIONS", 6)
 UL_WORKERS_PER_CONN = getattr(_cfg, "UL_WORKERS_PER_CONN", 4)
 
+class LongFloodWait(Exception):
+    """FloodWait එක max_flood_wait ඉක්මවුවා — caller (userbot pool) වෙන userbot එකකට මාරු වෙන්න ඕනේ."""
+
+    def __init__(self, seconds: int):
+        super().__init__(f"FloodWait {seconds}s")
+        self.seconds = seconds
+
+
 class FastUploader:
 
     def __init__(self):
@@ -105,7 +113,9 @@ class FastUploader:
                 pass
         return None
 
-    async def _parallel_upload(self, client: TelegramClient, filepath: str, filename: str, file_size: int, upload_id: str, progress_cb: Callable):
+    async def _parallel_upload(self, client: TelegramClient, filepath: str, filename: str, file_size: int, upload_id: str,
+                               progress_cb: Callable, connections: Optional[int] = None,
+                               max_flood_wait: Optional[float] = None, use_main: bool = True):
         if file_size == 0:
             return filepath
 
@@ -114,13 +124,13 @@ class FastUploader:
         total_parts = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
 
         # Multi-connection pool (home DC). Fail වුණොත් main client එක විතරක්.
-        pool = SenderPool(client, None, UL_CONNECTIONS)
+        pool = SenderPool(client, None, connections or UL_CONNECTIONS, use_main=use_main)
         try:
             await asyncio.wait_for(pool.start(), timeout=60.0)
         except Exception as e:
             logger.warning(f"Pool start failed ({e!r}) — single connection")
             await pool.close()
-            pool = SenderPool(client, None, 1)
+            pool = SenderPool(client, None, 1, use_main=use_main)
             await pool.start()
 
         uploaded_bytes = 0
@@ -157,6 +167,8 @@ class FastUploader:
                         except asyncio.CancelledError:
                             raise
                         except FloodWaitError as e:
+                            if max_flood_wait is not None and e.seconds > max_flood_wait:
+                                raise LongFloodWait(e.seconds)
                             logger.warning(f"Upload FloodWait ({e.seconds}s)")
                             await asyncio.sleep(e.seconds + 1)
                         except asyncio.TimeoutError:
@@ -193,6 +205,10 @@ class FastUploader:
         filepath:          str,
         upload_id:         str,
         progress_callback: Optional[Callable] = None,
+        connections:       Optional[int] = None,
+        max_flood_wait:    Optional[float] = None,
+        use_main:          bool = True,
+        caption:           str = "",
     ):
         self._cancel_flags[upload_id] = False
 
@@ -241,6 +257,10 @@ class FastUploader:
                 thumb_path=thumb_path,
                 upload_id=upload_id,
                 progress_cb=_prog,
+                connections=connections,
+                max_flood_wait=max_flood_wait,
+                use_main=use_main,
+                caption=caption,
             )
             return msg
         finally:
@@ -264,9 +284,14 @@ class FastUploader:
         thumb_path: Optional[str],
         upload_id:  str,
         progress_cb: Callable,
+        connections: Optional[int] = None,
+        max_flood_wait: Optional[float] = None,
+        use_main: bool = True,
+        caption: str = "",
     ):
-        
-        uploaded_file = await self._parallel_upload(client, filepath, filename, file_size, upload_id, progress_cb)
+        uploaded_file = await self._parallel_upload(client, filepath, filename, file_size, upload_id, progress_cb,
+                                                    connections=connections, max_flood_wait=max_flood_wait,
+                                                    use_main=use_main)
 
         max_retries = 3
         for attempt in range(max_retries):
@@ -276,16 +301,16 @@ class FastUploader:
                 # Commit Phase Timeout 
                 send_coro = None
                 if is_image:
-                    send_coro = client.send_file(chat_id, file=uploaded_file, caption="", force_document=False)
+                    send_coro = client.send_file(chat_id, file=uploaded_file, caption=caption, force_document=False)
                 elif is_video:
                     vi = video_info or {}
                     attrs = [DocumentAttributeVideo(duration=vi.get("duration", 0), w=vi.get("width", 0), h=vi.get("height", 0), supports_streaming=True)]
-                    send_coro = client.send_file(chat_id, file=uploaded_file, caption="", thumb=thumb_path, attributes=attrs, force_document=False, supports_streaming=True)
+                    send_coro = client.send_file(chat_id, file=uploaded_file, caption=caption, thumb=thumb_path, attributes=attrs, force_document=False, supports_streaming=True)
                 elif is_audio:
                     attrs = [DocumentAttributeAudio(duration=0), DocumentAttributeFilename(file_name=filename)]
-                    send_coro = client.send_file(chat_id, file=uploaded_file, caption="", attributes=attrs, force_document=False)
+                    send_coro = client.send_file(chat_id, file=uploaded_file, caption=caption, attributes=attrs, force_document=False)
                 else:
-                    send_coro = client.send_file(chat_id, file=uploaded_file, caption="", attributes=[DocumentAttributeFilename(file_name=filename)], force_document=True)
+                    send_coro = client.send_file(chat_id, file=uploaded_file, caption=caption, attributes=[DocumentAttributeFilename(file_name=filename)], force_document=True)
 
                 # Send File Commit Timeout (2 Mins maximum)
                 return await asyncio.wait_for(send_coro, timeout=120.0)
@@ -295,6 +320,8 @@ class FastUploader:
             except asyncio.TimeoutError:
                 logger.warning(f"Upload Commit Timed out. Retrying...")
             except FloodWaitError as e:
+                if max_flood_wait is not None and e.seconds > max_flood_wait:
+                    raise LongFloodWait(e.seconds)
                 wait = e.seconds + 1
                 logger.warning(f"Upload Commit FloodWait: {wait:.1f}s")
                 await asyncio.sleep(wait)
