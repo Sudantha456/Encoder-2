@@ -11,10 +11,12 @@ logger = logging.getLogger("FastConn")
 
 
 class SenderPool:
-    def __init__(self, client, dc_id: Optional[int], size: int):
+    def __init__(self, client, dc_id: Optional[int], size: int, use_main: bool = True):
         self.client = client
         self.dc_id = dc_id
         self.size = max(1, size)
+        # use_main=False → හැම connection එකක්ම අලුත් sender (main client එක නිදහස්; FloodWait raw ඒවා හරහා කෙළින්ම එනවා)
+        self.use_main = use_main
         self.senders: List = []      # None == main client
         self._extras: List = []      # අපි හදපු MTProtoSender (close කරන්න ඕන)
 
@@ -42,9 +44,9 @@ class SenderPool:
         self.dc_id = self.dc_id or home
         same = self.dc_id == home
         auth_key = c.session.auth_key if same else None
-        need = self.size - 1 if same else self.size
+        need = self.size - 1 if (same and self.use_main) else self.size
 
-        if same:
+        if same and self.use_main:
             self.senders.append(None)          # main client = connection #1
         if need > 0 and auth_key is None:      # වෙන DC: පළමු එකෙන් auth key ගන්නවා
             first = await self._make(None)
