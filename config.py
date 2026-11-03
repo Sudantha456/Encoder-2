@@ -3,6 +3,7 @@ config.py — Encoder bot settings
 fast_downloader.py / fast_uploader.py දෙකත් මේ PROGRESS_UPDATE_INTERVAL එකම import කරනවා.
 """
 import os
+import re
 
 # ── Telegram ──────────────────────────────────────────────
 API_ID = int(os.getenv("API_ID", "0"))
@@ -57,8 +58,9 @@ UL_CONNECTIONS = int(os.getenv("UL_CONNECTIONS", "6"))
 UL_WORKERS_PER_CONN = int(os.getenv("UL_WORKERS_PER_CONN", "4"))
 
 # ── 🌐 Distributed encoding (GitHub Actions workers) ──
-# Workers ගාන දැන් settings (/settings → 👷 Workers) වලින් — 2/4/6/8/10. මේ default එක විතරයි.
-WORKER_CHOICES = [2, 4, 6, 8, 10]
+# Workers ගාන දැන් settings (/settings → 👷 Workers) වලින් — 2…16. මේ default එක විතරයි.
+WORKER_CHOICES = list(range(2, 17, 2))      # 2,4,6,8,10,12,14,16  (/settings → 👷 Workers)
+MAX_WORKERS = max(WORKER_CHOICES)
 DEFAULT_WORKERS = int(os.getenv("DIST_WORKERS", "4"))
 if DEFAULT_WORKERS not in WORKER_CHOICES:
     DEFAULT_WORKERS = 4
@@ -77,3 +79,35 @@ MAX_UPLOAD_BYTES = 2000 * 1024 * 1024    # bot upload limit ≈ 2GB
 # Preview එකට metadata probe කරන bytes (head + tail)
 PROBE_HEAD_CHUNKS = 6      # 6 × 512KB = 3MB
 PROBE_TAIL_CHUNKS = 12     # 12 × 512KB = 6MB
+
+
+# ═════════════════ 👤 Userbot relay (private channel හරහා වේගවත් download/upload) ═════════════════
+# Flow: user → main bot → (forward) private channel → userbot(s) download → encode → userbot upload
+#       → channel → main bot → user ගේ private chat එකට.
+#
+# USER_STRINGS = Telethon StringSession එකක් හෝ කිහිපයක් (comma / newline වලින් වෙන් කරන්න):
+#     USER_STRINGS=session1,session2,session3
+# පරණ විදිහටත් වැඩ:  USER_STRING_1, USER_STRING_2, USER_STRING_3 …  (හෝ USER_STRING)
+def _collect_user_strings() -> list:
+    raw = [os.getenv("USER_STRINGS", ""), os.getenv("USER_STRING", "")]
+    numbered = sorted(((int(k.rsplit("_", 1)[1]), v) for k, v in os.environ.items()
+                       if re.fullmatch(r"USER_STR?ING_\d+", k) and v.strip()), key=lambda x: x[0])
+    raw += [v for _, v in numbered]
+    out = []
+    for blob in raw:
+        for part in re.split(r"[,\s]+", blob.strip()):
+            if part and part not in out:
+                out.append(part)
+    return out
+
+
+USER_STRINGS = _collect_user_strings()
+
+# Private channel: "-1001234567890" (හොඳම)  |  "@username"  |  "https://t.me/+AbCdEf…" invite link
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
+CHANNEL_CLEANUP = os.getenv("CHANNEL_CLEANUP", "1") == "1"      # delivery ඉවර වුණාම channel එකේ messages මකනවා
+
+UB_DL_CONNECTIONS = int(os.getenv("UB_DL_CONNECTIONS", str(DL_CONNECTIONS)))   # එක userbot එකකට connections
+UB_UL_CONNECTIONS = int(os.getenv("UB_UL_CONNECTIONS", str(UL_CONNECTIONS)))
+UB_MAX_FLOOD_WAIT = int(os.getenv("UB_MAX_FLOOD_WAIT", "30"))   # මීට වැඩි FloodWait එකක් ආවොත් ඒ userbot එක පැත්තකට දාලා තව එකක් use කරනවා
+UB_FLOOD_COOLDOWN = int(os.getenv("UB_FLOOD_COOLDOWN", "60"))   # FloodWait ආපු userbot එක ඊළඟ jobs වලට මෙච්චර වෙලාවක් skip
