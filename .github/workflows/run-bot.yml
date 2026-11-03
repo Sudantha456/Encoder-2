@@ -9,7 +9,6 @@ permissions:
   contents: write   # temp Releases (worker mailbox + parts)
   actions: write    # workers dispatch කරන්න
 
-# එකවර bot instance දෙකක් run වෙන එක වළක්වනවා (එකම token එකට conflict වෙනවා)
 concurrency:
   group: encoder-bot
   cancel-in-progress: false
@@ -41,24 +40,39 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Decode & Assemble User Strings
+        env:
+          S1: ${{ secrets.USER_STRING_1 }}
+          S2: ${{ secrets.USER_STRING_2 }}
+          S3: ${{ secrets.USER_STRING_3 }}
+        run: |
+          sessions=()
+
+          # එක් එක් secret අගයක් ඇත්නම් පමණක් base64 decode කර array එකට එකතු කරයි
+          [ -n "$S1" ] && sessions+=("$(echo "$S1" | base64 -d)")
+          [ -n "$S2" ] && sessions+=("$(echo "$S2" | base64 -d)")
+          [ -n "$S3" ] && sessions+=("$(echo "$S3" | base64 -d)")
+
+          # Comma-separated තනි string එකක් සාදා GITHUB_ENV එකට ලියයි
+          IFS=','
+          assembled="${sessions[*]}"
+          echo "USER_STRINGS=$assembled" >> $GITHUB_ENV
+
       - name: Run Telegram Bot
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}
-          # 👤 Userbot relay: USER_STRINGS = session1,session2,session3 (secret එකක් විදිහට)
-          USER_STRINGS: ${{ secrets.USER_STRINGS }}
-          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}          # -100xxxxxxxxxx  (හෝ invite link)
+          # ඉහත පියවරෙන් decode වී ලැබුණු string එක කෙලින්ම ලබා ගනී
+          USER_STRINGS: ${{ env.USER_STRINGS }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
           UB_MAX_FLOOD_WAIT: ${{ vars.UB_MAX_FLOOD_WAIT || '30' }}
           PROGRESS_UPDATE_INTERVAL: ${{ vars.PROGRESS_UPDATE_INTERVAL || '3' }}
           QUEUE_MAX: ${{ vars.QUEUE_MAX || '20' }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          DIST_WORKERS: ${{ vars.DIST_WORKERS || '4' }}   # default workers (/settings වලින් වෙනස් කරන්න පුළුවන්: 2-16)
+          DIST_WORKERS: ${{ vars.DIST_WORKERS || '4' }}
           DOWNLOAD_DIR: ${{ runner.temp }}/downloads
         run: |
           python3 -u bot.py
-
-  # Workers මෙතන නෑ — bot එක queue එක පටන් ගන්නකොට (video download වෙන අතරේ) encode-worker.yml
-  # dispatch කරනවා. Queue ඉවර වුණාම workers තනියම exit.
