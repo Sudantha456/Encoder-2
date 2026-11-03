@@ -26,6 +26,7 @@ from config import (API_ID, API_HASH, BOT_TOKEN, SESSION_NAME, ALLOWED_USERS,
                     WORKER_CHOICES, QUEUE_MAX, QUEUE_RES_CHOICES)
 from fast_downloader import get_downloader, init_download_engine
 from fast_uploader import get_uploader
+from userbots import Relay
 from media import (VideoMeta, telegram_meta, probe_remote, ffprobe, apply_probe,
                    offered_targets, estimate_size, render_preview, short_side, guard_kbps)
 from settings_store import SettingsStore
@@ -41,6 +42,7 @@ client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 client.parse_mode = "html"
 store = SettingsStore()
 pool = dist.WorkerPool()
+relay = Relay()                         # userbots ↔ private channel
 queue: deque = deque()                  # බලාගෙන ඉන්න jobs (FIFO)
 current_job = [None]                    # දැන් run වෙන job එක
 queue_task: Optional[asyncio.Task] = None
@@ -132,7 +134,8 @@ def settings_text(uid: int) -> str:
         f"🎞 Codec: <b>{s['codec']}</b>",
         f"🌐 Distributed (GitHub workers): <b>{s['dist']}</b>"
         + ("" if dist.available() else "  <i>(මේ environment එකේ නෑ)</i>"),
-        f"👷 Workers: <b>{s['workers']}</b>  <i>(download එක යන අතරේත් වෙනස් කරන්න පුළුවන්)</i>",
+        f"👷 Workers: <b>{s['workers']}</b>  <i>(2 – {max(WORKER_CHOICES)}; download එක යන අතරේත් වෙනස් කරන්න පුළුවන්)</i>",
+        f"👤 Userbot relay: <b>{('ON ×' + str(len(relay.ready))) if relay.enabled else 'OFF'}</b>",
         f"📋 Auto-queue: <b>{'ask (බොත්තම්)' if s['qres'] == 'ask' else s['qres'] + 'p'}</b>",
         "━━━━━━━━━━━━━━━━━━━━",
         "ultrafast → වේගවත්ම  |  veryslow → අඩුම size",
@@ -152,8 +155,9 @@ def settings_buttons(uid: int, job_id: str):
                  for c, n in CODECS.items()])
     rows.append([Button.inline(("✅ " if s["dist"] == m else "") + f"🌐 {m.title()}", cb("dst", job_id, m))
                  for m in ("auto", "on", "off")])
-    rows.append([Button.inline(("✅ " if s["workers"] == n else "") + f"👷{n}", cb("wrk", job_id, n))
-                 for n in WORKER_CHOICES])
+    wbtns = [Button.inline(("✅ " if s["workers"] == n else "") + f"👷{n}", cb("wrk", job_id, n))
+             for n in WORKER_CHOICES]
+    rows += [wbtns[i:i + 4] for i in range(0, len(wbtns), 4)]          # 2,4,6,8 / 10,12,14,16
     rows.append([Button.inline(("✅ " if s["qres"] == q else "") + ("📋 Ask" if q == "ask" else f"📋 {q}p"),
                                cb("qres", job_id, q)) for q in QUEUE_RES_CHOICES])
     rows.append([Button.inline("🔙 Back" if job_id != "0" else "✖ Close", cb("back", job_id))])
@@ -180,6 +184,21 @@ async def cmd_settings(event):
     if not allowed(event.sender_id):
         return
     await event.reply(settings_text(event.sender_id), buttons=settings_buttons(event.sender_id, "0"))
+
+
+@client.on(events.NewMessage(pattern=r"^/check", incoming=True))
+async def cmd_check(event):
+    """Userbots + private channel setup එක ආයෙ පරීක්ෂා කරනවා (job එකක් run වෙන්නේ නැති වෙලාවක)."""
+    if not allowed(event.sender_id):
+        return
+    if pending_count():
+        await event.reply(relay.status_text() + "\n\n<i>Jobs run වෙනවා — re-check කරන්නේ queue එක හිස් වුණාම.</i>")
+        return
+    m = await event.reply("🔍 <b>Userbots / channel setup බලනවා…</b>")
+    await relay.stop()
+    relay.userbots = []
+    await relay.setup(client)
+    await m.edit(relay.status_text())
 
 
 def queue_text() -> str:
@@ -401,6 +420,7 @@ async def run_job(job: Job, height: int):
     t_start = time.monotonic()
     stats = {}
     dl, ul = get_downloader(), get_uploader()
+    ch_ids, ch_out = [], [None, None]       # channel messages (cleanup): bot ගේ ids, [userbot msg, userbot]
 
     try:
         if job.cancelled:
@@ -423,7 +443,34 @@ async def run_job(job: Job, height: int):
             tr.update(cur, tot)
             await live.set(render_transfer("dl", tr, meta.name))
 
-        await dl.download(client, job.message, str(src), job.id, dl_cb)
+        use_relay, ch_in = relay.enabled and bool(relay.ready), None
+        if use_relay:                                      # user ගේ video එක → private channel (userbots එතනින් ගන්නවා)
+            try:
+                await live.set("📨 <b>Channel එකට forward කරනවා…</b>", force=True)
+                ch_in = await relay.forward_in(client, job.message)
+                ch_ids.append(ch_in)
+            except Exception as e:
+                logger.warning(f"relay forward failed ({e!r}) → bot download")
+                use_relay = False
+            await live.set(render_transfer("dl", tr, meta.name), force=True)
+        if use_relay:
+            try:
+                await relay.download(dl, ch_in, str(src), job.id, dl_cb)
+                stats["via"] = [u.name for u in relay.ready]
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if job.cancelled:
+                    raise asyncio.CancelledError()
+                logger.warning(f"relay download failed ({e!r}) → bot download")
+                await live.set("⚠️ Userbot download fail → bot එකෙන් download කරනවා…", force=True)
+                src.unlink(missing_ok=True)
+                tr = SpeedTracker(total=meta.size)
+                use_relay = False
+                stats.pop("via", None)
+                await dl.download(client, job.message, str(src), job.id, dl_cb)
+        else:
+            await dl.download(client, job.message, str(src), job.id, dl_cb)
         stats["dl_avg"], stats["dl_time"] = tr.avg_speed, tr.elapsed
         if job.cancelled:
             raise asyncio.CancelledError()
@@ -524,15 +571,33 @@ async def run_job(job: Job, height: int):
             tr2.update(cur, tot)
             await live.set(render_transfer("ul", tr2, dst.name))
 
-        sent = await ul.upload_file(client, job.chat_id, str(dst), job.id, ul_cb)
-        stats["ul_avg"], stats["ul_time"] = tr2.avg_speed, tr2.elapsed
-        phase[0] = "done"
-
         caption = (f"🎬 <b>{esc(stem)}</b>\n"
                    f"📐 {height}p • 🎞 {codec} • ⚙️ {preset}\n"
                    f"📦 {human_size(out_size)} (original {human_size(meta.size)})")
-        with contextlib.suppress(Exception):
-            await client.edit_message(sent, caption)
+        sent = None
+        if use_relay:
+            try:
+                ub, ch_msg = await relay.upload(ul, str(dst), job.id, ul_cb)       # userbot → channel
+                ch_out[0], ch_out[1] = ch_msg, ub
+                stats["ul_via"] = ub.name
+                stats["ul_avg"], stats["ul_time"] = tr2.avg_speed, tr2.elapsed
+                await live.set("📨 <b>User ගේ chat එකට යවනවා…</b>", force=True)
+                sent = await relay.deliver(client, job.chat_id, ch_msg.id, caption)  # main bot → user (re-upload නෑ)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if job.cancelled:
+                    raise asyncio.CancelledError()
+                logger.warning(f"relay upload/deliver failed ({e!r}) → bot upload")
+                await live.set("⚠️ Userbot upload fail → bot එකෙන් upload කරනවා…", force=True)
+                tr2 = SpeedTracker(total=out_size)
+                sent = None
+        if sent is None:
+            sent = await ul.upload_file(client, job.chat_id, str(dst), job.id, ul_cb)
+            stats["ul_avg"], stats["ul_time"] = tr2.avg_speed, tr2.elapsed
+            with contextlib.suppress(Exception):
+                await client.edit_message(sent, caption)
+        phase[0] = "done"
 
         saved = (1 - out_size / meta.size) * 100 if meta.size else 0
         live.buttons = None
@@ -543,11 +608,13 @@ async def run_job(job: Job, height: int):
             f"📦 <code>{human_size(meta.size)}</code> → <code>{human_size(out_size)}</code> "
             f"({'−' if saved >= 0 else '+'}{abs(saved):.0f}%)"
             + (f"  •  est ≈{human_size(est_size)}" if est_size else ""),
-            f"📥 DL: <code>{human_speed(stats['dl_avg'])}</code> • <code>{human_time(stats['dl_time'])}</code>",
+            f"📥 DL{' 👤×' + str(len(stats['via'])) if stats.get('via') else ''}: "
+            f"<code>{human_speed(stats['dl_avg'])}</code> • <code>{human_time(stats['dl_time'])}</code>",
             f"🎬 Encode{' 🌐×' + str(stats['workers']) if 'workers' in stats else ''}: "
             f"<code>{stats['enc_speed']:.2f}x</code> • <code>{human_time(stats['enc_time'])}</code>"
             + (f"  (🏠 local parts: {stats['local_parts']})" if stats.get("local_parts") else ""),
-            f"📤 UL: <code>{human_speed(stats['ul_avg'])}</code> • <code>{human_time(stats['ul_time'])}</code>",
+            f"📤 UL{' 👤' + stats['ul_via'] if stats.get('ul_via') else ''}: "
+            f"<code>{human_speed(stats['ul_avg'])}</code> • <code>{human_time(stats['ul_time'])}</code>",
             f"⏱ Total: <code>{human_time(time.monotonic() - t_start)}</code>",
         ]), force=True)
 
@@ -561,6 +628,9 @@ async def run_job(job: Job, height: int):
         live.buttons = None
         await live.set(f"⚠️ <b>Failed</b>\n<code>{esc(str(e)[-900:])}</code>", force=True)
     finally:
+        if ch_ids or ch_out[0] is not None:
+            with contextlib.suppress(Exception):
+                await relay.cleanup(client, ch_ids, ch_out[0], ch_out[1])
         await dl.cleanup(job.id)
         await ul.cleanup(job.id)
         shutil.rmtree(workdir, ignore_errors=True)
@@ -573,8 +643,17 @@ async def main():
     await init_download_engine()
     logger.info(f"🌐 Distributed workers: {'available (on-demand per queue)' if dist.available() else 'unavailable'}")
     me = await client.get_me()
+    await relay.setup(client)
+    if relay.configured and not relay.enabled:           # setup වැරදි නම් admins ට කෙළින්ම කියනවා
+        for uid in ALLOWED_USERS:
+            with contextlib.suppress(Exception):
+                await client.send_message(uid, relay.status_text() + "\n\n<i>Fallback: bot එකෙන්ම download/upload. "
+                                          "හදලා /check කරන්න.</i>")
     logger.info(f"✅ @{me.username} running • update interval {PROGRESS_UPDATE_INTERVAL}s")
-    await client.run_until_disconnected()
+    try:
+        await client.run_until_disconnected()
+    finally:
+        await relay.stop()
 
 
 if __name__ == "__main__":
