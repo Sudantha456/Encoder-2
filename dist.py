@@ -243,9 +243,13 @@ class DistState:
 
 
 # ───────────────────────── GitHub (gh CLI) ─────────────────────────
+ACTIVE_STATUSES = ("in_progress", "queued", "waiting", "requested", "pending")
+
+
 class GhBackend:
     def __init__(self, token: Optional[str] = None, repo: Optional[str] = None):
-        self.env = {**os.environ, "GH_REPO": repo or os.environ["GITHUB_REPOSITORY"]}
+        self.repo = repo or os.environ["GITHUB_REPOSITORY"]
+        self.env = {**os.environ, "GH_REPO": self.repo}
         if token:                                  # helper account
             self.env["GH_TOKEN"] = token
         self.ref = "main" if token else os.getenv("GITHUB_REF_NAME", "main")
@@ -290,6 +294,42 @@ class GhBackend:
     async def release_delete(self, tag):
         await self._gh("release", "delete", tag, "--cleanup-tag", "-y", check=False)
 
+    # ── workflow runs (encode-worker.yml විතරයි — run-bot.yml එකට කවදාවත් අත ගහන්නේ නෑ) ──
+    async def runs(self, statuses=ACTIVE_STATUSES) -> List[dict]:
+        async def one(st):
+            raw = await self._gh("run", "list", "--workflow", config.DIST_WORKFLOW, "--status", st,
+                                 "--limit", "100", "--json",
+                                 "databaseId,status,createdAt,startedAt,displayTitle,event", check=False)
+            try:
+                return json.loads(raw or "[]")
+            except Exception:
+                return []
+        seen: dict = {}
+        for lst in await asyncio.gather(*[one(st) for st in statuses]):
+            for r in lst:
+                seen[r["databaseId"]] = r
+        return sorted(seen.values(), key=lambda r: r.get("createdAt", ""))
+
+    async def run_jobs(self, run_id) -> List[dict]:
+        raw = await self._gh("run", "view", str(run_id), "--json", "jobs", check=False)
+        try:
+            return json.loads(raw or "{}").get("jobs", [])
+        except Exception:
+            return []
+
+    async def run_cancel(self, run_id, force=False):
+        if force:       # normal cancel එකට නොනවතින (hang වුණ) runs වලට
+            await self._gh("api", "-X", "POST", f"repos/{self.repo}/actions/runs/{run_id}/force-cancel", check=False)
+        else:
+            await self._gh("run", "cancel", str(run_id), check=False)
+
+    async def release_tags(self) -> List[str]:
+        raw = await self._gh("release", "list", "--limit", "100", "--json", "tagName", check=False)
+        try:
+            return [r["tagName"] for r in json.loads(raw or "[]")]
+        except Exception:
+            return []
+
 
 # ───────────────────────── Worker pool (queue session) ─────────────────────────
 class Acct:
@@ -310,6 +350,7 @@ class WorkerPool:
     def __init__(self, gh=None):
         self.accts: List[Acct] = []
         self._lock = asyncio.Lock()
+        self.halted = False            # /End_Work පස්සේ අලුත් workers dispatch වෙන එක නවත්තනවා
 
     def build(self):
         want = 1 + len(HELPERS)
@@ -335,6 +376,8 @@ class WorkerPool:
 
     async def ensure(self, n: int):
         """Workers n ක් ready කරනවා: index i → account i // PER_ACCT. Account එකක් fail වුණොත් ඒ කොටස් පස්සේ spill/local."""
+        if self.halted:
+            raise DistError("Workers නවත්තලා (/End_Work) — main runner එකෙන්ම encode කරනවා")
         async with self._lock:
             self.build()
             n = min(n, PER_ACCT * len(self.accts))
@@ -394,7 +437,76 @@ class WorkerPool:
             await asyncio.gather(*[a.gh.release_delete(a.tag) for a in act])
             for a in act:
                 a.dispatched = set()
+            self.halted = False                         # queue හිස් → ඊළඟ queue එකට workers ආයෙ allow
             logger.info(f"🌐 pool stopped ({len(act)} accounts)")
+
+    # ───────────── /End_Work : සේරම worker workflows kill ─────────────
+    async def kill_all(self, rounds: int = 5, on_progress=None) -> dict:
+        """Main + helper accounts හැම එකකම encode-worker workflow runs kill කරනවා.
+        1) pool නවත්තනවා (heartbeat, mailbox 'end', releases මකනවා) → workers තනියම exit
+        2) kill request rounds ≤ 5: ඉතුරු runs cancel (round 3+ = force-cancel) — හිස් වුණාම නවතිනවා
+        run-bot.yml (bot එක) කවදාවත් kill වෙන්නේ නෑ."""
+        self.build()
+        self.halted = True
+        for a in self.accts:                            # heartbeat නවත්තලා session close
+            a.active = False
+            if a.hb:
+                a.hb.cancel()
+                with contextlib.suppress(BaseException):
+                    await a.hb
+                a.hb = None
+        await asyncio.gather(*[a.gh.mailbox_set(a.tag, self._body(a, "end")) for a in self.accts if a.tag],
+                             return_exceptions=True)
+
+        async def purge(a: Acct):                       # enc-q-* / enc-* temp releases (workers watchdog එකත් නවතිනවා)
+            tags = [t for t in await a.gh.release_tags() if t.startswith("enc-")]
+            await asyncio.gather(*[a.gh.release_delete(t) for t in tags], return_exceptions=True)
+
+        await asyncio.gather(*[purge(a) for a in self.accts], return_exceptions=True)
+        for a in self.accts:
+            a.dispatched, a.session, a.tag = set(), "", ""
+
+        cancelled = {a.idx: set() for a in self.accts}
+        remaining = {a.idx: [] for a in self.accts}
+        used = 0
+        for rnd in range(1, rounds + 1):
+            lists = await asyncio.gather(*[a.gh.runs() for a in self.accts], return_exceptions=True)
+            remaining = {a.idx: (l if isinstance(l, list) else []) for a, l in zip(self.accts, lists)}
+            if not any(remaining.values()):
+                break
+            used = rnd
+            force = rnd >= 3
+            if on_progress:
+                with contextlib.suppress(Exception):
+                    await on_progress(rnd, rounds, force, {i: len(v) for i, v in remaining.items()})
+            await asyncio.gather(*[a.gh.run_cancel(r["databaseId"], force)
+                                   for a in self.accts for r in remaining[a.idx]], return_exceptions=True)
+            for a in self.accts:
+                cancelled[a.idx] |= {r["databaseId"] for r in remaining[a.idx]}
+            await asyncio.sleep(4)
+        lists = await asyncio.gather(*[a.gh.runs() for a in self.accts], return_exceptions=True)
+        left = {a.idx: (l if isinstance(l, list) else []) for a, l in zip(self.accts, lists)}
+        return {"rounds": used, "cancelled": {i: len(v) for i, v in cancelled.items()},
+                "left": left, "accts": [(a.idx, a.gh.repo) for a in self.accts]}
+
+    # ───────────── /workflow : worker workflows විස්තර ─────────────
+    async def overview(self) -> List[dict]:
+        self.build()
+
+        async def one(a: Acct):
+            info = {"idx": a.idx, "repo": a.gh.repo, "session": a.session, "active": a.active,
+                    "failed": a.failed, "dispatched": sorted(a.dispatched), "runs": [], "error": ""}
+            try:
+                runs = await a.gh.runs()
+                jobs = await asyncio.gather(*[a.gh.run_jobs(r["databaseId"]) for r in runs[:15]])
+                for r, js in zip(runs, jobs):
+                    r["jobs"] = js
+                info["runs"] = runs
+            except Exception as e:
+                info["error"] = str(e)[:120]
+            return info
+
+        return await asyncio.gather(*[one(a) for a in self.accts])
 
 
 # ───────────────────────── Telegram progress board ─────────────────────────
@@ -699,6 +811,10 @@ class DistRun:
     # ── runner busy / start නොවුණොත්: start නොවුණු parts ඔක්කොම ගණන් කරලා, වෙන account එකක
     #    free slots වලට **එක workflow dispatch එකකින්** යවනවා (part එකකට workflow එකක් හදන්නේ නෑ) ──
     async def _spill_batch(self, parts: List[Part]):
+        if self.pool.halted:                       # /End_Work → අලුත් workflows dispatch කරන්නේ නෑ (local fallback)
+            for p in parts:
+                p.spilled = True
+            return
         for p in parts:
             p.spilled = True                       # එක පාරයි try කරන්නේ; බැරි වුණොත් local fallback
         free = {a.idx: PER_ACCT - len(a.dispatched) for a in self.pool.accts if not a.failed}
