@@ -68,9 +68,18 @@ async def _helper_gh(token: str, repo: str, *args, check=True) -> str:
 
 
 async def _bootstrap_helper(token: str) -> tuple:
+    st = ["login"]
+    try:
+        return await _bootstrap_inner(token, st)
+    except Exception as e:                       # කුමන පියවරේද fail වුණේ කියලා පෙන්නනවා
+        raise DistError(f"පියවර '{st[0]}' fail: {e}") from e
+
+
+async def _bootstrap_inner(token: str, st: list) -> tuple:
     """Helper account එකේ public repo එක හදලා worker files + BOT_TOKEN secret එක දානවා (idempotent)."""
     login = (await _helper_gh(token, "", "api", "user", "-q", ".login")).strip()
     repo = f"{login}/{config.HELPER_REPO}"
+    st[0] = "repo create/check"
     # repo එක දැනටමත් තියෙනවද බලනවා — තියෙනවා නම් අලුත් එකක් හදන්නේ නෑ (එකම නමින් repo එකම යළි භාවිතා කරනවා)
     if not (await _helper_gh(token, repo, "api", f"repos/{repo}", "-q", ".full_name", check=False)).strip():
         try:
@@ -87,6 +96,7 @@ async def _bootstrap_helper(token: str) -> tuple:
     files = {"worker.py": root / "worker.py", "transcoder.py": root / "transcoder.py",
              ".github/workflows/encode-worker.yml": root / ".github/workflows/encode-worker.yml"}
     for path, src in files.items():
+        st[0] = f"push {path} (token එකට 'workflow' scope ඕනේ)"
         raw = src.read_bytes()
         cur = await _helper_gh(token, repo, "api", f"repos/{repo}/contents/{path}", check=False)
         sha = ""
@@ -102,7 +112,11 @@ async def _bootstrap_helper(token: str) -> tuple:
         if sha:
             args += ["-f", f"sha={sha}"]
         await _helper_gh(token, repo, *args)
-    await _helper_gh(token, repo, "secret", "set", "BOT_TOKEN", "--repo", repo, "--body", config.BOT_TOKEN)
+    st[0] = "secret BOT_TOKEN"
+    try:
+        await _helper_gh(token, repo, "secret", "set", "BOT_TOKEN", "--repo", repo, "--body", config.BOT_TOKEN)
+    except Exception as e:                       # fatal නෑ: workers වැඩ කරනවා, progress edits විතරක් නැති වෙනවා
+        HELPER_PROBLEMS.append(f"{repo}: BOT_TOKEN secret set වුණේ නෑ ({e}) — progress පෙන්වන්නේ නෑ")
     return token, repo
 
 
@@ -112,7 +126,7 @@ async def setup_helpers():
     res = await asyncio.gather(*[_bootstrap_helper(t) for t in config.HELPER_TOKENS], return_exceptions=True)
     for i, r in enumerate(res, 1):
         if isinstance(r, BaseException):
-            HELPER_PROBLEMS.append(f"Helper #{i}: {r} (token scopes: repo + workflow ඕනේ)")
+            HELPER_PROBLEMS.append(f"Helper #{i}: {r}")
             logger.error(HELPER_PROBLEMS[-1])
         else:
             HELPERS.append(r)
@@ -714,3 +728,12 @@ class DistRun:
             args += ["-tag:v", "hvc1"]
         args += ["-movflags", "+faststart", self.dst]
         await self._ff(*args)
+
+
+def helpers_status() -> str:
+    lines = [f"🤝 <b>Helper accounts: {len(HELPERS)}/{len(config.HELPER_TOKENS)}</b> • workers capacity <b>{capacity()}</b>"]
+    lines += [f"• ✅ {r}" for _, r in HELPERS]
+    lines += [f"• ❌ {p}" for p in HELPER_PROBLEMS]
+    if not config.HELPER_TOKENS:
+        lines.append("HELPER_TOKENS set කරලා නෑ.")
+    return "\n".join(lines)
