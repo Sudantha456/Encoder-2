@@ -344,7 +344,7 @@ async def cmd_end_work(event):
         else:
             lines.append(f"✅ සේරම worker workflows kill වුණා (kill requests: {res['rounds']})")
         if busy:
-            lines.append("<i>Run වෙන job එකේ කොටස් main runner එකෙන්ම encode වෙයි; අලුත් workers dispatch වෙන්නේ නෑ.</i>")
+            lines.append("<i>දැනට run වෙන distributed job එක worker pool එක නවත්වපු නිසා main runner එකට fallback නොවී stop/fail වෙයි.</i>")
         await m.edit("\n".join(lines))
 
 
@@ -677,16 +677,18 @@ async def run_job(job: Job, height: int):
                 stats["enc_time"], stats["enc_speed"] = dst_state.elapsed, meta.duration / max(dst_state.elapsed, 1)
                 stats["workers"] = dstats["workers"]
                 stats["local_parts"] = dstats["local_parts"]
+                stats["reassigned_parts"] = dstats.get("reassigned_parts", 0)
                 encoded = True
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.warning(f"Distributed encode failed → local: {e!r}")
-                await live.set(f"⚠️ Distributed failed ({esc(str(e)[:120])})\nmain runner එකෙන්ම encode කරනවා…", force=True)
-                for pat in ("raw_part_*", "encoded_part_*", "audio.mka", "concat.txt"):
-                    for f in workdir.glob(pat):
-                        f.unlink(missing_ok=True)
-                dst.unlink(missing_ok=True)
+                logger.exception(f"Distributed encode failed (local fallback disabled): {e!r}")
+                await live.set(
+                    f"❌ <b>Distributed encode failed</b> ({esc(str(e)[:160])})\n"
+                    "Worker pool එකෙන් part එකක් complete කරන්න නොහැකි වුණා. Main runner fallback disabled.",
+                    force=True,
+                )
+                raise
             finally:
                 dticker.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -773,6 +775,7 @@ async def run_job(job: Job, height: int):
             f"<code>{human_speed(stats['dl_avg'])}</code> • <code>{human_time(stats['dl_time'])}</code>",
             f"🎬 Encode{' 🌐×' + str(stats['workers']) if 'workers' in stats else ''}: "
             f"<code>{stats['enc_speed']:.2f}x</code> • <code>{human_time(stats['enc_time'])}</code>"
+            + (f"  (♻️ reassigned: {stats['reassigned_parts']})" if stats.get("reassigned_parts") else "")
             + (f"  (🏠 local parts: {stats['local_parts']})" if stats.get("local_parts") else ""),
             f"📤 UL{' 👤' + stats['ul_via'] if stats.get('ul_via') else ''}: "
             f"<code>{human_speed(stats['ul_avg'])}</code> • <code>{human_time(stats['ul_time'])}</code>",
