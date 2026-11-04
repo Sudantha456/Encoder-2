@@ -185,7 +185,7 @@ async def probe_remote(client, message, meta: VideoMeta, workdir: str) -> bool:
 PRESET_FACTOR = {"ultrafast": 1.55, "superfast": 1.35, "veryfast": 1.2, "faster": 1.1,
                  "fast": 1.05, "medium": 1.0, "slow": 0.95, "slower": 0.9, "veryslow": 0.87}
 CODEC_FACTOR = {"libx264": 1.0, "libx265": 0.62}
-RES_BPP = {720: 1.0, 480: 1.2, 240: 1.5}
+RES_BPP = {1080: 0.9, 720: 1.0, 540: 1.1, 480: 1.2, 360: 1.35, 240: 1.5, 144: 1.8}
 BASE_BPP = 0.075   # bits / pixel / frame  (x264, CRF 23, medium)
 
 
@@ -205,7 +205,7 @@ def res_label(m: VideoMeta) -> str:
 
 def offered_targets(m: VideoMeta):
     s = short_side(m)
-    t = [r for r in RESOLUTIONS if s >= r * 0.9]
+    t = [r for r in RESOLUTIONS if r < s * 0.95]      # source එකට වඩා අඩු resolutions විතරයි
     return t or [RESOLUTIONS[-1]]
 
 
