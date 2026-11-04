@@ -150,8 +150,9 @@ def render_dist(st, name: str, height: int, preset: str, codec: str) -> str:
     if st.phase == "merge":
         return head + "\n" + _render_merge(st)
     labels = {
-        "waiting": "⏳ runner එකක් බලාගෙන", "uploading": "☁️ result upload",
-        "remote_done": "📥 fetching", "failed": "⚠️ main එකෙන් retry", "ready": "✅ done",
+        "waiting": "⏳ runner start වෙන්න බලාගෙන", "held": "📦 held • idle runner එකක් එනකම්",
+        "uploading": "☁️ result upload", "remote_done": "📥 fetching",
+        "failed": "♻️ retry queue", "ready": "✅ done",
     }
     lines = [head, f"<code>[{bar(st.percent)}] {st.percent:5.1f}%</code>",
              f"🎞 Video: <code>{human_time(st.out_time)} / {human_time(st.duration)}</code>",
@@ -166,8 +167,6 @@ def render_dist(st, name: str, height: int, preset: str, codec: str) -> str:
     for p in st.parts:
         if p.status == "running":
             txt = f"{_mini(p.pct)} {p.pct:3.0f}% • {p.speed:.1f}x"
-        elif p.status == "local":
-            txt = f"🏠 {_mini(p.pct)} {p.pct:3.0f}% • {p.speed:.1f}x"
         else:
             txt = labels.get(p.status, p.status)
         lines.append(f"<code>{p.idx + 1}</code> {txt}")
