@@ -155,6 +155,9 @@ def should_distribute(meta, target, preset, codec, mode: str) -> bool:
     return estimate_encode_seconds(meta, target, preset, codec) >= config.DIST_AUTO_MIN_SECONDS
 
 
+_BG: set = set()      # background cleanup tasks (GC වෙන්නේ නැති වෙන්න)
+
+
 # ───────────────────────── state (UI render කරන්නේ මේකෙන්) ─────────────────────────
 @dataclass
 class Part:
@@ -194,6 +197,20 @@ class DistState:
         self.t0 = time.monotonic()
         self.enc_t0: Optional[float] = None
         self.uploaded = 0
+        # merge phase progress (UI)
+        self.merge_step = ""            # audio | mux
+        self.merge_t0 = 0.0
+        self.merge_out = 0.0            # seconds of output written
+        self.merge_size = 0
+        self.merge_speed = 0.0
+
+    @property
+    def merge_pct(self):
+        return min(self.merge_out / self.duration * 100, 99.9) if self.duration else 0.0
+
+    @property
+    def merge_elapsed(self):
+        return time.monotonic() - self.merge_t0 if self.merge_t0 else 0.0
 
     @property
     def elapsed(self):
@@ -645,13 +662,40 @@ class DistRun:
         self.stats = {"workers": 0, "local_parts": 0}
         self._rlock = asyncio.Lock()
 
-    async def _ff(self, *args):
+    async def _ff(self, *args, on_progress=None):
+        cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y"]
+        if on_progress:
+            cmd += ["-progress", "pipe:1", "-nostats"]
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-hide_banner", "-nostdin", "-y", *args,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+            *cmd, *args,
+            stdout=asyncio.subprocess.PIPE if on_progress else asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE)
         self.job.proc = proc
-        _, err = await proc.communicate()
-        self.job.proc = None
+        err_task = asyncio.create_task(proc.stderr.read())
+
+        async def pump():
+            t = size = sp = 0.0
+            async for raw in proc.stdout:
+                k, _, v = raw.decode(errors="ignore").strip().partition("=")
+                try:
+                    if k in ("out_time_us", "out_time_ms"):      # දෙකම microseconds
+                        t = int(v) / 1e6
+                    elif k == "total_size":
+                        size = int(v)
+                    elif k == "speed":
+                        sp = float(v.strip().rstrip("x") or 0)
+                    elif k == "progress":
+                        on_progress(max(t, 0.0), int(size), sp)
+                except ValueError:
+                    pass
+
+        try:
+            if on_progress:
+                await pump()
+            await proc.wait()
+            err = await err_task
+        finally:
+            self.job.proc = None
         if self.job.cancelled:
             raise asyncio.CancelledError()
         if proc.returncode != 0:
@@ -732,8 +776,7 @@ class DistRun:
 
             # 5) MERGE
             s.phase = "merge"
-            audio = await audio_task if audio_task else None
-            await self._merge(audio)
+            await self._merge(audio_task)
             return self.stats
         finally:
             if self._ensure:
@@ -747,10 +790,19 @@ class DistRun:
             for t in self.tasks:
                 t.cancel()
             await asyncio.gather(*self.tasks, return_exceptions=True)
+            # clear_job ඉක්මනින් (parallel, තත්පර 1-2) — workers ට ඊළඟ job එකට සූදානම් වෙන්න
+            with contextlib.suppress(BaseException):
+                await self.pool.clear_job()
+            # board messages (workers×) + Release assets මකන එක slow → merge/upload block නොකර background එකේ
+            t = asyncio.create_task(self._cleanup_bg())
+            _BG.add(t)
+            t.add_done_callback(_BG.discard)
+
+    async def _cleanup_bg(self):
+        with contextlib.suppress(BaseException):
             if self.board:
                 await self.board.delete()
-            await asyncio.gather(*[self._g(ai).release_delete(self.tag) for ai in self.used], return_exceptions=True)
-            await self.pool.clear_job()
+        await asyncio.gather(*[self._g(ai).release_delete(self.tag) for ai in self.used], return_exceptions=True)
 
     # ── audio (main runner, workers encode කරන අතරේ) ──
     async def _extract_audio(self) -> str:
@@ -1000,9 +1052,14 @@ class DistRun:
             await asyncio.gather(*[go(ai, ps) for ai, ps in plan.items()])
 
     # ── merge ──
-    async def _merge(self, audio: Optional[str]):
+    async def _merge(self, audio_task):
+        s = self.state
+        s.merge_t0 = time.monotonic()
+        s.merge_step = "audio"                      # audio extract තාම ඉවර නැත්නම් මෙතන තමයි බලාගෙන ඉන්නේ
+        audio = await audio_task if audio_task else None
+        s.merge_step, s.merge_out, s.merge_size = "mux", 0.0, 0
         lst = self.work / "concat.txt"
-        lst.write_text("".join(f"file '{Path(p.path).resolve()}'\n" for p in self.state.parts))
+        lst.write_text("".join(f"file '{Path(p.path).resolve()}'\n" for p in s.parts))
         args = ["-f", "concat", "-safe", "0", "-i", str(lst)]
         if audio:
             args += ["-i", audio]
@@ -1013,7 +1070,12 @@ class DistRun:
         if self.opts["codec"] == "libx265":
             args += ["-tag:v", "hvc1"]
         args += ["-movflags", "+faststart", self.dst]
-        await self._ff(*args)
+
+        def cb(t, size, sp):
+            s.merge_out, s.merge_size, s.merge_speed = t, size, sp
+
+        await self._ff(*args, on_progress=cb)
+        s.merge_out = s.duration
 
 
 def helpers_status() -> str:
