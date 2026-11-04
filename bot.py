@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from telethon import TelegramClient, events, Button
-from telethon.errors import MessageNotModifiedError, FloodWaitError
+from telethon.errors import MessageNotModifiedError, FloodWaitError, QueryIdInvalidError
 
 import config
 from config import (API_ID, API_HASH, BOT_TOKEN, SESSION_NAME, ALLOWED_USERS,
@@ -481,6 +481,16 @@ async def on_video(event):
 
 
 # ───────────────────────── callbacks ─────────────────────────
+async def safe_answer(event, *args, **kwargs):
+    """Callback query එක (තත්පර ~15කින්) expire වුණොත් QueryIdInvalidError ignore කරනවා."""
+    try:
+        await event.answer(*args, **kwargs)
+    except QueryIdInvalidError:
+        pass
+    except Exception as e:
+        logger.debug(f"callback answer failed: {e!r}")
+
+
 @client.on(events.CallbackQuery())
 async def on_callback(event):
     try:
@@ -491,22 +501,22 @@ async def on_callback(event):
     uid = event.sender_id
 
     if job_id != "0" and not job:
-        await event.answer("Job එක අවසන් / expire වෙලා.", alert=True)
+        await safe_answer(event, "Job එක අවසන් / expire වෙලා.", alert=True)
         return
     if job and uid != job.user_id:
-        await event.answer("මේක ඔයාගේ job එකක් නෙවෙයි.", alert=True)
+        await safe_answer(event, "මේක ඔයාගේ job එකක් නෙවෙයි.", alert=True)
         return
 
     if action == "res":
         if job.started:
-            await event.answer("Already in queue…")
+            await safe_answer(event, "Already in queue…")
             return
-        ok = await enqueue(job, int(arg))
-        await event.answer(f"Queued #{pending_count()}" if ok else "Queue පිරිලා", alert=not ok)
+        await safe_answer(event, "Queued ✔")      # කලින්ම answer — enqueue එක slow වුණත් query expire වෙන්නේ නෑ
+        await enqueue(job, int(arg))              # queue පිරිලා නම් enqueue එකම status message එක edit කරනවා
 
     elif action == "x":
         if job.queued and job in queue:          # තාම පටන් අරන් නෑ → queue එකෙන් අයින්
-            await event.answer("Removed")
+            await safe_answer(event, "Removed")
             await cancel_waiting(job)
             return
         job.cancelled = True
@@ -515,14 +525,14 @@ async def on_callback(event):
         if job.proc:
             with contextlib.suppress(Exception):
                 job.proc.kill()
-        await event.answer("Cancelling…")
+        await safe_answer(event, "Cancelling…")
         if not job.started:
             jobs.pop(job.id, None)
             with contextlib.suppress(Exception):
                 await job.status.edit("❌ <b>Cancelled</b>", buttons=None)
 
     elif action == "cfg":
-        await event.answer()
+        await safe_answer(event, )
         await event.edit(settings_text(uid), buttons=settings_buttons(uid, job_id))
 
     elif action in ("pre", "cod", "dst", "wrk", "qres"):
@@ -532,7 +542,7 @@ async def on_callback(event):
                 return
             arg = int(arg)
         store.set(uid, **{key: arg})
-        await event.answer(f"{arg} ✔")
+        await safe_answer(event, f"{arg} ✔")
         if action == "wrk" and pool.active and dist.available():
             # Download අතරේ වැඩි කළොත් අලුත් runners ඉක්මනින් start වෙන්න (අඩු කළොත් ඉතුරු ඒවා hold)
             async def _grow():
@@ -543,7 +553,7 @@ async def on_callback(event):
             await event.edit(settings_text(uid), buttons=settings_buttons(uid, job_id))
 
     elif action == "back":
-        await event.answer()
+        await safe_answer(event, )
         if job and not job.started:
             await show_preview(job)
         else:
