@@ -122,6 +122,24 @@ def _mini(pct: float, width: int = 8) -> str:
     return "▰" * filled + "▱" * (width - filled)
 
 
+def _render_merge(st) -> str:
+    n = len(st.parts)
+    lines = [f"✅ Encode ඉවරයි • කොටස් <b>{n}/{n}</b> download වුණා", "🔗 <b>කොටස් merge කරනවා…</b>", ""]
+    if getattr(st, "merge_step", "") == "audio":
+        lines.append(f"🔊 Audio track එක ready වෙනකම් බලාගෙන… <code>{human_time(st.merge_elapsed)}</code>")
+        return "\n".join(lines)
+    pct = st.merge_pct
+    sp = st.merge_speed
+    left = (st.duration - st.merge_out) / sp if sp > 0 else 0.0
+    lines += [
+        f"<code>[{bar(pct)}] {pct:5.1f}%</code>",
+        f"🎞 Muxed: <code>{human_time(st.merge_out)} / {human_time(st.duration)}</code>",
+        f"🚀 Speed: <code>{sp:.1f}x</code>   📦 <code>{human_size(st.merge_size)}</code>",
+        f"⏳ ETA: <code>{human_time(left)}</code>   ⏱ Merge: <code>{human_time(st.merge_elapsed)}</code>",
+    ]
+    return "\n".join(lines)
+
+
 def render_dist(st, name: str, height: int, preset: str, codec: str) -> str:
     head = (f"🌐 <b>Distributed Encode</b> → <b>{height}p</b>\n<code>{esc(short_name(name))}</code>\n"
             f"⚙️ <code>{codec} • {preset} • {st.n_workers} workers</code>\n")
@@ -130,7 +148,7 @@ def render_dist(st, name: str, height: int, preset: str, codec: str) -> str:
     if st.phase == "upload":
         return head + f"\n☁️ කොටස් {len(st.parts)} Release එකට upload කරනවා…"
     if st.phase == "merge":
-        return head + "\n🔗 <b>කොටස් merge කරනවා…</b>"
+        return head + "\n" + _render_merge(st)
     labels = {
         "waiting": "⏳ runner එකක් බලාගෙන", "uploading": "☁️ result upload",
         "remote_done": "📥 fetching", "failed": "⚠️ main එකෙන් retry", "ready": "✅ done",
