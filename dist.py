@@ -81,7 +81,8 @@ async def _bootstrap_inner(token: str, st: list) -> tuple:
     repo = f"{login}/{config.HELPER_REPO}"
     st[0] = "repo create/check"
     # repo එක දැනටමත් තියෙනවද බලනවා — තියෙනවා නම් අලුත් එකක් හදන්නේ නෑ (එකම නමින් repo එකම යළි භාවිතා කරනවා)
-    if not (await _helper_gh(token, repo, "api", f"repos/{repo}", "-q", ".full_name", check=False)).strip():
+    got = (await _helper_gh(token, repo, "api", f"repos/{repo}", "-q", ".full_name", check=False)).strip()
+    if got.lower() != repo.lower():          # 404 වුණාම gh error body එකත් stdout එකට print කරනවා → නමෙන්ම සසඳනවා
         try:
             await _helper_gh(token, repo, "api", "-X", "POST", "user/repos", "-f", f"name={config.HELPER_REPO}",
                              "-F", "private=false", "-F", "auto_init=true", "-f", "description=encoder worker")
