@@ -25,6 +25,7 @@ QUEUE_TAG = "enc-queue"
 POLL = float(os.getenv("WORKER_POLL", "3"))
 HB_STALE = 180        # main heartbeat මේ තත්පර ගණනට වඩා පරණ නම් worker exit
 JOB_MAX_AGE = 300
+STANDBY_BASE = 100    # idx >= 100 → hot standby worker (කොටසක් නැතුව ready වෙලා ඉඳලා main assign කරන part එක encode කරනවා)
 
 
 class Reporter:
@@ -147,14 +148,33 @@ def parse_hb(name) -> float:
         return 0.0
 
 
+def announce_ready(tag, idx):
+    """Standby worker එක ready බව main ට කියනවා: mailbox release එකට ready_<idx> asset එකක්."""
+    if os.getenv("QUEUE_FILE"):
+        return
+    try:
+        p = f"ready_{idx}"
+        with open(p, "w") as f:
+            f.write("1")
+        gh("release", "upload", tag, p, "--clobber", check=False)
+    except Exception as e:
+        print(f"[worker {idx}] ready announce failed: {e}", flush=True)
+
+
 async def serve():
     """Queue session එක පුරා hold වෙලා ඉඳලා jobs encode කරනවා. Queue හිස් වුණාම (state=end / release මැකුණාම) exit."""
     idx = int(os.environ["PART"])
     session = os.environ.get("SESSION", "")
     tag = f"enc-q-{session}" if session else QUEUE_TAG
-    etag, last_job, hb = None, None, 0.0
+    etag, hb = None, 0.0
+    done: set = set()                     # (job, part) — එකම part එක දෙපාරක් encode නොකරන්න
+    standby = idx >= STANDBY_BASE
+    poll = min(POLL, 2.0) if standby else POLL
     start, seen = time.time(), False
-    print(f"[worker {idx}] ready — session {session or '-'}; holding until queue ends (poll {POLL}s)", flush=True)
+    print(f"[worker {idx}] ready — session {session or '-'}; holding until queue ends (poll {poll}s)"
+          f"{' [standby]' if standby else ''}", flush=True)
+    if standby:
+        await asyncio.to_thread(announce_ready, tag, idx)
     while True:
         try:
             status, new_etag, rel = await asyncio.to_thread(poll_queue, tag, etag)
@@ -178,19 +198,27 @@ async def serve():
                 print(f"[worker {idx}] queue empty — exiting", flush=True)
                 return
             cfg = job.get("cfg")
-            if (job.get("state") == "job" and cfg and job.get("job") != last_job and idx < cfg["n"]
-                    and time.time() - job.get("ts", 0) < JOB_MAX_AGE):
-                last_job = job["job"]
-                print(f"[worker {idx}] job {last_job} → part {idx}", flush=True)
-                wd = os.path.join("work", last_job)
-                os.makedirs(wd, exist_ok=True)
-                try:
-                    await run_part(cfg, idx, wd)
-                except BaseException as e:
-                    print(f"[worker {idx}] job failed: {e}", file=sys.stderr, flush=True)
-                finally:
-                    shutil.rmtree(wd, ignore_errors=True)
-                continue            # job ඉවර → ආයෙත් hold (queue එකේ ඊළඟ job එකට)
+            if job.get("state") == "job" and cfg and time.time() - job.get("ts", 0) < JOB_MAX_AGE:
+                asg = job.get("assign") or {}
+                part = None
+                if str(idx) in asg:                       # main විසින් මේ worker එකට කෙලින්ම දුන්න part (hot standby / rescue)
+                    part = int(asg[str(idx)])
+                elif idx < cfg["n"] and idx not in (job.get("skip") or []):   # සාමාන්‍ය: worker idx = part idx
+                    part = idx
+                key = (job.get("job"), part)
+                if part is not None and part < cfg["n"] and key not in done:
+                    done.add(key)
+                    print(f"[worker {idx}] job {key[0]} → part {part}", flush=True)
+                    wd = os.path.join("work", f"{key[0]}_{part}")
+                    os.makedirs(wd, exist_ok=True)
+                    try:
+                        await run_part(cfg, part, wd)
+                    except BaseException as e:
+                        print(f"[worker {idx}] job failed: {e}", file=sys.stderr, flush=True)
+                    finally:
+                        shutil.rmtree(wd, ignore_errors=True)
+                    etag = None                           # ඊළඟ poll එකේ අලුත්ම mailbox state එක ගන්න
+                    continue                              # ඉවර → ආයෙත් hold (queue එකේ ඊළඟ job / assign එකට)
 
         now = time.time()
         if seen and hb and now - hb > HB_STALE:
@@ -199,7 +227,7 @@ async def serve():
         if not seen and now - start > 600:
             print(f"[worker {idx}] session never appeared — exiting", flush=True)
             return
-        await asyncio.sleep(POLL)
+        await asyncio.sleep(poll)
 
 
 async def single():
