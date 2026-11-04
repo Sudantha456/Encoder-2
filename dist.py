@@ -177,6 +177,9 @@ class Part:
     acct: int = 0                 # ඒ කොටස encode වෙන GitHub account index (0 = main)
     spilled: bool = False
     spill_t: float = 0.0
+    rescuing: bool = False        # rescue task එකක් දැන් මේ part එකට වැඩ කරනවා
+    orphan: bool = False          # owner account එක fail → raw part එක තවම upload වෙලා නෑ
+    last_try: float = 0.0
 
     @property
     def pct(self) -> float:
@@ -342,6 +345,10 @@ class Acct:
         self.active = False
         self.failed = False
         self.hb: Optional[asyncio.Task] = None
+        self.standby: set = set()          # 🔥 hot standby worker indices (>= STANDBY_BASE)
+        self.sb_busy: dict = {}            # standby idx -> Part
+        self.assign: dict = {}             # standby idx -> part idx (mailbox 'assign')
+        self.skip: set = set()             # වෙන account එකකට මාරු කළ parts (මෙහි workers ට start නොකර skip)
 
 
 class WorkerPool:
@@ -362,13 +369,16 @@ class WorkerPool:
         return any(a.active for a in self.accts)
 
     def _body(self, a: Acct, state="idle", **extra) -> str:
+        if state == "job":
+            extra.setdefault("assign", {str(k): v for k, v in a.assign.items()})
+            extra.setdefault("skip", sorted(a.skip))
         return json.dumps({"session": a.session, "state": state, "ts": time.time(), **extra}, separators=(",", ":"))
 
     async def _start(self, a: Acct):
         if not a.active:
             a.session = os.urandom(4).hex()
             a.tag = f"enc-q-{a.session}"
-            a.dispatched = set()
+            a.dispatched, a.standby, a.sb_busy, a.assign, a.skip = set(), set(), {}, {}, set()
             await a.gh.mailbox_create(a.tag, self._body(a))
             a.active, a.failed = True, False
             a.hb = asyncio.create_task(self._heartbeat(a))
@@ -384,7 +394,7 @@ class WorkerPool:
             errors = []
 
             async def one(a: Acct):
-                need = {i for i in range(n) if i // PER_ACCT == a.idx}
+                need = {i for i in range(n) if i % len(self.accts) == a.idx}     # round-robin: හැම account එකටම සමානව
                 if not need:
                     return
                 try:
@@ -402,6 +412,44 @@ class WorkerPool:
             await asyncio.gather(*[one(a) for a in self.accts])
             if errors and self.accts[0].failed:
                 raise DistError(f"main account dispatch failed: {errors[0]}")
+            await self._plan_standby(n)
+
+    async def _plan_standby(self, n: int):
+        """🔥 Hot standby: spare capacity තියෙන accounts වල කොටසක් නැතුව ready වෙලා ඉන්න runners.
+        Part එකක් තත්පර 5ක් ඇතුලත start නොවුණොත් main එක ඒ part එක standby runner එකකට කෙලින්ම assign කරනවා."""
+        want = config.DIST_STANDBY
+        k = len(self.accts)
+        if want <= 0 or k == 0:
+            return
+        cands = []
+        for a in self.accts:
+            if a.failed:
+                continue
+            normal = sum(1 for i in range(n) if i % k == a.idx)
+            spare = PER_ACCT - max(normal, len(a.dispatched)) - len(a.standby)
+            if spare > 0:
+                cands.append([a, spare, []])
+        todo = want - sum(len(a.standby) for a in self.accts)
+        cands.sort(key=lambda c: -c[1])
+        while todo > 0 and any(c[1] > 0 for c in cands):
+            for c in cands:
+                if todo <= 0:
+                    break
+                if c[1] > 0:
+                    c[2].append(config.STANDBY_BASE + len(c[0].standby) + len(c[2]))
+                    c[1] -= 1
+                    todo -= 1
+
+        async def disp(a: Acct, idxs: list):
+            try:
+                await self._start(a)
+                await a.gh.dispatch_workers(a.session, idxs)
+                a.standby |= set(idxs)
+                logger.info(f"🔥 [acct {a.idx}] standby workers {idxs}")
+            except Exception as e:
+                logger.warning(f"🔥 [acct {a.idx}] standby dispatch failed: {e}")
+
+        await asyncio.gather(*[disp(a, ix) for a, _, ix in cands if ix])
 
     async def _heartbeat(self, a: Acct):
         while True:
@@ -413,11 +461,13 @@ class WorkerPool:
                                for a in self.accts if a.active and not a.failed])
 
     async def clear_job(self):
+        for a in self.accts:
+            a.assign, a.skip, a.sb_busy = {}, set(), {}
         await asyncio.gather(*[a.gh.mailbox_set(a.tag, self._body(a)) for a in self.accts if a.active])
 
     def pick_spare(self, exclude: set) -> Optional[Acct]:
         """Busy/ start නොවුණ part එකකට: තවම free slots තියෙන වෙන account එකක්."""
-        c = [a for a in self.accts if a.idx not in exclude and not a.failed and len(a.dispatched) < PER_ACCT]
+        c = [a for a in self.accts if a.idx not in exclude and not a.failed and len(a.dispatched) + len(a.standby) < PER_ACCT]
         return min(c, key=lambda a: len(a.dispatched)) if c else None
 
     async def stop(self):
@@ -436,7 +486,7 @@ class WorkerPool:
             await asyncio.sleep(6)                      # workers poll කරලා 'end' දකින්න
             await asyncio.gather(*[a.gh.release_delete(a.tag) for a in act])
             for a in act:
-                a.dispatched = set()
+                a.dispatched, a.standby, a.sb_busy, a.assign, a.skip = set(), set(), {}, {}, set()
             self.halted = False                         # queue හිස් → ඊළඟ queue එකට workers ආයෙ allow
             logger.info(f"🌐 pool stopped ({len(act)} accounts)")
 
@@ -465,6 +515,7 @@ class WorkerPool:
         await asyncio.gather(*[purge(a) for a in self.accts], return_exceptions=True)
         for a in self.accts:
             a.dispatched, a.session, a.tag = set(), "", ""
+            a.standby, a.sb_busy, a.assign, a.skip = set(), {}, {}, set()
 
         cancelled = {a.idx: set() for a in self.accts}
         remaining = {a.idx: [] for a in self.accts}
@@ -592,6 +643,7 @@ class DistRun:
         self.tasks: List[asyncio.Task] = []
         self.ctls: List[types.SimpleNamespace] = []
         self.stats = {"workers": 0, "local_parts": 0}
+        self._rlock = asyncio.Lock()
 
     async def _ff(self, *args):
         proc = await asyncio.create_subprocess_exec(
@@ -631,7 +683,11 @@ class DistRun:
             files = sorted(self.work.glob("raw_part_*.mp4"), key=lambda p: int(re.findall(r"\d+", p.stem)[0]))
             if len(files) != len(bounds) - 1:
                 raise DistError(f"Split parts mismatch ({len(files)} vs {len(bounds) - 1})")
-            s.parts = [Part(i, bounds[i], bounds[i + 1] - bounds[i], acct=i // PER_ACCT) for i in range(len(files))]
+            k = len(self.pool.accts)
+            s.parts = [Part(i, bounds[i], bounds[i + 1] - bounds[i], acct=i % k) for i in range(len(files))]
+            for p in s.parts:                           # fail වුණ account එකේ parts → rescue (standby / spill)
+                if self.pool.accts[p.acct].failed:
+                    p.orphan = True
             self.stats["workers"] = len(files)
             await ensure                               # pool ready (fail → DistError → local fallback)
 
@@ -639,11 +695,11 @@ class DistRun:
             s.phase = "upload"
             groups: dict = {}
             for p, f in zip(s.parts, files):
-                groups.setdefault(p.acct, []).append(f)
+                if not p.orphan:
+                    groups.setdefault(p.acct, []).append(f)
 
             async def up(ai, fs):
-                await self._g(ai).release_create(self.tag)
-                self.used.add(ai)
+                await self._ensure_release(ai)
                 await self._g(ai).upload(self.tag, fs)
 
             await asyncio.gather(*[up(ai, fs) for ai, fs in groups.items()])   # account එකකට එහි කොටස් විතරයි
@@ -724,13 +780,27 @@ class DistRun:
         elif st == "failed":
             p.status = "failed"
 
+    async def _ensure_release(self, ai: int):
+        async with self._rlock:
+            if ai not in self.used:
+                await self._g(ai).release_create(self.tag)
+                self.used.add(ai)
+
     async def _fetch(self, p: Part):
         p.fetching = True
         try:
-            await self._g(p.acct).download(self.tag, f"encoded_part_{p.idx}.mkv", self.work)
             path = self.work / f"encoded_part_{p.idx}.mkv"
-            if not path.exists() or path.stat().st_size == 0:
-                raise DistError("empty encoded part")
+            err = None
+            # rescue වුණ part එක මුල් account එකෙන් හෝ අලුත් account එකෙන් ඉවර වෙන්න පුළුවන් → දෙකම try
+            for ai in [p.acct] + [x for x in self.used if x != p.acct]:
+                try:
+                    await self._g(ai).download(self.tag, f"encoded_part_{p.idx}.mkv", self.work)
+                    if path.exists() and path.stat().st_size > 0:
+                        break
+                except Exception as e:
+                    err = e
+            else:
+                raise DistError(f"encoded part not found ({err})")
             p.path, p.size = str(path), path.stat().st_size
             p.ready, p.status, p.speed, p.fps = True, "ready", 0.0, 0.0
         except Exception as e:
@@ -778,13 +848,17 @@ class DistRun:
                                     and assets.get(f"encoded_part_{p.idx}.mkv") == "uploaded"):
                                 p.status = "remote_done"
 
-            # start නොවුණු parts ටික ගණන් කරලා වෙන account එකකට එක workflow එකකින් (batch) යවනවා
+            # 🔥 තත්පර DIST_SPILL_AFTER (5) ඇතුලත start නොවුණු parts → ready standby runner එකකට කෙලින්ම assign
+            #    (standby නැත්නම් පස්සේ අලුත් workflow එකක් dispatch) — background task, monitor loop එක block වෙන්නේ නෑ
             stuck = [p for p in s.parts
-                     if p.status == "waiting" and not p.spilled and not p.ready
+                     if p.status == "waiting" and not p.spilled and not p.rescuing and not p.ready
                      and not p.local_started and not p.fetching
-                     and now - s.enc_t0 > config.DIST_START_TIMEOUT]
+                     and (p.orphan or now - s.enc_t0 > config.DIST_SPILL_AFTER)
+                     and now - p.last_try >= 2.0]
             if stuck:
-                await self._spill_batch(stuck)
+                for p in stuck:
+                    p.rescuing, p.last_try = True, now
+                self.tasks.append(asyncio.create_task(self._rescue(stuck)))
 
             for p in s.parts:
                 if p.ready or p.fetching:
@@ -808,6 +882,81 @@ class DistRun:
                     raise t.exception()
             await asyncio.sleep(max(1.0, PROGRESS_UPDATE_INTERVAL))
 
+    async def _rescue(self, parts: List[Part]):
+        try:
+            left = await self._to_standby(parts)
+            if left and time.monotonic() - self.state.enc_t0 >= config.DIST_SPILL_AFTER + config.DIST_COLD_AFTER:
+                await self._spill_batch(left)          # hot standby නැත්නම් විතරයි cold dispatch
+        except Exception as e:
+            logger.warning(f"rescue failed: {e!r}")
+        finally:
+            for p in parts:
+                p.rescuing = False
+
+    async def _to_standby(self, parts: List[Part]) -> List[Part]:
+        """ready (ready_<idx> asset එක දාපු) standby workers වලට parts assign කරනවා. ඉතුරු parts return."""
+        if self.pool.halted:
+            return []
+        accts = [a for a in self.pool.accts if a.active and not a.failed and a.standby]
+        left = sorted(parts, key=lambda p: p.idx)
+        if not accts:
+            return left
+
+        async def ready_of(a: Acct):
+            try:
+                assets = await a.gh.assets(a.tag)
+            except Exception:
+                return a, []
+            rdy = {int(n[6:]) for n, st in assets.items() if n.startswith("ready_") and n[6:].isdigit() and st == "uploaded"}
+            free = [i for i in sorted(rdy & a.standby)
+                    if i not in a.sb_busy or a.sb_busy[i].ready or a.sb_busy[i].status == "failed"]
+            return a, free
+
+        free = {a.idx: (a, fr) for a, fr in await asyncio.gather(*[ready_of(a) for a in accts]) if fr}
+        plan: dict = {}
+        for p in list(left):
+            if not free:
+                break
+            ai = max(free, key=lambda k: len(free[k][1]))
+            fr = free[ai][1]
+            plan.setdefault(ai, []).append((fr.pop(0), p))
+            left.remove(p)
+            if not fr:
+                free.pop(ai)
+
+        async def go(ai: int, items: list):
+            a = self.pool.accts[ai]
+            try:
+                await self._ensure_release(ai)
+                ups = [self.work / f"raw_part_{p.idx}.mp4" for _, p in items if p.acct != ai or p.orphan]
+                if ups:
+                    await a.gh.upload(self.tag, ups)
+                for sidx, p in items:
+                    a.assign[sidx] = p.idx
+                    a.sb_busy[sidx] = p
+                await a.gh.mailbox_set(a.tag, self.pool._body(a, "job", job=self.job.id, cfg=self.job_cfg))
+                t = time.monotonic()
+                olds = set()
+                for sidx, p in items:
+                    if p.acct != ai and not self.pool.accts[p.acct].failed:
+                        self.pool.accts[p.acct].skip.add(p.idx)       # මුල් worker එක තාම start වෙලා නැත්නම් skip
+                        olds.add(p.acct)
+                    p.acct, p.spilled, p.orphan, p.spill_t, p.last_change = ai, True, False, t, t
+                for oi in olds:
+                    o = self.pool.accts[oi]
+                    await o.gh.mailbox_set(o.tag, self.pool._body(o, "job", job=self.job.id, cfg=self.job_cfg))
+                logger.info(f"🔥 standby: parts {[p.idx for _, p in items]} → acct {ai} workers {[s for s, _ in items]}")
+            except Exception as e:
+                for sidx, _ in items:
+                    a.assign.pop(sidx, None)
+                    a.sb_busy.pop(sidx, None)
+                logger.warning(f"standby assign to acct {ai} failed: {e}")
+                left.extend(p for _, p in items if not p.spilled)
+
+        if plan:
+            await asyncio.gather(*[go(ai, it) for ai, it in plan.items()])
+        return left
+
     # ── runner busy / start නොවුණොත්: start නොවුණු parts ඔක්කොම ගණන් කරලා, වෙන account එකක
     #    free slots වලට **එක workflow dispatch එකකින්** යවනවා (part එකකට workflow එකක් හදන්නේ නෑ) ──
     async def _spill_batch(self, parts: List[Part]):
@@ -817,7 +966,7 @@ class DistRun:
             return
         for p in parts:
             p.spilled = True                       # එක පාරයි try කරන්නේ; බැරි වුණොත් local fallback
-        free = {a.idx: PER_ACCT - len(a.dispatched) for a in self.pool.accts if not a.failed}
+        free = {a.idx: PER_ACCT - len(a.dispatched) - len(a.standby) for a in self.pool.accts if not a.failed}
         plan: dict = {}                            # target acct idx -> [parts]
         for p in parts:
             cands = [a for a in self.pool.accts
@@ -835,16 +984,14 @@ class DistRun:
                 async with self.pool._lock:
                     await self.pool._start(a)
                 g = a.gh
-                if a.idx not in self.used:
-                    await g.release_create(self.tag)
-                    self.used.add(a.idx)
+                await self._ensure_release(a.idx)
                 await g.upload(self.tag, [self.work / f"raw_part_{i}.mp4" for i in idxs])
                 await g.mailbox_set(a.tag, self.pool._body(a, "job", job=self.job.id, cfg=self.job_cfg))
                 await g.dispatch_workers(a.session, idxs)          # ← එකම workflow run එක, matrix = idxs
                 a.dispatched |= set(idxs)
                 t = time.monotonic()
                 for p in ps:
-                    p.acct, p.spill_t, p.last_change = a.idx, t, t
+                    p.acct, p.spill_t, p.last_change, p.orphan = a.idx, t, t, False
                 logger.warning(f"spill: parts {idxs} → acct {a.idx} (workflow 1ක්)")
             except Exception as e:
                 logger.warning(f"spill batch to acct {ai} failed: {e}")
