@@ -28,6 +28,9 @@ logger = logging.getLogger("FastDL")
 CHUNK_SIZE = 1024 * 1024                                   # 1MB (Telegram max)
 DL_CONNECTIONS = getattr(_cfg, "DL_CONNECTIONS", 6)
 DL_WORKERS_PER_CONN = getattr(_cfg, "DL_WORKERS_PER_CONN", 4)
+CHUNK_TIMEOUT = 20.0                                       # chunk එකක් මේ තත්පර ගණනට වැඩි නම් retry (පරණ: 60)
+HEDGE_AFTER = 3.0                                          # end-game: chunk එකක් තත්පර 3කට වඩා inflight නම් තව worker කෙනෙක් ඒක ඉල්ලනවා
+HEDGE_MAX = 3                                              # එකම chunk එකට උපරිම එකවර requests
 BACKOFF_SCALE = 1.0                                        # retry backoff (tests වලදී අඩු කරන්න)
 SMALL_FILE = 4 * 1024 * 1024                               # මීට කුඩා නම් native
 
@@ -292,6 +295,16 @@ class FastDownloader:
             if all(l.dead for l in lanes):
                 _fatal(RuntimeError("සියලුම userbot lanes fail වුණා: " + why))
 
+        finished: set = set()
+        inflight: Dict[int, list] = {}            # off → [පටන් ගත් වෙලාව, එකවර requests ගණන]
+
+        def pick_hedge() -> Optional[int]:
+            """End-game: queue හිස්, ඒත් chunks ටිකක් slow connections වල හිරවෙලා → නිදහස් workers ඒවා නැවත ඉල්ලනවා."""
+            now = time.monotonic()
+            c = [(t0, off) for off, (t0, n) in inflight.items()
+                 if off not in finished and n < HEDGE_MAX and now - t0 >= HEDGE_AFTER]
+            return min(c)[1] if c else None
+
         async def worker(ln: Lane, widx: int):
             while not done_ev.is_set() and not ln.dead:
                 if self.is_cancelled(download_id):
@@ -300,28 +313,41 @@ class FastDownloader:
                 if wait > 0:                                   # මේ lane එක FloodWait pause එකක — chunk අල්ලන්නේ නෑ
                     await asyncio.sleep(min(wait, 1.0))
                     continue
+                hedge = False
                 try:
-                    off = await asyncio.wait_for(queue.get(), 0.5)
-                except asyncio.TimeoutError:
+                    off = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    off = pick_hedge()
+                    if off is None:
+                        await asyncio.sleep(0.1)
+                        continue
+                    hedge = True
+                if off in finished:
                     continue
+                rec = inflight.setdefault(off, [time.monotonic(), 0])
+                rec[1] += 1
                 try:
                     req = GetFileRequest(location=ln.location, offset=off, limit=CHUNK_SIZE)
-                    r = await asyncio.wait_for(ln.pool.send(req, widx), timeout=60.0)
+                    r = await asyncio.wait_for(ln.pool.send(req, widx + (1 if hedge else 0)), timeout=CHUNK_TIMEOUT)
                     data = getattr(r, "bytes", None)
                     if data is None:
                         raise RuntimeError(f"Unexpected response: {type(r).__name__}")
-                    await write_at(off, data)
-                    ln.got += len(data)
                     ln.bad = 0
-                    _prog(len(data))
-                    remaining[0] -= 1
-                    if remaining[0] <= 0:
-                        done_ev.set()
+                    if off not in finished:                    # පළමුව ඉවර වූ copy එක විතරක් ගණන් වෙනවා
+                        finished.add(off)
+                        await write_at(off, data)
+                        ln.got += len(data)
+                        _prog(len(data))
+                        remaining[0] -= 1
+                        if remaining[0] <= 0:
+                            done_ev.set()
                 except asyncio.CancelledError:
-                    queue.put_nowait(off)
+                    if not hedge and off not in finished:
+                        queue.put_nowait(off)
                     raise
                 except FloodWaitError as e:
-                    queue.put_nowait(off)                      # chunk එක වෙන lane එකකට
+                    if not hedge and off not in finished:
+                        queue.put_nowait(off)                  # chunk එක වෙන lane එකකට
                     if ln.on_flood:
                         ln.on_flood(e.seconds)
                     if e.seconds > max_flood_wait and any(l is not ln and not l.dead for l in lanes):
@@ -330,7 +356,10 @@ class FastDownloader:
                     ln.flood_until = max(ln.flood_until, time.monotonic() + e.seconds + random.uniform(0.5, 1.5))
                     logger.warning(f"[{ln.name}] FloodWait {e.seconds}s — lane paused, others continue")
                 except Exception as e:
-                    queue.put_nowait(off)
+                    if not hedge and off not in finished:
+                        queue.put_nowait(off)
+                    if hedge:
+                        continue                               # hedge copy එක fail වුණාට කමක් නෑ (මුල් එක තාම තියෙනවා)
                     n = fails[off] = fails.get(off, 0) + 1
                     msg = str(e).lower()
                     if "wait of" in msg:
@@ -345,6 +374,10 @@ class FastDownloader:
                         lane_died(ln, f"දිගටම errors ({ln.bad}): {e!r}")      # වෙන lanes ඉතුරුයි → මේක අයින්
                         return
                     await asyncio.sleep(min(2 ** (n - 1), 8) * BACKOFF_SCALE)
+                finally:
+                    rec[1] -= 1
+                    if rec[1] <= 0:
+                        inflight.pop(off, None)
 
         # workers lanes අතර interleave (A,B,C,A,B,C…) — නැත්නම් මුල් lane එකේ workers ම chunks ඔක්කොම අල්ලගන්නවා
         per = {ln.name: max(1, len(ln.pool.senders)) * wpc for ln in live}
