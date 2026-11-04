@@ -662,7 +662,7 @@ class DistRun:
         self.stats = {"workers": 0, "local_parts": 0}
         self._rlock = asyncio.Lock()
 
-    async def _ff(self, *args, on_progress=None):
+    async def _ff(self, *args, on_progress=None, track=True):
         cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y"]
         if on_progress:
             cmd += ["-progress", "pipe:1", "-nostats"]
@@ -670,7 +670,8 @@ class DistRun:
             *cmd, *args,
             stdout=asyncio.subprocess.PIPE if on_progress else asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE)
-        self.job.proc = proc
+        if track:                       # split/merge → Cancel button එකෙන් kill වෙන්න; audio (සමාන්තරව) වෙනම handle කරනවා
+            self.job.proc = proc
         err_task = asyncio.create_task(proc.stderr.read())
 
         async def pump():
@@ -694,8 +695,14 @@ class DistRun:
                 await pump()
             await proc.wait()
             err = await err_task
+        except BaseException:
+            if proc.returncode is None:
+                with contextlib.suppress(Exception):
+                    proc.kill()
+            raise
         finally:
-            self.job.proc = None
+            if track:
+                self.job.proc = None
         if self.job.cancelled:
             raise asyncio.CancelledError()
         if proc.returncode != 0:
@@ -711,7 +718,13 @@ class DistRun:
         s, meta = self.state, self.meta
         self.pool.build()
         self._ensure = None
+        audio_task = None
         try:
+            # 0) AUDIO — ඒකම මුලින්ම පටන් ගන්නවා (split/upload/encode මුළු කාලේම background එකේ ඉවර වෙනවා)
+            if self.meta.acodec and self.opts["audio_mode"] != "none":
+                audio_task = asyncio.create_task(self._extract_audio())
+                self.tasks.append(audio_task)
+
             # 1) SPLIT
             s.phase = "split"
             # pool එක ready කරන්න (download එකේදී කලින්ම පටන් අරන් නම් මේක no-op / අලුත් workers විතරක් dispatch)
@@ -752,10 +765,6 @@ class DistRun:
             chat = int(config.DIST_PROGRESS_CHAT) if config.DIST_PROGRESS_CHAT else self.job.chat_id
             self.board = self.board_cls(self.client, chat, self.job.id, len(files))
             await self.board.create()
-            audio_task = None
-            if self.meta.acodec and self.opts["audio_mode"] != "none":
-                audio_task = asyncio.create_task(self._extract_audio())
-                self.tasks.append(audio_task)
             o = self.opts
             job_cfg = {
                 "job": self.job.id, "n": len(files), "chat": chat, "ids": self.board.ids,
@@ -809,7 +818,7 @@ class DistRun:
         out = str(self.work / "audio.mka")
         o = self.opts
         a = ["-c:a", "copy"] if o["audio_mode"] == "copy" else ["-c:a", "aac", "-b:a", f"{o['abitrate']}k"]
-        await self._ff("-i", self.src, "-vn", "-sn", "-dn", "-map", "0:a?", *a, out)
+        await self._ff("-i", self.src, "-vn", "-sn", "-dn", "-map", "0:a?", *a, out, track=False)
         return out
 
     # ── monitor loop ──
