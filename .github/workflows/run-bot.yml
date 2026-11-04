@@ -67,6 +67,8 @@ jobs:
           # ඉහත පියවරෙන් decode වී ලැබුණු string එක කෙලින්ම ලබා ගනී
           USER_STRINGS: ${{ env.USER_STRINGS }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          UB_DL_CONNECTIONS: ${{ vars.UB_DL_CONNECTIONS || '6' }}
+          UB_UL_CONNECTIONS: ${{ vars.UB_UL_CONNECTIONS || '6' }}
           UB_MAX_FLOOD_WAIT: ${{ vars.UB_MAX_FLOOD_WAIT || '30' }}
           PROGRESS_UPDATE_INTERVAL: ${{ vars.PROGRESS_UPDATE_INTERVAL || '3' }}
           QUEUE_MAX: ${{ vars.QUEUE_MAX || '20' }}
