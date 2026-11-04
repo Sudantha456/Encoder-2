@@ -666,6 +666,14 @@ class DistRun:
                                     and assets.get(f"encoded_part_{p.idx}.mkv") == "uploaded"):
                                 p.status = "remote_done"
 
+            # start නොවුණු parts ටික ගණන් කරලා වෙන account එකකට එක workflow එකකින් (batch) යවනවා
+            stuck = [p for p in s.parts
+                     if p.status == "waiting" and not p.spilled and not p.ready
+                     and not p.local_started and not p.fetching
+                     and now - s.enc_t0 > config.DIST_START_TIMEOUT]
+            if stuck:
+                await self._spill_batch(stuck)
+
             for p in s.parts:
                 if p.ready or p.fetching:
                     continue
@@ -677,9 +685,6 @@ class DistRun:
                 idle = now - p.last_change
                 if p.status == "remote_done":
                     self.tasks.append(asyncio.create_task(self._fetch(p)))
-                elif (p.status == "waiting" and not p.spilled
-                      and now - s.enc_t0 > config.DIST_START_TIMEOUT and await self._spill(p)):
-                    continue                           # busy account → වෙන account එකේ free runner එකකට යැව්වා
                 elif (p.status == "failed"
                       or (p.status == "waiting" and now - max(s.enc_t0, p.spill_t) > config.DIST_START_TIMEOUT)
                       or (p.status in ("running", "uploading") and idle > config.DIST_STALE_SECONDS)):
@@ -691,29 +696,45 @@ class DistRun:
                     raise t.exception()
             await asyncio.sleep(max(1.0, PROGRESS_UPDATE_INTERVAL))
 
-    # ── runner busy / start නොවුණොත්: වෙන account එකක free slot එකකට (එකම part index එකෙන්) ──
-    async def _spill(self, p: Part) -> bool:
-        p.spilled = True
-        a = self.pool.pick_spare({p.acct})
-        if not a:
-            return False
-        try:
-            async with self.pool._lock:
-                await self.pool._start(a)
-            g = a.gh
-            if a.idx not in self.used:
-                await g.release_create(self.tag)
-                self.used.add(a.idx)
-            await g.upload(self.tag, [self.work / f"raw_part_{p.idx}.mp4"])
-            await g.mailbox_set(a.tag, self.pool._body(a, "job", job=self.job.id, cfg=self.job_cfg))
-            await g.dispatch_workers(a.session, [p.idx])
-            a.dispatched.add(p.idx)
-            logger.warning(f"part {p.idx}: acct {p.acct} busy → spill to acct {a.idx}")
-            p.acct, p.spill_t, p.last_change = a.idx, time.monotonic(), time.monotonic()
-            return True
-        except Exception as e:
-            logger.warning(f"spill failed: {e}")
-            return False
+    # ── runner busy / start නොවුණොත්: start නොවුණු parts ඔක්කොම ගණන් කරලා, වෙන account එකක
+    #    free slots වලට **එක workflow dispatch එකකින්** යවනවා (part එකකට workflow එකක් හදන්නේ නෑ) ──
+    async def _spill_batch(self, parts: List[Part]):
+        for p in parts:
+            p.spilled = True                       # එක පාරයි try කරන්නේ; බැරි වුණොත් local fallback
+        free = {a.idx: PER_ACCT - len(a.dispatched) for a in self.pool.accts if not a.failed}
+        plan: dict = {}                            # target acct idx -> [parts]
+        for p in parts:
+            cands = [a for a in self.pool.accts
+                     if a.idx != p.acct and not a.failed and free.get(a.idx, 0) > 0]
+            if not cands:
+                continue                           # spare slot නෑ → monitor එකේ local fallback
+            a = max(cands, key=lambda x: free[x.idx])
+            plan.setdefault(a.idx, []).append(p)
+            free[a.idx] -= 1
+
+        async def go(ai: int, ps: List[Part]):
+            a = self.pool.accts[ai]
+            idxs = sorted(p.idx for p in ps)
+            try:
+                async with self.pool._lock:
+                    await self.pool._start(a)
+                g = a.gh
+                if a.idx not in self.used:
+                    await g.release_create(self.tag)
+                    self.used.add(a.idx)
+                await g.upload(self.tag, [self.work / f"raw_part_{i}.mp4" for i in idxs])
+                await g.mailbox_set(a.tag, self.pool._body(a, "job", job=self.job.id, cfg=self.job_cfg))
+                await g.dispatch_workers(a.session, idxs)          # ← එකම workflow run එක, matrix = idxs
+                a.dispatched |= set(idxs)
+                t = time.monotonic()
+                for p in ps:
+                    p.acct, p.spill_t, p.last_change = a.idx, t, t
+                logger.warning(f"spill: parts {idxs} → acct {a.idx} (workflow 1ක්)")
+            except Exception as e:
+                logger.warning(f"spill batch to acct {ai} failed: {e}")
+
+        if plan:
+            await asyncio.gather(*[go(ai, ps) for ai, ps in plan.items()])
 
     # ── merge ──
     async def _merge(self, audio: Optional[str]):
