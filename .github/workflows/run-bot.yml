@@ -9,6 +9,7 @@ permissions:
   contents: write   # temp Releases (worker mailbox + parts)
   actions: write    # workers dispatch කරන්න
 
+# එකවර bot instance දෙකක් run වෙන එක වළක්වනවා (එකම token එකට conflict වෙනවා)
 concurrency:
   group: encoder-bot
   cancel-in-progress: false
@@ -64,9 +65,10 @@ jobs:
           API_HASH: ${{ secrets.API_HASH }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}
-          # ඉහත පියවරෙන් decode වී ලැබුණු string එක කෙලින්ම ලබා ගනී
-          USER_STRINGS: ${{ env.USER_STRINGS }}
-          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          # ඉහත Decode පියවරෙන් decode වී ලැබුණු string එක ලබා ගනී (නැතහොත් secrets.USER_STRINGS වෙතින්)
+          USER_STRINGS: ${{ env.USER_STRINGS || secrets.USER_STRINGS }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}          # -100xxxxxxxxxx  (හෝ invite link)
+          HELPER_TOKENS: ${{ secrets.HELPER_TOKENS }}    # tokenA,tokenB,tokenC,tokenD (classic PAT: repo + workflow)
           UB_DL_CONNECTIONS: ${{ vars.UB_DL_CONNECTIONS || '6' }}
           UB_UL_CONNECTIONS: ${{ vars.UB_UL_CONNECTIONS || '6' }}
           UB_MAX_FLOOD_WAIT: ${{ vars.UB_MAX_FLOOD_WAIT || '30' }}
@@ -74,7 +76,7 @@ jobs:
           QUEUE_MAX: ${{ vars.QUEUE_MAX || '20' }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          DIST_WORKERS: ${{ vars.DIST_WORKERS || '4' }}
+          DIST_WORKERS: ${{ vars.DIST_WORKERS || '10' }}   # default workers (/settings වලින් වෙනස් කරන්න පුළුවන්: 5-50)
           DOWNLOAD_DIR: ${{ runner.temp }}/downloads
         run: |
           python3 -u bot.py
