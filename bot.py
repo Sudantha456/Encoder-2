@@ -12,6 +12,7 @@ import shutil
 import time
 import uuid
 from collections import deque
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -176,7 +177,8 @@ async def cmd_start(event):
         "📐 Source එකට අඩු resolutions (1080p…144p) තෝරන්න (≈ size පෙන්වනවා) • Settings → 🧠 Smart = auto හොඳම එක\n"
         "⚡ High-speed download → FFmpeg encode → High-speed upload\n\n"
         "📋 Videos 20 ක් දක්වා queue කරන්න පුළුවන් — එකින් එක download → encode → upload\n"
-        "⚙️ Preset / Codec / Workers: /settings   •   📋 /queue   •   🧹 /clear"
+        "⚙️ Preset / Codec / Workers: /settings   •   📋 /queue   •   🧹 /clear\n"
+        "🌐 Worker workflows: /workflow   •   🛑 /End_Work (සේරම workers kill)"
     )
 
 
@@ -213,6 +215,137 @@ async def cmd_check(event):
     await relay.setup(client)
     await init_helpers(notify=False)
     await m.edit(relay.status_text() + "\n\n" + dist.helpers_status())
+
+
+# ───────────────────────── 🌐 /workflow  &  🛑 /End_Work ─────────────────────────
+_STATUS_ICON = {"in_progress": "▶️", "queued": "⏳", "waiting": "⏳", "requested": "⏳", "pending": "⏳"}
+end_work_lock = asyncio.Lock()
+
+
+def _age(iso: str) -> str:
+    try:
+        t = datetime.fromisoformat((iso or "").replace("Z", "+00:00"))
+        sec = max(0, int((datetime.now(timezone.utc) - t).total_seconds()))
+    except Exception:
+        return "?"
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h {m:02d}m" if h else (f"{m}m {s:02d}s" if m else f"{s}s")
+
+
+def _parts_str(idx: list) -> str:
+    idx = sorted(set(idx))
+    if not idx:
+        return "-"
+    out, start, prev = [], idx[0], idx[0]
+    for i in idx[1:] + [None]:
+        if i is not None and i == prev + 1:
+            prev = i
+            continue
+        out.append(str(start) if start == prev else f"{start}-{prev}")
+        if i is not None:
+            start = prev = i
+    return ",".join(out)
+
+
+def _acct_label(i: int) -> str:
+    return "🏠 Main" if i == 0 else f"🤝 Helper #{i}"
+
+
+@client.on(events.NewMessage(pattern=r"(?i)^/workflows?(@\w+)?(\s|$)", incoming=True))
+async def cmd_workflow(event):
+    """Worker workflows ගැන සම්පූර්ණ විස්තර (account එකින් එක: session, runs, workers)."""
+    if not allowed(event.sender_id):
+        return
+    if not dist.available():
+        await event.reply("🌐 <b>Distributed workers unavailable</b>\n<i>gh CLI / GH_TOKEN / GITHUB_REPOSITORY නෑ.</i>")
+        return
+    m = await event.reply("🔍 <b>Worker workflows බලනවා…</b>")
+    cur = current_job[0]
+    cfg = store.get(event.sender_id)
+    head = [
+        "🌐 <b>Worker Workflows</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"⚙️ Settings workers: <b>{cfg['workers']}</b> • Dist mode: <b>{esc(str(cfg['dist']))}</b> • Capacity: <b>{dist.capacity()}</b>",
+        f"📋 Queue: {'▶️ ' + esc(cur.meta.name[:30]) + ' + ' if cur else ''}<b>{len(queue)}</b> waiting",
+        f"🧠 Pool: <b>{'ACTIVE' if pool.active else 'idle'}</b>{' • 🛑 halted (/End_Work)' if pool.halted else ''}",
+    ]
+    try:
+        info = await pool.overview()
+    except Exception as e:
+        await m.edit("\n".join(head) + f"\n\n❌ GitHub query fail: <code>{esc(str(e)[:150])}</code>")
+        return
+    total_runs = total_workers = 0
+    body = []
+    for a in info:
+        runs = a["runs"]
+        total_runs += len(runs)
+        sess = f"session <code>{a['session']}</code>" if a["session"] else "session -"
+        flag = " • ❌ dispatch failed" if a["failed"] else ""
+        body.append(f"\n{_acct_label(a['idx'])} — <code>{esc(a['repo'])}</code>")
+        body.append(f"   {sess} • dispatched <b>{len(a['dispatched'])}</b> [{_parts_str(a['dispatched'])}]{flag}")
+        if a["error"]:
+            body.append(f"   ⚠️ {esc(a['error'])}")
+            continue
+        if not runs:
+            body.append("   💤 Active workflow runs නෑ")
+        for r in runs[:6]:
+            jobs = r.get("jobs", [])
+            run_n = sum(1 for j in jobs if j.get("status") == "in_progress")
+            que_n = sum(1 for j in jobs if j.get("status") in ("queued", "waiting", "pending", "requested"))
+            total_workers += run_n
+            idx = [int(x) for j in jobs for x in re.findall(r"\((\d+)\)", j.get("name", ""))]
+            body.append(f"   {_STATUS_ICON.get(r['status'], '•')} run <code>#{r['databaseId']}</code> • {r['status']} • {_age(r.get('createdAt'))}"
+                        f"\n      👷 running <b>{run_n}</b> • queued <b>{que_n}</b> • parts [{_parts_str(idx)}]")
+        if len(runs) > 6:
+            body.append(f"   … තව runs {len(runs) - 6} ක්")
+    summary = f"\n━━━━━━━━━━━━━━━━━━━━\n📊 Active runs: <b>{total_runs}</b> • Running workers: <b>{total_workers}</b>"
+    tail = "\n🛑 සේරම kill කරන්න: /End_Work" if total_runs else ""
+    text = "\n".join(head + body) + summary + tail
+    await m.edit(text[:4000])
+
+
+@client.on(events.NewMessage(pattern=r"(?i)^/end_?work(@\w+)?(\s|$)", incoming=True))
+async def cmd_end_work(event):
+    """Main + helper accounts වල run වෙන සේරම worker workflows kill (kill request 5 ක් දක්වා, kill වෙනකන්)."""
+    if not allowed(event.sender_id):
+        return
+    if not dist.available():
+        await event.reply("🌐 <b>Distributed workers unavailable</b> — kill කරන්න දෙයක් නෑ.")
+        return
+    if end_work_lock.locked():
+        await event.reply("⏳ <i>/End_Work දැනටමත් run වෙනවා…</i>")
+        return
+    async with end_work_lock:
+        m = await event.reply("🛑 <b>End Work</b> — workers kill කරනවා…")
+        live = Live(m)
+        busy = pending_count() > 0
+
+        async def prog(rnd, total, force, counts):
+            rows = "\n".join(f"   {_acct_label(i)}: <b>{n}</b> run" for i, n in counts.items() if n)
+            await live.set(f"🛑 <b>Kill request {rnd}/{total}</b>{' (force)' if force else ''}\n{rows}", force=True)
+
+        try:
+            res = await pool.kill_all(rounds=5, on_progress=prog)
+        except Exception as e:
+            logger.exception("end_work failed")
+            await m.edit(f"❌ <b>End Work fail</b>: <code>{esc(str(e)[:200])}</code>")
+            return
+        if pending_count() == 0:
+            pool.halted = False            # job එකක් නැත්නම් ඊළඟ queue එකට workers ආයෙ allow
+        left = sum(len(v) for v in res["left"].values())
+        lines = ["🛑 <b>End Work</b>", "━━━━━━━━━━━━━━━━━━━━"]
+        for i, repo in res["accts"]:
+            n, rem = res["cancelled"].get(i, 0), len(res["left"].get(i, []))
+            lines.append(f"{_acct_label(i)} <code>{esc(repo)}</code>\n   🔪 killed <b>{n}</b>" + (f" • ⚠️ තව <b>{rem}</b> ඉතුරුයි" if rem else " • ✅ clean"))
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        if left:
+            lines.append(f"⚠️ Kill requests {res['rounds']} ක් යැව්වත් runs <b>{left}</b> ඉතුරුයි — තත්පර කීපයකින් /workflow බලන්න, නැත්නම් ආයෙ /End_Work.")
+        else:
+            lines.append(f"✅ සේරම worker workflows kill වුණා (kill requests: {res['rounds']})")
+        if busy:
+            lines.append("<i>Run වෙන job එකේ කොටස් main runner එකෙන්ම encode වෙයි; අලුත් workers dispatch වෙන්නේ නෑ.</i>")
+        await m.edit("\n".join(lines))
 
 
 def queue_text() -> str:
