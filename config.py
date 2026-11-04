@@ -72,12 +72,10 @@ HELPER_TOKENS = [t for t in re.split(r"[,\s]+", os.getenv("HELPER_TOKENS", "").s
 HELPER_REPO = os.getenv("HELPER_REPO", "encoder-workers")
 DIST_WORKFLOW = os.getenv("DIST_WORKFLOW", "encode-worker.yml")
 DIST_AUTO_MIN_SECONDS = int(os.getenv("DIST_AUTO_MIN_SECONDS", "240"))  # auto mode: single-runner encode මීට වැඩි නම් විතරයි
-DIST_START_TIMEOUT = int(os.getenv("DIST_START_TIMEOUT", "10"))    # spill කළත් worker එකක් start නොවුණොත් main එකම ඒ කොටස encode කරනවා
-DIST_SPILL_AFTER = float(os.getenv("DIST_SPILL_AFTER", "5"))       # 🔥 job post කරලා තත්පර 5ක් ඇතුලත part එක start නොවුණොත් වෙන ready runner එකකට මාරු
-DIST_COLD_AFTER = float(os.getenv("DIST_COLD_AFTER", "5"))         # hot standby නැත්නම් මෙච්චර තත්පර ඉඳලා අලුත් workflow එකක් dispatch
-DIST_STANDBY = int(os.getenv("DIST_STANDBY", "0"))                # 🔥 hot standby runners (idle, ready) ගාණ — 0 = off
+DIST_START_TIMEOUT = int(os.getenv("DIST_START_TIMEOUT", "10"))    # runner එක start නොවුණොත් part එක held queue එකට යනවා
+DIST_STANDBY = int(os.getenv("DIST_STANDBY", "0"))                # optional extra idle runners — 0 = off
 STANDBY_BASE = 100                                                 # standby worker index (worker.py එකේත් 100)
-DIST_STALE_SECONDS = int(os.getenv("DIST_STALE_SECONDS", "180"))   # progress නොවෙනස් වුණොත් fallback
+DIST_STALE_SECONDS = int(os.getenv("DIST_STALE_SECONDS", "180"))   # runner progress නතර වුණොත් part එක held queue එකට
 DIST_PROGRESS_CHAT = os.getenv("DIST_PROGRESS_CHAT", "")           # හිස් = user ගේ chat එකම (messages පස්සේ delete වෙනවා)
 
 # ── 📋 Queue ──
