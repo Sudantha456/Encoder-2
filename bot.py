@@ -1,6 +1,6 @@
 """
 bot.py — Telethon Video Encoder Bot
-Video එකක් දාන්න → metadata preview → resolution (720p/480p/240p) තෝරන්න →
+Video එකක් දාන්න → metadata preview → resolution (1080p…144p) තෝරන්න →
 fast_downloader → FFmpeg (live progress) → fast_uploader
 """
 import asyncio
@@ -134,9 +134,9 @@ def settings_text(uid: int) -> str:
         f"🎞 Codec: <b>{s['codec']}</b>",
         f"🌐 Distributed (GitHub workers): <b>{s['dist']}</b>"
         + ("" if dist.available() else "  <i>(මේ environment එකේ නෑ)</i>"),
-        f"👷 Workers: <b>{s['workers']}</b>  <i>(2 – {max(WORKER_CHOICES)}; download එක යන අතරේත් වෙනස් කරන්න පුළුවන්)</i>",
+        f"👷 Workers: <b>{s['workers']}</b>  <i>({min(WORKER_CHOICES)} – {max(WORKER_CHOICES)}, accounts {1 + len(dist.HELPERS)} × {config.WORKERS_PER_ACCOUNT}; download එක යන අතරේත් වෙනස් කරන්න පුළුවන්)</i>",
         f"👤 Userbot relay: <b>{('ON ×' + str(len(relay.ready))) if relay.enabled else 'OFF'}</b>",
-        f"📋 Auto-queue: <b>{'ask (බොත්තම්)' if s['qres'] == 'ask' else s['qres'] + 'p'}</b>",
+        f"📋 Auto-queue: <b>{'ask (බොත්තම්)' if s['qres'] == 'ask' else '🧠 smart' if s['qres'] == 'smart' else s['qres'] + 'p'}</b>",
         "━━━━━━━━━━━━━━━━━━━━",
         "ultrafast → වේගවත්ම  |  veryslow → අඩුම size",
         "H.265 → size අඩුයි, encode වෙන්න වැඩි වෙලාවක් යනවා",
@@ -157,9 +157,10 @@ def settings_buttons(uid: int, job_id: str):
                  for m in ("auto", "on", "off")])
     wbtns = [Button.inline(("✅ " if s["workers"] == n else "") + f"👷{n}", cb("wrk", job_id, n))
              for n in WORKER_CHOICES]
-    rows += [wbtns[i:i + 4] for i in range(0, len(wbtns), 4)]          # 2,4,6,8 / 10,12,14,16
-    rows.append([Button.inline(("✅ " if s["qres"] == q else "") + ("📋 Ask" if q == "ask" else f"📋 {q}p"),
-                               cb("qres", job_id, q)) for q in QUEUE_RES_CHOICES])
+    rows += [wbtns[i:i + 5] for i in range(0, len(wbtns), 5)]          # 5..25 / 30..50
+    qb = [Button.inline(("✅ " if s["qres"] == q else "") + ("📋 Ask" if q == "ask" else "🧠 Smart" if q == "smart" else f"📋 {q}p"),
+                        cb("qres", job_id, q)) for q in QUEUE_RES_CHOICES]
+    rows += [qb[i:i + 3] for i in range(0, len(qb), 3)]
     rows.append([Button.inline("🔙 Back" if job_id != "0" else "✖ Close", cb("back", job_id))])
     return rows
 
@@ -172,7 +173,7 @@ async def cmd_start(event):
     await event.reply(
         "👋 <b>Video Encoder Bot</b>\n\n"
         "🎬 Video එකක් එවන්න → metadata preview එක පෙනෙයි\n"
-        "📐 720p / 480p / 240p තෝරන්න (≈ size පෙන්වනවා)\n"
+        "📐 Source එකට අඩු resolutions (1080p…144p) තෝරන්න (≈ size පෙන්වනවා) • Settings → 🧠 Smart = auto හොඳම එක\n"
         "⚡ High-speed download → FFmpeg encode → High-speed upload\n\n"
         "📋 Videos 20 ක් දක්වා queue කරන්න පුළුවන් — එකින් එක download → encode → upload\n"
         "⚙️ Preset / Codec / Workers: /settings   •   📋 /queue   •   🧹 /clear"
@@ -198,6 +199,13 @@ async def cmd_check(event):
     await relay.stop()
     relay.userbots = []
     await relay.setup(client)
+    if dist.available() and config.HELPER_TOKENS:
+        await dist.setup_helpers()
+        logger.info(f"🤝 Helper accounts ready: {len(dist.HELPERS)}/{len(config.HELPER_TOKENS)} • workers capacity {dist.capacity()}")
+        if dist.HELPER_PROBLEMS:
+            for uid in ALLOWED_USERS:
+                with contextlib.suppress(Exception):
+                    await client.send_message(uid, "⚠️ <b>Helper accounts</b>\n" + "\n".join(esc(x) for x in dist.HELPER_PROBLEMS))
     await m.edit(relay.status_text())
 
 
@@ -323,8 +331,12 @@ async def on_video(event):
     qres = store.get(job.user_id)["qres"]
     if qres != "ask":                       # auto-queue: source එකට වඩා ලොකු resolution නම් ළඟම එක
         opts = offered_targets(job.meta)
-        want = int(qres)
-        await enqueue(job, want if want in opts else min(opts, key=lambda t: abs(t - want)))
+        if qres == "smart":                 # source එකට අඩුවෙන් තියෙන හොඳම (ලොකුම) resolution එක
+            target = max(opts)
+        else:
+            want = int(qres)
+            target = want if want in opts else min(opts, key=lambda t: abs(t - want))
+        await enqueue(job, target)
     else:
         await show_preview(job)
 
@@ -386,7 +398,7 @@ async def on_callback(event):
             # Download අතරේ වැඩි කළොත් අලුත් runners ඉක්මනින් start වෙන්න (අඩු කළොත් ඉතුරු ඒවා hold)
             async def _grow():
                 with contextlib.suppress(Exception):
-                    await pool.ensure(arg)
+                    await pool.ensure(min(arg, dist.capacity()))
             asyncio.create_task(_grow())
         with contextlib.suppress(MessageNotModifiedError):
             await event.edit(settings_text(uid), buttons=settings_buttons(uid, job_id))
@@ -430,7 +442,7 @@ async def run_job(job: Job, height: int):
         if dist.should_distribute(meta, height, preset, codec, cfg["dist"]):
             async def _prestart():
                 with contextlib.suppress(Exception):
-                    await pool.ensure(store.get(job.user_id)["workers"])
+                    await pool.ensure(min(store.get(job.user_id)["workers"], dist.capacity()))
             prestart = asyncio.create_task(_prestart())
 
         # 1) DOWNLOAD ─────────────────────────────
@@ -498,7 +510,7 @@ async def run_job(job: Job, height: int):
 
         # 3a) Distributed (GitHub Actions workers) ─
         cfg = store.get(job.user_id)         # download අතරේ settings (workers…) වෙනස් කළා නම් අලුත් එක
-        n_workers = cfg["workers"]
+        n_workers = min(cfg["workers"], dist.capacity())       # accounts වලින් දෙන්න පුළුවන් උපරිමය
         if dist.should_distribute(meta, height, preset, codec, cfg["dist"]):
             dst_state = dist.DistState(meta.duration, meta.fps, n_workers)
 
