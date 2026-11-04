@@ -148,17 +148,22 @@ def parse_hb(name) -> float:
         return 0.0
 
 
-def announce_ready(tag, idx):
-    """Standby worker එක ready බව main ට කියනවා: mailbox release එකට ready_<idx> asset එකක්."""
+def announce_idle(tag, idx):
+    """Announce a one-use idle lease after startup or after finishing a part."""
     if os.getenv("QUEUE_FILE"):
         return
     try:
-        p = f"ready_{idx}"
+        # Unique marker names prevent the main runner from deleting a fresh
+        # marker when it consumes an older idle lease for this same worker.
+        p = f"idle_{idx}_{time.time_ns()}"
         with open(p, "w") as f:
             f.write("1")
-        gh("release", "upload", tag, p, "--clobber", check=False)
+        result = gh("release", "upload", tag, p, "--clobber", check=False)
+        if result.returncode != 0:
+            print(f"[worker {idx}] idle marker upload failed: {result.stderr[-200:]}", flush=True)
+        os.remove(p)
     except Exception as e:
-        print(f"[worker {idx}] ready announce failed: {e}", flush=True)
+        print(f"[worker {idx}] idle announce failed: {e}", flush=True)
 
 
 async def serve():
@@ -167,14 +172,16 @@ async def serve():
     session = os.environ.get("SESSION", "")
     tag = f"enc-q-{session}" if session else QUEUE_TAG
     etag, hb = None, 0.0
-    done: set = set()                     # (job, part) — එකම part එක දෙපාරක් encode නොකරන්න
+    attempted: set = set()                # (job, part, attempt) — mailbox replay de-duplication
     standby = idx >= STANDBY_BASE
     poll = min(POLL, 2.0) if standby else POLL
     start, seen = time.time(), False
+    idle_announced = False
     print(f"[worker {idx}] ready — session {session or '-'}; holding until queue ends (poll {poll}s)"
           f"{' [standby]' if standby else ''}", flush=True)
     if standby:
-        await asyncio.to_thread(announce_ready, tag, idx)
+        await asyncio.to_thread(announce_idle, tag, idx)
+        idle_announced = True
     while True:
         try:
             status, new_etag, rel = await asyncio.to_thread(poll_queue, tag, etag)
@@ -201,13 +208,20 @@ async def serve():
             if job.get("state") == "job" and cfg and time.time() - job.get("ts", 0) < JOB_MAX_AGE:
                 asg = job.get("assign") or {}
                 part = None
-                if str(idx) in asg:                       # main විසින් මේ worker එකට කෙලින්ම දුන්න part (hot standby / rescue)
-                    part = int(asg[str(idx)])
+                attempt = 0
+                if str(idx) in asg:                       # main විසින් මේ idle worker එකට දුන්න part
+                    entry = asg[str(idx)]
+                    if isinstance(entry, dict):
+                        part = int(entry.get("part", -1))
+                        attempt = int(entry.get("attempt", 0))
+                    else:                                  # older mailbox compatibility
+                        part = int(entry)
                 elif idx < cfg["n"] and idx not in (job.get("skip") or []):   # සාමාන්‍ය: worker idx = part idx
                     part = idx
-                key = (job.get("job"), part)
-                if part is not None and part < cfg["n"] and key not in done:
-                    done.add(key)
+                key = (job.get("job"), part, attempt)
+                if part is not None and 0 <= part < cfg["n"] and key not in attempted:
+                    attempted.add(key)
+                    idle_announced = False
                     print(f"[worker {idx}] job {key[0]} → part {part}", flush=True)
                     wd = os.path.join("work", f"{key[0]}_{part}")
                     os.makedirs(wd, exist_ok=True)
@@ -217,8 +231,18 @@ async def serve():
                         print(f"[worker {idx}] job failed: {e}", file=sys.stderr, flush=True)
                     finally:
                         shutil.rmtree(wd, ignore_errors=True)
+                    # A completed (or failed) runner remains alive and can be
+                    # assigned another held part by the main scheduler.
+                    await asyncio.to_thread(announce_idle, tag, idx)
+                    idle_announced = True
                     etag = None                           # ඊළඟ poll එකේ අලුත්ම mailbox state එක ගන්න
                     continue                              # ඉවර → ආයෙත් hold (queue එකේ ඊළඟ job / assign එකට)
+
+                # A worker whose own part was moved to another runner, or an
+                # extra matrix slot, is also reusable once it has read the job.
+                if not idle_announced:
+                    await asyncio.to_thread(announce_idle, tag, idx)
+                    idle_announced = True
 
         now = time.time()
         if seen and hb and now - hb > HB_STALE:
