@@ -127,11 +127,12 @@ async def setup_helpers():
     res = await asyncio.gather(*[_bootstrap_helper(t) for t in config.HELPER_TOKENS], return_exceptions=True)
     for i, r in enumerate(res, 1):
         if isinstance(r, BaseException):
-            HELPER_PROBLEMS.append(f"Helper #{i}: {r}")
+            t = config.HELPER_TOKENS[i - 1]
+            HELPER_PROBLEMS.append(f"Token #{i} (…{t[-4:]}): {r}")
             logger.error(HELPER_PROBLEMS[-1])
         else:
             HELPERS.append(r)
-            logger.info(f"🤝 helper #{i} ready: {r[1]}")
+            logger.info(f"🤝 token #{i} ready: {r[1]}")
 
 
 # ───────────── single-runner encode time estimate (auto mode) ─────────────
