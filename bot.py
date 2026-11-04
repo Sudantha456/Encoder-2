@@ -187,6 +187,18 @@ async def cmd_settings(event):
     await event.reply(settings_text(event.sender_id), buttons=settings_buttons(event.sender_id, "0"))
 
 
+async def init_helpers(notify: bool = True):
+    """Helper GitHub accounts bootstrap (repo/files/secret) — bot start එකේදීත්, /check එකේදීත්."""
+    if not (dist.available() and config.HELPER_TOKENS):
+        return
+    await dist.setup_helpers()
+    logger.info(f"🤝 Helper accounts ready: {len(dist.HELPERS)}/{len(config.HELPER_TOKENS)} • workers capacity {dist.capacity()}")
+    if notify and dist.HELPER_PROBLEMS:
+        for uid in ALLOWED_USERS:
+            with contextlib.suppress(Exception):
+                await client.send_message(uid, dist.helpers_status())
+
+
 @client.on(events.NewMessage(pattern=r"^/check", incoming=True))
 async def cmd_check(event):
     """Userbots + private channel setup එක ආයෙ පරීක්ෂා කරනවා (job එකක් run වෙන්නේ නැති වෙලාවක)."""
@@ -199,14 +211,8 @@ async def cmd_check(event):
     await relay.stop()
     relay.userbots = []
     await relay.setup(client)
-    if dist.available() and config.HELPER_TOKENS:
-        await dist.setup_helpers()
-        logger.info(f"🤝 Helper accounts ready: {len(dist.HELPERS)}/{len(config.HELPER_TOKENS)} • workers capacity {dist.capacity()}")
-        if dist.HELPER_PROBLEMS:
-            for uid in ALLOWED_USERS:
-                with contextlib.suppress(Exception):
-                    await client.send_message(uid, "⚠️ <b>Helper accounts</b>\n" + "\n".join(esc(x) for x in dist.HELPER_PROBLEMS))
-    await m.edit(relay.status_text())
+    await init_helpers(notify=False)
+    await m.edit(relay.status_text() + "\n\n" + dist.helpers_status())
 
 
 def queue_text() -> str:
@@ -656,6 +662,7 @@ async def main():
     logger.info(f"🌐 Distributed workers: {'available (on-demand per queue)' if dist.available() else 'unavailable'}")
     me = await client.get_me()
     await relay.setup(client)
+    await init_helpers()
     if relay.configured and not relay.enabled:           # setup වැරදි නම් admins ට කෙළින්ම කියනවා
         for uid in ALLOWED_USERS:
             with contextlib.suppress(Exception):
