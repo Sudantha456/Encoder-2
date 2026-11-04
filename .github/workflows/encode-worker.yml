@@ -28,7 +28,7 @@ jobs:
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os
-          idx = sorted({int(i) for i in json.loads(os.environ["INDICES"])})[:16]
+          idx = sorted({int(i) for i in json.loads(os.environ["INDICES"])})[:50]
           print("matrix=" + json.dumps({"part": idx}, separators=(",", ":")))
           PY
 
