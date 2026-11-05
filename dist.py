@@ -997,4 +997,30 @@ class DistRun:
                         sp = float(v.strip().rstrip("x") or 0)
                     elif k == "progress":
                         on_progress(max(t, 0.0), int(size), sp)
-                except ValueError:
+                except ValueError:                except ValueError:
+                    pass
+
+        try:
+            if on_progress:
+                await pump()
+            await proc.wait()
+            err = await err_task
+        except BaseException:
+            if proc.returncode is None:
+                with contextlib.suppress(Exception):
+                    proc.kill()
+            raise
+        finally:
+            if track:
+                self.job.proc = None
+        if self.job.cancelled:
+            raise asyncio.CancelledError()
+        if proc.returncode != 0:
+            raise DistError("ffmpeg failed: " + err.decode(errors="ignore")[-400:])
+
+    async def run(self) -> dict:
+        return await self._run()
+
+    def _g(self, ai: int):
+        return self.pool.accts[ai].gh
+
