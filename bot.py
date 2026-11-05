@@ -998,3 +998,14 @@ async def run_job(job: Job, height: int):
         await live.set("❌ <b>Cancelled</b>", force=True)
         await persist_queue_state()
     except Exception as e:
+        logger.exception("Job failed: %s", e)
+        phase[0] = "error"
+        live.buttons = None
+        with contextlib.suppress(Exception):
+            await live.set(
+                f"❌ <b>Job failed</b>\\n<code>{esc(str(e)[:300])}</code>",
+                force=True,
+            )
+        with contextlib.suppress(Exception):
+            await persist_queue_state()
+        raise
