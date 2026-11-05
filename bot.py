@@ -29,7 +29,8 @@ from fast_downloader import get_downloader, init_download_engine
 from fast_uploader import get_uploader
 from userbots import Relay
 from media import (VideoMeta, telegram_meta, probe_remote, ffprobe, apply_probe,
-                   offered_targets, estimate_size, render_preview, short_side, guard_kbps)
+                   offered_targets, estimate_size, render_preview, short_side, guard_kbps,
+                   resolve_preset, resolve_crf)
 from settings_store import SettingsStore
 from transcoder import EncState, transcode
 import dist
@@ -47,6 +48,9 @@ relay = Relay()                         # userbots ↔ private channel
 queue: deque = deque()                  # බලාගෙන ඉන්න jobs (FIFO)
 current_job = [None]                    # දැන් run වෙන job එක
 queue_task: Optional[asyncio.Task] = None
+queue_paused = False
+queue_resume = asyncio.Event()
+queue_resume.set()
 probe_sem = asyncio.Semaphore(3)        # videos 20ක් එකවර දැම්මොත් probe flood වෙන එක වළක්වන්න
 
 
@@ -63,10 +67,17 @@ class Job:
     proc: object = None
     height: int = 0
     queued: bool = False
+    priority: int = 0
     live: object = None
+    resume_checkpoint: object = None
+    completed: bool = False
+    dist_state: object = None
+    dist_pool: object = None
 
 
 jobs = {}
+queue_state_lock = asyncio.Lock()
+_restoring_queue = False
 
 
 # ───────────────────────── helpers ─────────────────────────
@@ -252,7 +263,7 @@ def _acct_label(i: int) -> str:
     return "🏠 Main" if i == 0 else f"🤝 Helper #{i}"
 
 
-@client.on(events.NewMessage(pattern=r"(?i)^/workflows?(@\w+)?(\s|$)", incoming=True))
+@client.on(events.NewMessage(pattern=r"(?i)^/(workflows?|workers)(@\w+)?(\s|$)", incoming=True))
 async def cmd_workflow(event):
     """Worker workflows ගැන සම්පූර්ණ විස්තර (account එකින් එක: session, runs, workers)."""
     if not allowed(event.sender_id):
@@ -305,6 +316,56 @@ async def cmd_workflow(event):
     await m.edit(text[:4000])
 
 
+@client.on(events.NewMessage(pattern=r"(?i)^/workerstats(@\w+)?(\s|$)", incoming=True))
+async def cmd_workerstats(event):
+    if not allowed(event.sender_id):
+        return
+    job = current_job[0]
+    if not job or not job.dist_state:
+        await event.reply("📊 <b>Worker stats</b>\nදැනට distributed encode job එකක් run වෙන්නේ නෑ.")
+        return
+    st = job.dist_state
+    active = sum(1 for p in st.parts if p.status in ("running", "uploading"))
+    held = sum(1 for p in st.parts if p.status == "held")
+    done = sum(1 for p in st.parts if p.ready)
+    lines = ["📊 <b>Live Worker Statistics</b>", f"🎬 <code>{esc(job.meta.name[:45])}</code>",
+             f"👷 Active <b>{active}</b> • Held <b>{held}</b> • Completed <b>{done}/{len(st.parts)}</b>",
+             f"🚀 Aggregate <b>{st.fps:.0f} FPS</b> • <b>{st.speed:.2f}x</b>",
+             f"♻️ Reassigned <b>{getattr(st, 'reassigned_parts', 0)}</b>", ""]
+    for p in st.parts[:24]:
+        state = "✅ done" if p.ready else p.status
+        lines.append(f"Part {p.idx + 1}: <b>{esc(state)}</b> • worker {p.runner_idx} / acct {p.acct}"
+                     + (f" • {p.fps:.0f} FPS • {p.speed:.2f}x" if p.fps or p.speed else ""))
+    if len(st.parts) > 24:
+        lines.append(f"… තවත් parts {len(st.parts) - 24} ක්")
+    if job.dist_pool:
+        scores = [(a.idx, wi, score) for a in job.dist_pool.accts
+                  for wi, score in a.worker_scores.items()]
+        if scores:
+            lines += ["", "<b>Best observed workers</b>"]
+            for ai, wi, score in sorted(scores, key=lambda x: x[2], reverse=True)[:8]:
+                lines.append(f"• Account {ai} / worker {wi}: <b>{score:.0f}</b> score")
+    await event.reply("\n".join(lines)[:4000])
+
+
+@client.on(events.NewMessage(pattern=r"(?i)^/health(@\w+)?(\s|$)", incoming=True))
+async def cmd_health(event):
+    if not allowed(event.sender_id):
+        return
+    job = current_job[0]
+    lines = ["🩺 <b>Encoder System Health</b>",
+             f"📋 Queue: <b>{len(queue)}</b> waiting • {'⏸ paused' if queue_paused else '▶️ active'}",
+             f"🎬 Current job: <b>{'yes' if job else 'no'}</b>",
+             f"🌐 GitHub workers: <b>{'available' if dist.available() else 'unavailable'}</b> • capacity <b>{dist.capacity() if dist.available() else 0}</b>",
+             f"👷 Pool: <b>{'active' if pool.active else 'idle'}</b>{' • halted' if pool.halted else ''}",
+             f"👤 Userbot relay: <b>{'ready' if relay.enabled and relay.ready else 'off / fallback'}</b>",
+             f"💾 JSON queue persistence: <b>{'available' if dist.available() else 'unavailable'}</b>"]
+    if job and job.dist_state:
+        st = job.dist_state
+        lines.append(f"📈 Encode: <b>{st.percent:.1f}%</b> • <b>{st.fps:.0f} FPS</b> • <b>{st.speed:.2f}x</b>")
+    await event.reply("\n".join(lines))
+
+
 @client.on(events.NewMessage(pattern=r"(?i)^/end_?work(@\w+)?(\s|$)", incoming=True))
 async def cmd_end_work(event):
     """Main + helper accounts වල run වෙන සේරම worker workflows kill (kill request 5 ක් දක්වා, kill වෙනකන්)."""
@@ -320,6 +381,14 @@ async def cmd_end_work(event):
         m = await event.reply("🛑 <b>End Work</b> — workers kill කරනවා…")
         live = Live(m)
         busy = pending_count() > 0
+        if current_job[0]:
+            current_job[0].cancelled = True
+            get_downloader().cancel(current_job[0].id)
+            get_uploader().cancel(current_job[0].id)
+            if current_job[0].proc:
+                with contextlib.suppress(Exception):
+                    current_job[0].proc.kill()
+        await persist_queue_state()
 
         async def prog(rnd, total, force, counts):
             rows = "\n".join(f"   {_acct_label(i)}: <b>{n}</b> run" for i, n in counts.items() if n)
@@ -355,6 +424,8 @@ def queue_text() -> str:
         rows.append(f"▶️ <b>Running</b>: <code>{esc(cur.meta.name[:40])}</code> → {cur.height}p")
     for i, j in enumerate(queue, 1):
         rows.append(f"{i}. <code>{esc(j.meta.name[:40])}</code> → {j.height}p")
+    if queue_paused:
+        rows.insert(0, "⏸ <b>Queue paused</b>")
     if not rows:
         return "📭 Queue හිස්."
     return f"📋 <b>Queue</b> ({len(queue) + (1 if cur else 0)}/{QUEUE_MAX})\n━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(rows)
@@ -376,9 +447,73 @@ async def cmd_clear(event):
     await event.reply(f"🧹 Queue එකෙන් {len(mine)} ක් ඉවත් කළා. (දැන් run වෙන එක නවත්තන්න ඒකේ ❌ Cancel)")
 
 
+@client.on(events.NewMessage(pattern=r"(?i)^/pause(@\w+)?(\s|$)", incoming=True))
+async def cmd_pause(event):
+    global queue_paused
+    if not allowed(event.sender_id):
+        return
+    queue_paused = True
+    queue_resume.clear()
+    await event.reply("⏸ <b>Queue paused</b> — දැනට run වෙන video එක ඉවර වෙනවා; ඊළඟ job එක start වෙන්නේ /resume කළාම.")
+
+
+@client.on(events.NewMessage(pattern=r"(?i)^/resume(@\w+)?(\s|$)", incoming=True))
+async def cmd_resume(event):
+    global queue_paused
+    if not allowed(event.sender_id):
+        return
+    queue_paused = False
+    queue_resume.set()
+    await event.reply("▶️ <b>Queue resumed</b> — ඊළඟ job එක start කරනවා.")
+
+
+@client.on(events.NewMessage(pattern=r"(?i)^/cancel(@\w+)?(\s|$)", incoming=True))
+async def cmd_cancel(event):
+    if not allowed(event.sender_id):
+        return
+    job = current_job[0]
+    if not job or job.user_id != event.sender_id:
+        await event.reply("දැනට cancel කළ හැකි running job එකක් නැහැ.")
+        return
+    job.cancelled = True
+    get_downloader().cancel(job.id)
+    get_uploader().cancel(job.id)
+    if job.proc:
+        with contextlib.suppress(Exception):
+            job.proc.kill()
+    await persist_queue_state()
+    await event.reply("🛑 Current job එක cancel කරනවා. එයට assign කළ workers පමණක් stop/release කරනවා.")
+
+
 # ───────────────────────── queue ─────────────────────────
 def pending_count() -> int:
     return len(queue) + (1 if current_job[0] else 0)
+
+
+async def _queue_record(job: Job) -> dict:
+    return {
+        "id": job.id, "user_id": int(job.user_id), "chat_id": int(job.chat_id),
+        "message_id": int(getattr(job.message, "id", 0) or 0),
+        "status_message_id": int(getattr(job.status, "id", 0) or 0),
+        "height": int(job.height), "priority": int(getattr(job, "priority", 0) or 0),
+        "cancelled": bool(job.cancelled),
+        "completed": bool(job.completed), "source_name": getattr(job.meta, "name", ""),
+        "queued_at": int(time.time()),
+    }
+
+
+async def persist_queue_state():
+    """Persist the active and waiting queue as a small JSON Release asset (no DB)."""
+    if _restoring_queue or not dist.available():
+        return
+    async with queue_state_lock:
+        cur = current_job[0]
+        current = await _queue_record(cur) if cur and not cur.cancelled and not cur.completed else None
+        waiting = [await _queue_record(j) for j in list(queue)
+                   if not j.cancelled and not j.completed]
+        payload = {"version": 1, "updated_at": int(time.time()), "paused": bool(queue_paused),
+                   "current": current, "queued": waiting}
+        await dist.save_queue_snapshot(payload)
 
 
 async def cancel_waiting(job: Job):
@@ -389,6 +524,7 @@ async def cancel_waiting(job: Job):
     with contextlib.suppress(Exception):
         await job.status.edit("❌ <b>Cancelled</b>", buttons=None)
     await refresh_positions()
+    await persist_queue_state()
 
 
 async def refresh_positions():
@@ -398,6 +534,25 @@ async def refresh_positions():
                              "ඉස්සරහ jobs ඉවර වුණාම ස්වයංක්‍රීයව පටන් ගන්නවා.", force=True)
 
 
+def _rebalance_queue_fairness():
+    """Priority first, then round-robin by sender while preserving per-user FIFO."""
+    by_priority = {}
+    for item in queue:
+        priority = int(getattr(item, "priority", 0) or 0)
+        per_user, order = by_priority.setdefault(priority, ({}, []))
+        if item.user_id not in per_user:
+            per_user[item.user_id] = deque()
+            order.append(item.user_id)
+        per_user[item.user_id].append(item)
+    queue.clear()
+    for priority in sorted(by_priority, reverse=True):
+        per_user, order = by_priority[priority]
+        while any(per_user.values()):
+            for uid in order:
+                if per_user[uid]:
+                    queue.append(per_user[uid].popleft())
+
+
 async def enqueue(job: Job, height: int) -> bool:
     global queue_task
     if pending_count() >= QUEUE_MAX:
@@ -405,10 +560,21 @@ async def enqueue(job: Job, height: int) -> bool:
             await job.status.edit(f"🚫 Queue පිරිලා ({QUEUE_MAX}/{QUEUE_MAX}). ටිකක් ඉඳලා ආයෙ එවන්න.", buttons=None)
         jobs.pop(job.id, None)
         return False
+    user_pending = sum(1 for x in queue if x.user_id == job.user_id)
+    if current_job[0] and current_job[0].user_id == job.user_id:
+        user_pending += 1
+    if user_pending >= config.QUEUE_USER_MAX:
+        with contextlib.suppress(Exception):
+            await job.status.edit(f"🚫 ඔයාගේ queue limit එක {config.QUEUE_USER_MAX} jobs. පරණ job එකක් ඉවර වූ පසු නැවත එවන්න.", buttons=None)
+        jobs.pop(job.id, None)
+        return False
     job.height, job.queued, job.started = height, True, True
+    job.priority = 1 if job.user_id in config.QUEUE_PRIORITY_USERS else 0
     job.live = Live(job.status, [[Button.inline("❌ Cancel", cb("x", job.id))]])
     queue.append(job)
+    _rebalance_queue_fairness()
     await refresh_positions()
+    await persist_queue_state()
     if queue_task is None or queue_task.done():
         queue_task = asyncio.create_task(queue_loop())
     return True
@@ -420,22 +586,33 @@ async def queue_loop():
     try:
         while True:
             while queue:
+                await queue_resume.wait()
                 job = queue.popleft()
                 if job.cancelled:
                     continue
                 current_job[0] = job
                 await refresh_positions()
+                await persist_queue_state()
                 try:
                     await run_job(job, job.height)
                 except Exception:
                     logger.exception("run_job crashed")
                 finally:
                     current_job[0] = None
+                    await persist_queue_state()
+                # /End_Work cancels the active worker pool. The next queued job
+                # starts a fresh session instead of inheriting the halted flag.
+                if pool.halted and queue:
+                    pool.halted = False
             with contextlib.suppress(Exception):
                 await pool.stop()
             if not queue:           # stop අතරේ අලුත් job ආවොත් ආයෙ loop
-                queue_task = None
-                return
+                with contextlib.suppress(Exception):
+                    await dist.clear_queue_snapshot()
+                if not queue:       # clear_queue_snapshot() අතරතුර enqueue වුණාද බලන්න
+                    queue_task = None
+                    return
+            await persist_queue_state()
     finally:
         if current_job[0] is None and not queue:
             queue_task = None
@@ -525,6 +702,7 @@ async def on_callback(event):
         if job.proc:
             with contextlib.suppress(Exception):
                 job.proc.kill()
+        await persist_queue_state()
         await safe_answer(event, "Cancelling…")
         if not job.started:
             jobs.pop(job.id, None)
@@ -569,6 +747,11 @@ async def run_job(job: Job, height: int):
     meta = job.meta
     cfg = store.get(job.user_id)
     preset, codec = cfg["preset"], cfg["codec"]
+    resume = job.resume_checkpoint if isinstance(job.resume_checkpoint, dict) else {}
+    saved_run_opts = resume.get("run_opts") if resume else None
+    if isinstance(saved_run_opts, dict) and int(saved_run_opts.get("target", -1)) == int(height):
+        preset = str(saved_run_opts.get("preset", preset))
+        codec = str(saved_run_opts.get("codec", codec))
     est_size = estimate_size(meta, height, preset, codec)
 
     workdir = Path(DOWNLOAD_DIR) / job.id
@@ -588,10 +771,13 @@ async def run_job(job: Job, height: int):
             raise asyncio.CancelledError()
 
         # 0) Workers ඉක්මන් start: download එක යන අතරේම runners ready කරන්න ─
-        if dist.should_distribute(meta, height, preset, codec, cfg["dist"]):
+        # On resume, revoke the previous session before dispatching any new
+        # runners. DistRun performs that revocation before its own ensure().
+        if (not resume and dist.should_distribute(meta, height, preset, codec, cfg["dist"])):
             async def _prestart():
                 with contextlib.suppress(Exception):
-                    await pool.ensure(min(store.get(job.user_id)["workers"], dist.capacity()))
+                    requested = min(store.get(job.user_id)["workers"], dist.capacity())
+                    await pool.ensure(dist.worker_budget(meta.duration, requested))
             prestart = asyncio.create_task(_prestart())
 
         # 1) DOWNLOAD ─────────────────────────────
@@ -642,6 +828,11 @@ async def run_job(job: Job, height: int):
         if not apply_probe(meta, await ffprobe(str(src))):
             raise RuntimeError("Valid video stream එකක් හමු වුණේ නෑ.")
 
+        # Auto profile uses the actual downloaded-file metadata, not Telegram's
+        # approximate attributes, to choose a suitable preset and CRF.
+        preset = resolve_preset(meta, height, codec, preset)
+        crf = resolve_crf(meta, height, codec, CRF[codec])
+
         # 3) ENCODE ───────────────────────────────
         phase[0] = "enc"
         # Audio: source එකේ bitrate එකට වඩා වැඩි කරන්නේ නෑ; AAC & අඩු නම් copy
@@ -652,15 +843,29 @@ async def run_job(job: Job, height: int):
             ab = min(ab, src_ab)
         enc_opts = dict(
             target=height, scale=short_side(meta) > height, portrait=meta.height > meta.width,
-            preset=preset, codec=codec, crf=CRF[codec], maxrate_kbps=guard_kbps(meta, height),
+            preset=preset, codec=codec, crf=crf, maxrate_kbps=guard_kbps(meta, height),
             abitrate=ab, audio_mode="copy" if ac else "aac",
+            subtitle_indexes=[s["index"] for s in meta.subtitle_streams
+                              if s.get("codec") in ("subrip", "ass", "ssa", "mov_text", "webvtt", "text")],
         )
+        if isinstance(saved_run_opts, dict) and int(saved_run_opts.get("target", -1)) == int(height):
+            allowed_opt_keys = set(enc_opts)
+            restored_opts = {k: v for k, v in saved_run_opts.items() if k in allowed_opt_keys}
+            enc_opts.update(restored_opts)
+            preset, codec = enc_opts["preset"], enc_opts["codec"]
+            crf = enc_opts["crf"]
+
         encoded = False
 
         # 3a) Distributed (GitHub Actions workers) ─
         cfg = store.get(job.user_id)         # download අතරේ settings (workers…) වෙනස් කළා නම් අලුත් එක
-        n_workers = min(cfg["workers"], dist.capacity())       # accounts වලින් දෙන්න පුළුවන් උපරිමය
-        if dist.should_distribute(meta, height, preset, codec, cfg["dist"]):
+        requested_workers = min(cfg["workers"], dist.capacity())
+        if resume and isinstance(resume.get("stats"), dict):
+            requested_workers = min(int(resume["stats"].get("workers", requested_workers) or requested_workers),
+                                    max(1, dist.capacity()))
+        n_workers = dist.worker_budget(meta.duration, requested_workers)
+        resume_distributed = bool(resume and (isinstance(saved_run_opts, dict) or resume.get("parts")))
+        if resume_distributed or dist.should_distribute(meta, height, preset, codec, cfg["dist"]):
             dst_state = dist.DistState(meta.duration, meta.fps, n_workers)
 
             async def dist_ticker():
@@ -672,7 +877,8 @@ async def run_job(job: Job, height: int):
             try:
                 run = dist.DistRun(client=client, job=job, src=src, dst=dst, meta=meta,
                                    state=dst_state, opts=enc_opts, workdir=workdir,
-                                   pool=pool, n_workers=n_workers)
+                                   pool=pool, n_workers=n_workers, resume_manifest=resume or None)
+                job.dist_state, job.dist_pool = dst_state, pool
                 dstats = await run.run()
                 stats["enc_time"], stats["enc_speed"] = dst_state.elapsed, meta.duration / max(dst_state.elapsed, 1)
                 stats["workers"] = dstats["workers"]
@@ -708,8 +914,9 @@ async def run_job(job: Job, height: int):
                 await transcode(
                     str(src), str(dst), st, job,
                     target=height, scale=enc_opts["scale"], portrait=enc_opts["portrait"],
-                    preset=preset, codec=codec, crf=CRF[codec], abitrate=ab,
+                    preset=preset, codec=codec, crf=crf, abitrate=ab,
                     maxrate_kbps=enc_opts["maxrate_kbps"], audio_mode=enc_opts["audio_mode"],
+                    subtitle_indexes=enc_opts["subtitle_indexes"],
                 )
             finally:
                 ticker.cancel()
@@ -761,6 +968,8 @@ async def run_job(job: Job, height: int):
             with contextlib.suppress(Exception):
                 await client.edit_message(sent, caption)
         phase[0] = "done"
+        job.completed = True
+        await persist_queue_state()
 
         saved = (1 - out_size / meta.size) * 100 if meta.size else 0
         live.buttons = None
@@ -784,42 +993,8 @@ async def run_job(job: Job, height: int):
 
     except asyncio.CancelledError:
         phase[0] = "stop"
+        job.cancelled = True
         live.buttons = None
         await live.set("❌ <b>Cancelled</b>", force=True)
+        await persist_queue_state()
     except Exception as e:
-        phase[0] = "stop"
-        logger.exception("job failed")
-        live.buttons = None
-        await live.set(f"⚠️ <b>Failed</b>\n<code>{esc(str(e)[-900:])}</code>", force=True)
-    finally:
-        if ch_ids or ch_out[0] is not None:
-            with contextlib.suppress(Exception):
-                await relay.cleanup(client, ch_ids, ch_out[0], ch_out[1])
-        await dl.cleanup(job.id)
-        await ul.cleanup(job.id)
-        shutil.rmtree(workdir, ignore_errors=True)
-        jobs.pop(job.id, None)
-
-
-async def main():
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    await client.start(bot_token=BOT_TOKEN)
-    await init_download_engine()
-    logger.info(f"🌐 Distributed workers: {'available (on-demand per queue)' if dist.available() else 'unavailable'}")
-    me = await client.get_me()
-    await relay.setup(client)
-    await init_helpers()
-    if relay.configured and not relay.enabled:           # setup වැරදි නම් admins ට කෙළින්ම කියනවා
-        for uid in ALLOWED_USERS:
-            with contextlib.suppress(Exception):
-                await client.send_message(uid, relay.status_text() + "\n\n<i>Fallback: bot එකෙන්ම download/upload. "
-                                          "හදලා /check කරන්න.</i>")
-    logger.info(f"✅ @{me.username} running • update interval {PROGRESS_UPDATE_INTERVAL}s")
-    try:
-        await client.run_until_disconnected()
-    finally:
-        await relay.stop()
-
-
-if __name__ == "__main__":
-    client.loop.run_until_complete(main())

@@ -156,7 +156,10 @@ def render_dist(st, name: str, height: int, preset: str, codec: str) -> str:
     }
     lines = [head, f"<code>[{bar(st.percent)}] {st.percent:5.1f}%</code>",
              f"🎞 Video: <code>{human_time(st.out_time)} / {human_time(st.duration)}</code>",
-             f"🚀 Speed: <code>{st.speed:.2f}x</code> realtime (මුළු එකතුව) • <code>{st.fps:.0f} fps</code>"]
+             f"🚀 Speed: <code>{st.speed:.2f}x</code> realtime (මුළු එකතුව) • <code>{st.fps:.0f} fps</code>",
+             f"👷 Active: <code>{sum(1 for p in st.parts if p.status in ('running', 'uploading'))}</code>"
+             f" • Held: <code>{sum(1 for p in st.parts if p.status == 'held')}</code>"
+             f" • Reassigned: <code>{getattr(st, 'reassigned_parts', 0)}</code>"]
     if st.est_total_frames:
         lines.append(f"🖼 Frames: <code>{st.frame:,} / ≈{st.est_total_frames:,}</code>")
     lines.append(f"⏳ ETA: <code>{human_time(st.eta)}</code>   ⏱ Elapsed: <code>{human_time(st.elapsed)}</code>")
@@ -164,10 +167,16 @@ def render_dist(st, name: str, height: int, preset: str, codec: str) -> str:
     if st.est_final_size:
         size += f"  (≈ final <code>{human_size(st.est_final_size)}</code>)"
     lines += [size, "", "<b>Workers</b>"]
-    for p in st.parts:
+    # Telegram editMessageText is limited to 4096 chars. Keep the live panel
+    # compact even when adaptive splitting creates many small parts.
+    visible = st.parts[:18]
+    for p in visible:
         if p.status == "running":
             txt = f"{_mini(p.pct)} {p.pct:3.0f}% • {p.speed:.1f}x"
         else:
             txt = labels.get(p.status, p.status)
         lines.append(f"<code>{p.idx + 1}</code> {txt}")
+    hidden = len(st.parts) - len(visible)
+    if hidden > 0:
+        lines.append(f"… තවත් <code>{hidden}</code> parts. `/workerstats` බලන්න.")
     return "\n".join(lines)

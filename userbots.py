@@ -17,6 +17,7 @@ Flood protection:
 import asyncio
 import contextlib
 import logging
+import os
 import time
 from typing import List, Optional
 
@@ -46,6 +47,8 @@ class UserBot:
         self.error = ""
         self.cooldown_until = 0.0
         self.floods = 0                    # මේ run එකේ ආපු FloodWait ගණන
+        self.download_rate = 0.0
+        self.upload_rate = 0.0
 
     @property
     def label(self) -> str:
@@ -219,7 +222,8 @@ class Relay:
     # ───────────────────────── userbot side ─────────────────────────
     def _order(self) -> List[UserBot]:
         """Flood අඩු / cooldown නැති userbots මුලින්."""
-        return sorted(self.ready, key=lambda u: (u.cooling, u.floods, u.idx))
+        return sorted(self.ready, key=lambda u: (u.cooling, u.floods,
+                                                  -(u.download_rate + u.upload_rate), u.idx))
 
     async def _lane_for(self, ub: UserBot, ch_msg_id: int, connections: int):
         """(Lane, file_size) හෝ None"""
@@ -253,8 +257,17 @@ class Relay:
         if total < 8 * 1024 * 1024:               # පොඩි file → userbot එකක් ඇති
             lanes = lanes[:1]
         logger.info(f"📥 relay download: {total / 1048576:.1f}MB via {', '.join(l.name for l in lanes)}")
-        return await dl.download_lanes(lanes, total, save_path, job_id, progress_cb,
-                                       max_flood_wait=config.UB_MAX_FLOOD_WAIT)
+        started = time.monotonic()
+        result = await dl.download_lanes(lanes, total, save_path, job_id, progress_cb,
+                                         max_flood_wait=config.UB_MAX_FLOOD_WAIT)
+        elapsed = max(time.monotonic() - started, 0.1)
+        by_name = {u.name: u for u in self.userbots}
+        for lane in lanes:
+            ub = by_name.get(lane.name)
+            if ub and lane.rate_bps:
+                ub.download_rate = lane.rate_bps
+        logger.info(f"📥 relay effective speed: {total / elapsed / 1048576:.2f} MB/s")
+        return result
 
     async def upload(self, up, path: str, job_id: str, progress_cb):
         """(userbot, channel message). Flood වුණොත් ඊළඟ userbot එකෙන්."""
@@ -265,9 +278,11 @@ class Relay:
                 continue
             try:
                 logger.info(f"📤 relay upload via {ub.name}")
+                started = time.monotonic()
                 msg = await up.upload_file(ub.client, ub.entity, path, job_id, progress_cb,
                                            connections=config.UB_UL_CONNECTIONS,
                                            max_flood_wait=config.UB_MAX_FLOOD_WAIT, use_main=False)
+                ub.upload_rate = os.path.getsize(path) / max(time.monotonic() - started, 0.1)
                 return ub, msg
             except LongFloodWait as e:
                 ub.flood(e.seconds)

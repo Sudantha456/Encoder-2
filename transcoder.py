@@ -1,6 +1,7 @@
 """FFmpeg runner with live -progress parsing."""
 import asyncio
 import logging
+import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -50,16 +51,24 @@ class EncState:
 
 
 def build_cmd(src, dst, *, target, scale, portrait, preset, codec, crf, abitrate=0,
-              maxrate_kbps=0, audio_mode="aac", container="mp4"):
+              maxrate_kbps=0, audio_mode="aac", container="mp4", subtitle_indexes=None):
     """audio_mode: aac | copy | none     container: mp4 | mkv"""
     vf = []
     if scale:
         vf.append(f"scale={target}:-2" if portrait else f"scale=-2:{target}")
     vf.append("format=yuv420p")
-    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-i", src, "-map", "0:v:0"]
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-xerror", "-i", src, "-map", "0:v:0"]
     if audio_mode != "none":
         cmd += ["-map", "0:a?"]
-    cmd += ["-sn", "-dn", "-vf", ",".join(vf), "-c:v", codec, "-preset", preset, "-crf", str(crf)]
+    cmd += ["-dn", "-vf", ",".join(vf), "-c:v", codec, "-preset", preset, "-crf", str(crf)]
+    subtitle_indexes = [int(x) for x in (subtitle_indexes or []) if int(x) >= 0]
+    if subtitle_indexes:
+        for stream_index in subtitle_indexes:
+            cmd += ["-map", f"0:{stream_index}"]
+        cmd += ["-c:s", "mov_text"]
+    else:
+        cmd += ["-sn"]
+    cmd += ["-fps_mode:v", "passthrough"]
     if maxrate_kbps:
         cmd += ["-maxrate", f"{maxrate_kbps}k", "-bufsize", f"{maxrate_kbps * 2}k"]
     if codec == "libx265":
@@ -101,6 +110,7 @@ async def transcode(src: str, dst: str, state: EncState, job, **opts):
 
     drain_task = asyncio.create_task(drain())
     state.started = time.monotonic()
+    rc = -1
     try:
         while True:
             raw = await proc.stdout.readline()
@@ -123,12 +133,34 @@ async def transcode(src: str, dst: str, state: EncState, job, **opts):
                 state.finished = True
         rc = await proc.wait()
         await drain_task
+    except BaseException:
+        if proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+        raise
     finally:
         if proc.returncode is None:
             proc.kill()
+            await proc.wait()
+        if not drain_task.done():
+            drain_task.cancel()
+            await asyncio.gather(drain_task, return_exceptions=True)
         job.proc = None
 
     if job.cancelled:
         raise asyncio.CancelledError("cancelled")
     if rc != 0:
         raise RuntimeError("FFmpeg failed:\n" + "\n".join(err_tail))
+    if not os.path.isfile(dst) or os.path.getsize(dst) < 1024:
+        raise RuntimeError("FFmpeg output is missing or too small")
+    probe = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+        "stream=codec_type", "-of", "csv=p=0", dst,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    probe_out, probe_err = await asyncio.wait_for(probe.communicate(), timeout=30)
+    if probe.returncode != 0 or not probe_out.strip():
+        raise RuntimeError("FFmpeg output failed validation: " + probe_err.decode(errors="ignore")[-250:])

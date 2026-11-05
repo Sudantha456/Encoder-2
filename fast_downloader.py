@@ -48,6 +48,8 @@ class Lane:
     dead: bool = False
     got: int = 0                                  # මේ lane එකෙන් download කළ bytes
     bad: int = 0                                  # දිගටම ආපු errors (සාර්ථක chunk එකකින් reset)
+    started_at: float = 0.0
+    rate_bps: float = 0.0
     on_flood: Optional[Callable[[int], None]] = None   # (seconds) → userbot pool එකට දැනුම් දෙන්න
 
 
@@ -164,6 +166,9 @@ class FastDownloader:
                     data = getattr(res, "bytes", None)
                     if data is None:
                         raise RuntimeError(f"Unexpected response: {type(res).__name__}")
+                    expected = min(CHUNK_SIZE, total_size - off)
+                    if len(data) != expected:
+                        raise RuntimeError(f"Chunk {off} size mismatch ({len(data)} != {expected})")
                     await write_at(off, data)
                     _prog(len(data))
                     return
@@ -206,6 +211,9 @@ class FastDownloader:
             await asyncio.gather(*tasks)
             if downloaded < total_size:
                 raise RuntimeError(f"Incomplete download {downloaded}/{total_size}")
+            if os.fstat(fd).st_size != total_size:
+                raise RuntimeError("Downloaded file size does not match Telegram metadata")
+            os.fsync(fd)
             return save_path
         except BaseException:
             for t in tasks:
@@ -234,6 +242,7 @@ class FastDownloader:
         # 1) pools (පොඩි stagger එකක් — එකවර connect කරද්දී flood වෙන එක අඩු කරන්න)
         async def start_lane(i: int, ln: Lane):
             await asyncio.sleep(i * 0.25)
+            ln.started_at = time.monotonic()
             ln.pool = SenderPool(ln.client, ln.dc_id, ln.connections, use_main=False)
             await asyncio.wait_for(ln.pool.start(), timeout=60.0)
 
@@ -332,11 +341,16 @@ class FastDownloader:
                     data = getattr(r, "bytes", None)
                     if data is None:
                         raise RuntimeError(f"Unexpected response: {type(r).__name__}")
+                    expected = min(CHUNK_SIZE, total_size - off)
+                    if len(data) != expected:
+                        raise RuntimeError(f"Chunk {off} size mismatch ({len(data)} != {expected})")
                     ln.bad = 0
                     if off not in finished:                    # පළමුව ඉවර වූ copy එක විතරක් ගණන් වෙනවා
                         finished.add(off)
                         await write_at(off, data)
                         ln.got += len(data)
+                        elapsed = max(time.monotonic() - (ln.started_at or time.monotonic()), 0.1)
+                        ln.rate_bps = ln.got / elapsed
                         _prog(len(data))
                         remaining[0] -= 1
                         if remaining[0] <= 0:
@@ -398,6 +412,9 @@ class FastDownloader:
                     break
             if downloaded[0] < total_size:
                 raise RuntimeError(f"Incomplete download {downloaded[0]}/{total_size}")
+            if os.fstat(fd).st_size != total_size:
+                raise RuntimeError("Downloaded file size does not match Telegram metadata")
+            os.fsync(fd)
             logger.info("lane summary: " + ", ".join(f"{l.name}={l.got / 1048576:.0f}MB" for l in lanes))
             return save_path
         except BaseException:
@@ -431,6 +448,11 @@ class FastDownloader:
                 path = await client.download_media(message, file=save_path, progress_callback=_prog)
                 if not path:
                     raise RuntimeError("Native download_media returned no path")
+                expected = getattr(getattr(message, "document", None), "size", 0) or 0
+                actual = os.path.getsize(path) if os.path.isfile(path) else 0
+                if expected and actual != expected:
+                    self.force_delete_file(path)
+                    raise RuntimeError(f"Native download size mismatch ({actual}/{expected})")
                 return path
             except asyncio.CancelledError:
                 self.force_delete_file(save_path)

@@ -5,6 +5,7 @@ Silent Network Hangs (Freezes) වළක්වා ගැනීමට asyncio.wai
 """
 import os
 import asyncio
+import contextlib
 import time
 import json
 import logging
@@ -313,7 +314,17 @@ class FastUploader:
                     send_coro = client.send_file(chat_id, file=uploaded_file, caption=caption, attributes=[DocumentAttributeFilename(file_name=filename)], force_document=True)
 
                 # Send File Commit Timeout (2 Mins maximum)
-                return await asyncio.wait_for(send_coro, timeout=120.0)
+                sent = await asyncio.wait_for(send_coro, timeout=120.0)
+                # Telegram commit verification: reject a server-side truncated
+                # document rather than reporting a successful delivery.
+                sent_doc = getattr(sent, "document", None)
+                if sent_doc and int(getattr(sent_doc, "size", 0) or 0) != int(file_size):
+                    with contextlib.suppress(Exception):
+                        await client.delete_messages(chat_id, sent.id)
+                    raise RuntimeError(
+                        f"Telegram upload size mismatch ({getattr(sent_doc, 'size', 0)}/{file_size})"
+                    )
+                return sent
 
             except asyncio.CancelledError:
                 raise
@@ -353,4 +364,3 @@ def get_uploader() -> FastUploader:
     if _uploader is None:
         _uploader = FastUploader()
     return _uploader
-

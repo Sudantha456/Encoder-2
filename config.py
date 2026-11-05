@@ -25,11 +25,12 @@ SETTINGS_FILE = os.getenv("SETTINGS_FILE", "user_settings.json")
 DEFAULT_PRESET = "ultrafast"
 DEFAULT_CODEC = "libx264"
 
-PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast",
+PRESETS = ["auto", "ultrafast", "superfast", "veryfast", "faster", "fast",
            "medium", "slow", "slower", "veryslow"]
 CODECS = {"libx264": "H.264 (libx264)", "libx265": "H.265 (libx265)"}
 
 PRESET_INFO = {
+    "auto":       "🧠 Resolution / FPS / codec අනුව වේගය සහ quality balance කරනවා",
     "ultrafast": "⚡ වේගවත්ම • Quality අඩු • File size ඉතා විශාලයි",
     "superfast": "🚀 ඉතා වේගවත් • size විශාලයි",
     "veryfast":  "🏃 වේගවත් • size ටිකක් විශාලයි",
@@ -72,14 +73,24 @@ HELPER_TOKENS = [t for t in re.split(r"[,\s]+", os.getenv("HELPER_TOKENS", "").s
 HELPER_REPO = os.getenv("HELPER_REPO", "encoder-workers")
 DIST_WORKFLOW = os.getenv("DIST_WORKFLOW", "encode-worker.yml")
 DIST_AUTO_MIN_SECONDS = int(os.getenv("DIST_AUTO_MIN_SECONDS", "240"))  # auto mode: single-runner encode මීට වැඩි නම් විතරයි
-DIST_START_TIMEOUT = int(os.getenv("DIST_START_TIMEOUT", "10"))    # runner එක start නොවුණොත් part එක held queue එකට යනවා
-DIST_STANDBY = int(os.getenv("DIST_STANDBY", "0"))                # optional extra idle runners — 0 = off
+DIST_START_TIMEOUT = int(os.getenv("DIST_START_TIMEOUT", "45"))   # GitHub queue delay එකට ඉඩ දී පසුව held කරනවා
+DIST_STANDBY = int(os.getenv("DIST_STANDBY", "1"))                 # at least one spare runner for dispatch/start failures
 STANDBY_BASE = 100                                                 # standby worker index (worker.py එකේත් 100)
-DIST_STALE_SECONDS = int(os.getenv("DIST_STALE_SECONDS", "180"))   # runner progress නතර වුණොත් part එක held queue එකට
+DIST_STALE_SECONDS = int(os.getenv("DIST_STALE_SECONDS", "240"))   # runner progress නතර වුණොත් part එක held queue එකට
+DIST_MAX_PART_ATTEMPTS = max(2, int(os.getenv("DIST_MAX_PART_ATTEMPTS", "8")))
+DIST_IDLE_MARKER_TTL = max(60, int(os.getenv("DIST_IDLE_MARKER_TTL", "900")))
+DIST_FETCH_RETRIES = max(1, int(os.getenv("DIST_FETCH_RETRIES", "4")))
+DIST_CHECKPOINT_INTERVAL = max(5, int(os.getenv("DIST_CHECKPOINT_INTERVAL", "15")))
+DIST_LEASE_POLL_SECONDS = max(5, int(os.getenv("DIST_LEASE_POLL_SECONDS", "5")))
+DIST_MIN_PART_SECONDS = max(5, float(os.getenv("DIST_MIN_PART_SECONDS", "20")))
+DIST_MAX_PARTS = max(1, min(100, int(os.getenv("DIST_MAX_PARTS", "100"))))
+DIST_SPARE_DISPATCH_COOLDOWN = max(10, int(os.getenv("DIST_SPARE_DISPATCH_COOLDOWN", "30")))
 DIST_PROGRESS_CHAT = os.getenv("DIST_PROGRESS_CHAT", "")           # හිස් = user ගේ chat එකම (messages පස්සේ delete වෙනවා)
 
 # ── 📋 Queue ──
 QUEUE_MAX = int(os.getenv("QUEUE_MAX", "20"))      # එකවර queue එකේ තියෙන්න පුළුවන් උපරිම videos
+QUEUE_USER_MAX = max(1, int(os.getenv("QUEUE_USER_MAX", "5")))
+QUEUE_PRIORITY_USERS = {int(x) for x in os.getenv("QUEUE_PRIORITY_USERS", "").split(",") if x.strip()}
 QUEUE_RES_CHOICES = ["ask", "smart"] + [str(r) for r in RESOLUTIONS]   # auto-queue: "ask" = බොත්තම්, "smart" = source එකට අඩුවෙන් තියෙන හොඳම resolution එක
 
 MAX_UPLOAD_BYTES = 2000 * 1024 * 1024    # bot upload limit ≈ 2GB

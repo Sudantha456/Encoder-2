@@ -74,6 +74,7 @@ jobs:
           UB_MAX_FLOOD_WAIT: ${{ vars.UB_MAX_FLOOD_WAIT || '30' }}
           PROGRESS_UPDATE_INTERVAL: ${{ vars.PROGRESS_UPDATE_INTERVAL || '3' }}
           QUEUE_MAX: ${{ vars.QUEUE_MAX || '20' }}
+          QUEUE_PRIORITY_USERS: ${{ vars.QUEUE_PRIORITY_USERS || '' }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           DIST_WORKERS: ${{ vars.DIST_WORKERS || '10' }}   # default workers (/settings වලින් වෙනස් කරන්න පුළුවන්: 5-50)

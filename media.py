@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeFilename
@@ -41,6 +41,7 @@ class VideoMeta:
     abitrate: int = 0
     container: str = ""
     probed: bool = False
+    subtitle_streams: list = field(default_factory=list)
 
 
 # ───────────────────────── Telegram attrs ─────────────────────────
@@ -89,6 +90,10 @@ def apply_probe(m: VideoMeta, info: dict) -> bool:
     v = next((s for s in streams if s.get("codec_type") == "video"
               and not s.get("disposition", {}).get("attached_pic")), None)
     a = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    m.subtitle_streams = [
+        {"index": int(s.get("index", -1)), "codec": s.get("codec_name", "unknown")}
+        for s in streams if s.get("codec_type") == "subtitle" and int(s.get("index", -1)) >= 0
+    ]
     if not v:
         return False
     fmt = info.get("format", {})
@@ -216,6 +221,37 @@ def target_dims(m: VideoMeta, t: int):
         return w - w % 2, h - h % 2
     r = t / s
     return int(round(w * r / 2) * 2), int(round(h * r / 2) * 2)
+
+
+def resolve_preset(m: VideoMeta, target: int, codec: str, requested: str) -> str:
+    """Choose a conservative CPU-aware FFmpeg preset when the user selects Auto."""
+    allowed = {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}
+    if requested != "auto":
+        return requested if requested in allowed else "ultrafast"
+    w, h = target_dims(m, target)
+    pixels = max(0, w * h)
+    fps = m.fps or 30.0
+    if codec == "libx265":
+        # x265 is more CPU intensive; keep a fast preset on hosted runners.
+        return "ultrafast" if pixels >= 1920 * 1080 or fps >= 50 else "superfast"
+    if pixels >= 2560 * 1440 or fps >= 50:
+        return "ultrafast"
+    if pixels >= 1920 * 1080:
+        return "superfast"
+    if pixels >= 1280 * 720:
+        return "veryfast"
+    return "faster"
+
+
+def resolve_crf(m: VideoMeta, target: int, codec: str, base: int) -> int:
+    """Small resolution-aware CRF adjustment; size guard remains the hard bitrate ceiling."""
+    if target >= 1080:
+        value = base - 1
+    elif target <= 480:
+        value = base + 1
+    else:
+        value = base
+    return max(16 if codec == "libx264" else 20, min(34, value))
 
 
 def guard_kbps(m: VideoMeta, t: int) -> int:

@@ -8,6 +8,7 @@ Progress: Telegram Bot API editMessageText (main bot හදපු message එක
 Env: PART, SESSION, BOT_TOKEN, GH_TOKEN, GH_REPO  (single mode: CONFIG)
 """
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -24,8 +25,9 @@ from transcoder import EncState, transcode
 QUEUE_TAG = "enc-queue"
 POLL = float(os.getenv("WORKER_POLL", "3"))
 HB_STALE = 180        # main heartbeat මේ තත්පර ගණනට වඩා පරණ නම් worker exit
-JOB_MAX_AGE = 300
+JOB_MAX_AGE = 86400
 STANDBY_BASE = 100    # idx >= 100 → hot standby worker (කොටසක් නැතුව ready වෙලා ඉඳලා main assign කරන part එක encode කරනවා)
+LEASE_POLL = max(5.0, float(os.getenv("DIST_LEASE_POLL_SECONDS", "5")))
 
 
 class Reporter:
@@ -56,17 +58,46 @@ class Reporter:
 
 
 def gh(*args, check=True):
-    r = subprocess.run(["gh", *args], capture_output=True, text=True)
-    if check and r.returncode != 0:
-        raise RuntimeError(f"gh {' '.join(args[:2])} failed: {r.stderr[-300:]}")
+    for attempt in range(4):
+        r = subprocess.run(["gh", *args], capture_output=True, text=True)
+        combined = (r.stdout + "\n" + r.stderr).lower()
+        limited = any(term in combined for term in (
+            "api rate limit exceeded", "secondary rate limit", "abuse detection",
+            "rate limit for this resource", "retry-after"))
+        if r.returncode == 0 or not limited or attempt == 3:
+            if check and r.returncode != 0:
+                raise RuntimeError(f"gh {' '.join(args[:2])} failed: {r.stderr[-300:]}")
+            return r
+        delay = min(3 * (2 ** attempt), 30)
+        import re
+        match = re.search(r"retry[- ]after[: ]+(\d+)", combined)
+        if match:
+            delay = min(max(int(match.group(1)), 1), 60)
+        print(f"[github] rate limited; retrying in {delay}s", flush=True)
+        time.sleep(delay)
     return r
 
 
-async def run_part(cfg: dict, idx: int, workdir: str = "."):
+async def _valid_video(path: str) -> bool:
+    if not os.path.isfile(path) or os.path.getsize(path) < 256:
+        return False
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=codec_type", "-of", "csv=p=0", path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=25)
+        return proc.returncode == 0 and bool(out.strip())
+    except Exception:
+        return False
+
+
+async def run_part(cfg: dict, idx: int, workdir: str = ".", worker_idx: int = -1, attempt: int = 0):
     """එක කොටසක් encode + upload. Fail වුණොත් 'failed' report කරලා exception raise."""
     tag = f"enc-{cfg['job']}"
     raw = os.path.join(workdir, f"raw_part_{idx}.mp4")
     dst = os.path.join(workdir, f"encoded_part_{idx}.mkv")
+    tmp_dst = os.path.join(workdir, f"encoded_part_{idx}.partial.mkv")
     st = EncState(duration=cfg["durations"][idx], src_fps=cfg["fps"])
     rep = Reporter(cfg, idx)
     ctl = types.SimpleNamespace(cancelled=False, proc=None)
@@ -77,15 +108,42 @@ async def run_part(cfg: dict, idx: int, workdir: str = "."):
             await rep.send("running", st)
             await asyncio.sleep(interval)
 
-    async def watchdog():  # Release delete වුණොත් (cancel / main ඉවර) නවතිනවා
+    async def watchdog():  # Lease revoke / queue close / Release delete detect කරනවා
+        etag = None
         while True:
-            await asyncio.sleep(30)
-            r = await asyncio.to_thread(gh, "release", "view", tag, "--json", "id", check=False)
-            if r.returncode != 0 and "not found" in r.stderr.lower():
-                ctl.cancelled = True
-                if ctl.proc:
-                    ctl.proc.kill()
+            await asyncio.sleep(LEASE_POLL)
+            if worker_idx >= 0:
+                try:
+                    status, new_etag, rel = await asyncio.to_thread(poll_queue, tag, etag)
+                    if status == 200 and rel:
+                        etag = new_etag
+                        try:
+                            mailbox = json.loads(rel.get("body") or "{}")
+                        except Exception:
+                            mailbox = {}
+                        if mailbox.get("state") == "end" or mailbox.get("job") != cfg.get("job"):
+                            ctl.cancelled = True
+                        else:
+                            skip = {int(x) for x in (mailbox.get("skip") or [])}
+                            assigned = (mailbox.get("assign") or {}).get(str(worker_idx))
+                            if assigned is not None:
+                                current_part = int(assigned.get("part", -1)) if isinstance(assigned, dict) else int(assigned)
+                                current_attempt = int(assigned.get("attempt", 0)) if isinstance(assigned, dict) else 0
+                                if current_part != idx or current_attempt != attempt:
+                                    ctl.cancelled = True
+                            elif worker_idx != idx or idx in skip:
+                                ctl.cancelled = True
+                    elif status == 404:
+                        ctl.cancelled = True
+                except Exception as e:
+                    # Temporary API failures do not revoke a lease.
+                    print(f"[lease] check failed: {e}", flush=True)
+            if ctl.cancelled:
+                if ctl.proc and ctl.proc.returncode is None:
+                    ctl.proc.terminate()
                 return
+            # poll_queue already returns 404 when the mailbox Release is removed;
+            # a second gh release-view request here only burns API quota.
 
     bg = []
     try:
@@ -93,18 +151,33 @@ async def run_part(cfg: dict, idx: int, workdir: str = "."):
         if not os.path.exists(raw):
             await asyncio.to_thread(gh, "release", "download", tag, "-p", f"raw_part_{idx}.mp4",
                                     "-D", workdir, "--clobber")
-        if not os.path.exists(raw):
-            raise RuntimeError("raw part not found")
+        if not await _valid_video(raw):
+            raise RuntimeError("raw part missing, truncated, or has no video stream")
         bg = [asyncio.create_task(ticker()), asyncio.create_task(watchdog())]
-        await transcode(raw, dst, st, ctl, target=cfg["target"], scale=cfg["scale"], portrait=cfg["portrait"],
+        with contextlib.suppress(OSError):
+            os.remove(tmp_dst)
+        await transcode(raw, tmp_dst, st, ctl, target=cfg["target"], scale=cfg["scale"], portrait=cfg["portrait"],
                         preset=cfg["preset"], codec=cfg["codec"], crf=cfg["crf"], maxrate_kbps=cfg["maxrate"],
                         audio_mode="none", container="mkv")
+        if ctl.cancelled:
+            raise asyncio.CancelledError("worker lease revoked")
+        if not await _valid_video(tmp_dst):
+            raise RuntimeError("encoded output failed ffprobe integrity check")
+        os.replace(tmp_dst, dst)
         for t in bg:
             t.cancel()
         await rep.send("uploading", st)
         await asyncio.to_thread(gh, "release", "upload", tag, dst, "--clobber")
         st.finished = True
         await rep.send("done", st)
+        return st
+    except asyncio.CancelledError:
+        for t in bg:
+            t.cancel()
+        with contextlib.suppress(OSError):
+            os.remove(tmp_dst)
+        await rep.send("cancelled", st, "lease released")
+        raise
     except BaseException as e:
         for t in bg:
             t.cancel()
@@ -148,14 +221,14 @@ def parse_hb(name) -> float:
         return 0.0
 
 
-def announce_idle(tag, idx):
+def announce_idle(tag, idx, score=0.0):
     """Announce a one-use idle lease after startup or after finishing a part."""
     if os.getenv("QUEUE_FILE"):
         return
     try:
         # Unique marker names prevent the main runner from deleting a fresh
         # marker when it consumes an older idle lease for this same worker.
-        p = f"idle_{idx}_{time.time_ns()}"
+        p = f"idle_{idx}_{time.time_ns()}_{max(0, int(float(score) * 10))}"
         with open(p, "w") as f:
             f.write("1")
         result = gh("release", "upload", tag, p, "--clobber", check=False)
@@ -177,6 +250,7 @@ async def serve():
     poll = min(POLL, 2.0) if standby else POLL
     start, seen = time.time(), False
     idle_announced = False
+    worker_score = 0.0
     print(f"[worker {idx}] ready — session {session or '-'}; holding until queue ends (poll {poll}s)"
           f"{' [standby]' if standby else ''}", flush=True)
     if standby:
@@ -226,14 +300,16 @@ async def serve():
                     wd = os.path.join("work", f"{key[0]}_{part}")
                     os.makedirs(wd, exist_ok=True)
                     try:
-                        await run_part(cfg, part, wd)
+                        result = await run_part(cfg, part, wd, worker_idx=idx, attempt=attempt)
+                        if result:
+                            worker_score = max(worker_score, result.fps, result.avg_speed * cfg.get("fps", 1))
                     except BaseException as e:
                         print(f"[worker {idx}] job failed: {e}", file=sys.stderr, flush=True)
                     finally:
                         shutil.rmtree(wd, ignore_errors=True)
                     # A completed (or failed) runner remains alive and can be
                     # assigned another held part by the main scheduler.
-                    await asyncio.to_thread(announce_idle, tag, idx)
+                    await asyncio.to_thread(announce_idle, tag, idx, worker_score)
                     idle_announced = True
                     etag = None                           # ඊළඟ poll එකේ අලුත්ම mailbox state එක ගන්න
                     continue                              # ඉවර → ආයෙත් hold (queue එකේ ඊළඟ job / assign එකට)
