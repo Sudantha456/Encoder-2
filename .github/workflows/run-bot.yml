@@ -43,21 +43,30 @@ jobs:
 
       - name: Decode & Assemble User Strings
         env:
-          S1: ${{ secrets.USER_STRING_1 }}
-          S2: ${{ secrets.USER_STRING_2 }}
-          S3: ${{ secrets.USER_STRING_3 }}
+          SECRETS_CONTEXT: ${{ toJson(secrets) }}
         run: |
-          sessions=()
+          # secrets context එකෙන් USER_STRING_ වලින් පටන් ගන්නා සියල්ල (USER_STRING_1, 2, 3, 4...) 
+          # ස්වයංක්‍රීයව decode කර comma-separated string එකක් ලෙස සකසයි
+          USER_STRINGS=$(python3 -c '
+          import json, os, base64
 
-          # එක් එක් secret අගයක් ඇත්නම් පමණක් base64 decode කර array එකට එකතු කරයි
-          [ -n "$S1" ] && sessions+=("$(echo "$S1" | base64 -d)")
-          [ -n "$S2" ] && sessions+=("$(echo "$S2" | base64 -d)")
-          [ -n "$S3" ] && sessions+=("$(echo "$S3" | base64 -d)")
+          secrets = json.loads(os.environ.get("SECRETS_CONTEXT", "{}"))
+          keys = sorted([k for k in secrets if k.startswith("USER_STRING_")])
 
-          # Comma-separated තනි string එකක් සාදා GITHUB_ENV එකට ලියයි
-          IFS=','
-          assembled="${sessions[*]}"
-          echo "USER_STRINGS=$assembled" >> $GITHUB_ENV
+          sessions = []
+          for k in keys:
+              val = secrets[k].strip()
+              if val:
+                  try:
+                      decoded = base64.b64decode(val).decode("utf-8").strip()
+                      sessions.append(decoded)
+                  except Exception:
+                      sessions.append(val)
+
+          print(",".join(sessions))
+          ')
+
+          echo "USER_STRINGS=$USER_STRINGS" >> $GITHUB_ENV
 
       - name: Run Telegram Bot
         env:
@@ -65,7 +74,7 @@ jobs:
           API_HASH: ${{ secrets.API_HASH }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}
-          # ඉහත Decode පියවරෙන් decode වී ලැබුණු string එක ලබා ගනී (නැතහොත් secrets.USER_STRINGS වෙතින්)
+          # ඉහත පියවරෙන් dynamic ලෙස decode වූ strings (නැතහොත් secrets.USER_STRINGS වෙතින්)
           USER_STRINGS: ${{ env.USER_STRINGS || secrets.USER_STRINGS }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}          # -100xxxxxxxxxx  (හෝ invite link)
           HELPER_TOKENS: ${{ secrets.HELPER_TOKENS }}    # tokenA,tokenB,tokenC,tokenD (classic PAT: repo + workflow)
