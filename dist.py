@@ -1404,3 +1404,27 @@ def helpers_status() -> str:
     if not config.HELPER_TOKENS:
         lines.append("HELPER_TOKENS set කරලා නෑ.")
     return "\n".join(lines)
+
+
+# ── Queue persistence (GitHub Release asset; no external database) ──
+_QUEUE_STATE_TAG = "enc-queue-state"
+_QUEUE_STATE_ASSET = "queue-state.json"
+
+
+async def save_queue_snapshot(payload: dict):
+    """Atomically replace the bot queue snapshot in a dedicated GitHub Release."""
+    if not available():
+        return
+    backend = GhBackend()
+    with tempfile.TemporaryDirectory(prefix="encoder-queue-") as tmp:
+        path = Path(tmp) / _QUEUE_STATE_ASSET
+        path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        await backend.release_create(_QUEUE_STATE_TAG)
+        await backend.upload(_QUEUE_STATE_TAG, [path])
+
+
+async def clear_queue_snapshot():
+    """Remove the queue snapshot Release when no active or waiting jobs remain."""
+    if not available():
+        return
+    await GhBackend().release_delete(_QUEUE_STATE_TAG)
