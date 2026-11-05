@@ -1009,3 +1009,36 @@ async def run_job(job: Job, height: int):
         with contextlib.suppress(Exception):
             await persist_queue_state()
         raise
+
+    finally:
+        if ch_ids or ch_out[0] is not None:
+            with contextlib.suppress(Exception):
+                await relay.cleanup(client, ch_ids, ch_out[0], ch_out[1])
+        await dl.cleanup(job.id)
+        await ul.cleanup(job.id)
+        shutil.rmtree(workdir, ignore_errors=True)
+        jobs.pop(job.id, None)
+
+
+async def main():
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    await client.start(bot_token=BOT_TOKEN)
+    await init_download_engine()
+    logger.info(f"🌐 Distributed workers: {'available (on-demand per queue)' if dist.available() else 'unavailable'}")
+    me = await client.get_me()
+    await relay.setup(client)
+    await init_helpers()
+    if relay.configured and not relay.enabled:           # setup වැරදි නම් admins ට කෙළින්ම කියනවා
+        for uid in ALLOWED_USERS:
+            with contextlib.suppress(Exception):
+                await client.send_message(uid, relay.status_text() + "\n\n<i>Fallback: bot එකෙන්ම download/upload. "
+                                          "හදලා /check කරන්න.</i>")
+    logger.info(f"✅ @{me.username} running • update interval {PROGRESS_UPDATE_INTERVAL}s")
+    try:
+        await client.run_until_disconnected()
+    finally:
+        await relay.stop()
+
+
+if __name__ == "__main__":
+    client.loop.run_until_complete(main())
