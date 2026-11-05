@@ -997,7 +997,7 @@ class DistRun:
                         sp = float(v.strip().rstrip("x") or 0)
                     elif k == "progress":
                         on_progress(max(t, 0.0), int(size), sp)
-                except ValueError:                except ValueError:
+                except ValueError:
                     pass
 
         try:
