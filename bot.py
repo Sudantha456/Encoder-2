@@ -513,7 +513,11 @@ async def persist_queue_state():
                    if not j.cancelled and not j.completed]
         payload = {"version": 1, "updated_at": int(time.time()), "paused": bool(queue_paused),
                    "current": current, "queued": waiting}
-        await dist.save_queue_snapshot(payload)
+        try:
+            await dist.save_queue_snapshot(payload)
+        except Exception:
+            # GitHub Release persistence must never prevent a job entering the live queue.
+            logger.exception("Could not persist queue snapshot; continuing with in-memory queue")
 
 
 async def cancel_waiting(job: Job):
