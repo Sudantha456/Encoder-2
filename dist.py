@@ -1219,7 +1219,7 @@ async def distributed_download(*, client, job, meta, live, workdir: Path, src_pa
                     "total_size": str(total), "duration": str(meta.duration),
                     "splits": str(n_parts), "audio_mode": audio_mode, "abitrate": str(abitrate)})
                 logger.info(f"🧩 assembler dispatched → acct {asm_acct} ({asm_repo}) • splits={n_parts}")
-                await live.set(f"🧩 <b>Slices verified (byte-exact)</b> — assembling on Helper #{asm_acct}…",
+                await live.set(f"🧩 <b>Slices verified (byte-exact)</b>\nගොනුව encode කොටස් වලට කැඩලා workers ට බෙදනවා (Helper #{asm_acct}) — main runner එකට file එක ඕනේ නෑ…",
                                force=True)
             except Exception as e:
                 logger.warning(f"asm dispatch failed: {e} → local reassemble")
@@ -1808,11 +1808,17 @@ class DistRun:
         missing = [f.name for f in files if not f.exists() or f.stat().st_size <= 0]
         if missing:
             raise DistError(f"encoded parts missing on main runner: {', '.join(missing)}")
-        logger.info(f"📦 pushing {len(files)} encoded parts → main account release {self.tag}")
-        try:
-            await self._g(0).upload(self.tag, files)
-        except Exception as exc:
-            raise DistError(f"encoded parts → main account release upload failed: {exc}") from exc
+        logger.info(f"📦 pushing {len(files)} encoded parts → main account release {self.tag} (parallel ×4)")
+        sem = asyncio.Semaphore(4)
+
+        async def push_one(f):
+            async with sem:
+                await self._g(0).upload(self.tag, [f])
+
+        results = await asyncio.gather(*[push_one(f) for f in files], return_exceptions=True)
+        errs = [str(r) for r in results if isinstance(r, BaseException)]
+        if errs:
+            raise DistError("encoded parts → main account release upload failed: " + " | ".join(errs))
 
     async def _merge(self, audio_task):
         s = self.state
