@@ -13,7 +13,7 @@
     "codec": "libx265",
     "dist": "on",
     "mode": "compress",
-    "preset": "veryfast",
+    "preset": "ultrafast",
     "qres": "ask",
     "workers": 30
   }
