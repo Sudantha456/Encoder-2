@@ -140,19 +140,29 @@ ENC_SPEED_720P = {"ultrafast": 6.5, "superfast": 5.0, "veryfast": 3.5, "faster":
                   "medium": 1.6, "slow": 0.9, "slower": 0.5, "veryslow": 0.25}
 
 
-def estimate_encode_seconds(meta, target, preset, codec) -> float:
+def estimate_encode_seconds(meta, target, preset, codec, pix_fmt: str = "yuv420p") -> float:
     from media import target_dims
-    tw, th = target_dims(meta, target)
-    sp = ENC_SPEED_720P.get(preset, 1.0) * (921600 / max(tw * th, 1)) * (0.4 if codec == "libx265" else 1.0)
+    if target and target > 0:
+        tw, th = target_dims(meta, target)
+    else:
+        tw = max(meta.width - (meta.width % 2), 2) if meta.width else 1280
+        th = max(meta.height - (meta.height % 2), 2) if meta.height else 720
+    pf_factor = 0.8 if any(x in (pix_fmt or "") for x in ("10", "12", "16", "422", "444")) else 1.0
+    sp = (
+        ENC_SPEED_720P.get(preset, 1.0)
+        * (921600 / max(tw * th, 1))
+        * (0.4 if codec == "libx265" else 1.0)
+        * pf_factor
+    )
     return meta.duration / max(sp, 0.05)
 
 
-def should_distribute(meta, target, preset, codec, mode: str) -> bool:
+def should_distribute(meta, target, preset, codec, mode: str, pix_fmt: str = "yuv420p") -> bool:
     if mode == "off" or not available() or meta.duration < 30:
         return False
     if mode == "on":
         return True
-    return estimate_encode_seconds(meta, target, preset, codec) >= config.DIST_AUTO_MIN_SECONDS
+    return estimate_encode_seconds(meta, target, preset, codec, pix_fmt=pix_fmt) >= config.DIST_AUTO_MIN_SECONDS
 
 
 _BG: set = set()      # background cleanup tasks (GC වෙන්නේ නැති වෙන්න)
@@ -927,6 +937,8 @@ class DistRun:
                 "target": o["target"], "scale": o["scale"], "portrait": o["portrait"],
                 "preset": o["preset"], "codec": o["codec"], "crf": o["crf"],
                 "maxrate": o["maxrate_kbps"], "interval": PROGRESS_UPDATE_INTERVAL,
+                "pix_fmt": o.get("pix_fmt", "yuv420p"),
+                "x265_extra": o.get("x265_extra", ""),
             }
             self.job_cfg = job_cfg
             await self.pool.post_job(self.job.id, job_cfg)        # hold වෙලා ඉන්න workers තත්පර 3කින් අල්ලගන්නවා

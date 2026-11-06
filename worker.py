@@ -98,7 +98,9 @@ async def run_part(cfg: dict, idx: int, workdir: str = "."):
         bg = [asyncio.create_task(ticker()), asyncio.create_task(watchdog())]
         await transcode(raw, dst, st, ctl, target=cfg["target"], scale=cfg["scale"], portrait=cfg["portrait"],
                         preset=cfg["preset"], codec=cfg["codec"], crf=cfg["crf"], maxrate_kbps=cfg["maxrate"],
-                        audio_mode="none", container="mkv")
+                        audio_mode="none", container="mkv",
+                        pix_fmt=cfg.get("pix_fmt", "yuv420p"),
+                        x265_extra=cfg.get("x265_extra", ""))
         for t in bg:
             t.cancel()
         await rep.send("uploading", st)

@@ -98,7 +98,9 @@ jobs:
           PROGRESS_UPDATE_INTERVAL: ${{ vars.PROGRESS_UPDATE_INTERVAL || '3' }}
           QUEUE_MAX: ${{ vars.QUEUE_MAX || '20' }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SETTINGS_GH_TOKEN: ${{ secrets.SETTINGS_GH_TOKEN || secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
           DIST_WORKERS: ${{ vars.DIST_WORKERS || '10' }}   # default workers (/settings වලින් වෙනස් කරන්න පුළුවන්: 5-50)
           DOWNLOAD_DIR: ${{ runner.temp }}/downloads
         run: |

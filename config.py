@@ -17,13 +17,71 @@ ALLOWED_USERS = [int(x) for x in os.getenv("ALLOWED_USERS", "").split(",") if x.
 # ── 🔁 Progress update interval (තත්පර) — මෙතනින් වෙනස් කරන්න ──
 PROGRESS_UPDATE_INTERVAL = float(os.getenv("PROGRESS_UPDATE_INTERVAL", "3"))
 
-# ── Paths ─────────────────────────────────────────────────
+# ── Paths & Cloud Settings Sync (GitHub JSON) ─────────────
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
 SETTINGS_FILE = os.getenv("SETTINGS_FILE", "user_settings.json")
+SETTINGS_GH_PATH = os.getenv("SETTINGS_GH_PATH", SETTINGS_FILE)
+SETTINGS_GH_BRANCH = os.getenv("SETTINGS_GH_BRANCH", "").strip()
 
-# ── Encoding ──────────────────────────────────────────────
+# ── Encoding Modes ────────────────────────────────────────
+ENCODE_MODES = {
+    "res": "📐 Resolution වෙනස් කිරීම",
+    "compress": "🗜 Size අඩු කිරීම (Quality/Res නොවෙනස්ව • H.265)",
+}
+DEFAULT_MODE = "res"
+
+# ── Encoding (Resolution Mode + Shared) ───────────────────
 DEFAULT_PRESET = "ultrafast"
 DEFAULT_CODEC = "libx264"
+
+# ── Size-Reduce / Visually Lossless Mode (H.265) Defaults ─
+DEFAULT_COMPRESS_PRESET = "fast"
+DEFAULT_COMPRESS_CRF = 18                    # Visually lossless (Very High)
+DEFAULT_COMPRESS_PIX_FMT = "yuv420p"         # 8-bit 4:2:0 (හොඳම device compatibility)
+COMPRESS_AUTO_CHOICES = ["ask", "auto"]      # ask = Preview + Button, auto = කෙළින්ම queue එකට
+
+CRF_CHOICES = [14, 16, 18, 20, 22, 24, 26, 28, 30, 32]
+CRF_INFO = {
+    14: ("Ultra",       "ඉතා ඉහළ quality, විශාල file"),
+    16: ("Excellent",   "ඉතා සුළු quality loss"),
+    18: ("Very High",   "Visually lossless සඳහා හොඳයි ⭐"),
+    20: ("High",        "Quality සහ size අතර හොඳ balance"),
+    22: ("Good",        "සාමාන්‍යයෙන් හොඳ quality"),
+    24: ("Medium High", "Size අඩු කරගැනීමට"),
+    26: ("Medium",      "Quality වෙනස පෙනෙන්න පුළුවන්"),
+    28: ("Low",         "වැඩි compression"),
+    30: ("Very Low",    "පැහැදිලි quality loss ඇතිවිය හැක"),
+    32: ("Extreme",     "ඉතා වැඩි compression"),
+}
+
+PIX_FMT_CHOICES = [
+    "yuv420p", "yuv420p10le",
+    "yuv422p", "yuv422p10le",
+    "yuv444p", "yuv444p10le",
+    "yuv420p12le", "yuv422p12le", "yuv444p12le",
+    "yuv420p16le", "yuv422p16le", "yuv444p16le",
+]
+PIX_FMT_INFO = {
+    "yuv420p":     ("8-bit, 4:2:0",  "සාමාන්‍ය video සඳහා, Device compatibility ඉතා හොඳයි"),
+    "yuv420p10le": ("10-bit, 4:2:0", "වැඩි colour precision, gradients වල banding අඩු විය හැක"),
+    "yuv422p":     ("8-bit, 4:2:2",  "4:2:0 ට වඩා වැඩි colour detail"),
+    "yuv422p10le": ("10-bit, 4:2:2", "Professional video සඳහා සුදුසුයි"),
+    "yuv444p":     ("8-bit, 4:4:4",  "Chroma subsampling නැති full colour resolution"),
+    "yuv444p10le": ("10-bit, 4:4:4", "වැඩි colour precision සහ detail"),
+    "yuv420p12le": ("12-bit, 4:2:0", "ඉහළ bit-depth workflow සඳහා"),
+    "yuv422p12le": ("12-bit, 4:2:2", "Professional colour workflows"),
+    "yuv444p12le": ("12-bit, 4:4:4", "ඉහළ colour precision"),
+    "yuv420p16le": ("16-bit, 4:2:0", "High bit-depth processing"),
+    "yuv422p16le": ("16-bit, 4:2:2", "Advanced video processing"),
+    "yuv444p16le": ("16-bit, 4:4:4", "High-precision colour processing"),
+}
+
+X265_TOGGLE_INFO = {
+    "c_bframes":   ("B-Frames",  "Frames අතර පුනරාවර්තන දත්ත අඩු කර size තවත් අඩු කරයි"),
+    "c_sao":       ("SAO",       "ON: blocking අඩු කරයි • OFF: තියුණු (sharp) සියුම් detail රකියි"),
+    "c_lookahead": ("Lookahead", "ඉදිරි frames විශ්ලේෂණය කර quality/bitrate හොඳින්ම බෙදයි"),
+    "c_aq":        ("AQ-Mode",   "අඳුරු සහ සියුම් කොටස් වල quality හා colour gradients රකියි"),
+}
 
 PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast",
            "medium", "slow", "slower", "veryslow"]

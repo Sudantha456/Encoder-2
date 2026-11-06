@@ -107,11 +107,22 @@ def render_transfer(kind: str, tr: SpeedTracker, name: str, badge: str = "") -> 
     ])
 
 
-def render_encode(st, name: str, height: int, preset: str, codec: str) -> str:
+def render_encode(
+    st,
+    name: str,
+    height: int,
+    preset: str,
+    codec: str,
+    *,
+    target_label: str = "",
+    extra_info: str = "",
+) -> str:
     pct = st.percent
+    t_lbl = target_label or (f"{height}p" if height else "Original Res")
+    cfg_txt = f"{codec} • {preset}" + (f" • {extra_info}" if extra_info else "")
     lines = [
-        f"🎬 <b>Encoding</b> → <b>{height}p</b>\n<code>{esc(short_name(name))}</code>",
-        f"⚙️ <code>{codec} • {preset}</code>",
+        f"🎬 <b>Encoding</b> → <b>{esc(t_lbl)}</b>\n<code>{esc(short_name(name))}</code>",
+        f"⚙️ <code>{esc(cfg_txt)}</code>",
         "",
         f"<code>[{bar(pct)}] {pct:5.1f}%</code>",
         f"🎞 Video: <code>{human_time(st.out_time)} / {human_time(st.duration)}</code>",
@@ -150,9 +161,20 @@ def _render_merge(st) -> str:
     return "\n".join(lines)
 
 
-def render_dist(st, name: str, height: int, preset: str, codec: str) -> str:
-    head = (f"🌐 <b>Distributed Encode</b> → <b>{height}p</b>\n<code>{esc(short_name(name))}</code>\n"
-            f"⚙️ <code>{codec} • {preset} • {st.n_workers} workers</code>\n")
+def render_dist(
+    st,
+    name: str,
+    height: int,
+    preset: str,
+    codec: str,
+    *,
+    target_label: str = "",
+    extra_info: str = "",
+) -> str:
+    t_lbl = target_label or (f"{height}p" if height else "Original Res")
+    cfg_txt = f"{codec} • {preset}" + (f" • {extra_info}" if extra_info else "") + f" • {st.n_workers} workers"
+    head = (f"🌐 <b>Distributed Encode</b> → <b>{esc(t_lbl)}</b>\n<code>{esc(short_name(name))}</code>\n"
+            f"⚙️ <code>{esc(cfg_txt)}</code>\n")
     if st.phase == "split":
         return head + "\n✂️ Video එක keyframes අනුව කොටස් වලට කඩනවා…"
     if st.phase == "upload":
