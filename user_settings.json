@@ -11,7 +11,7 @@
     "c_sao": true,
     "c_workers": 30,
     "codec": "libx264",
-    "dist": "auto",
+    "dist": "on",
     "mode": "res",
     "preset": "ultrafast",
     "qres": "ask",
