@@ -284,8 +284,92 @@ class GhBackend:
     async def release_create(self, tag):
         await self._gh("release", "create", tag, "--prerelease", "--title", f"Temp {tag}", "--notes", "encoder temp")
 
+    @staticmethod
+    def _upload_retryable(exc: Exception) -> bool:
+        """Return True only for transient GitHub/network upload failures."""
+        msg = str(exc).lower()
+        markers = (
+            "http 408", "http 409", "http 425", "http 429",
+            "http 500", "http 502", "http 503", "http 504",
+            "timed out", "timeout", "temporarily unavailable",
+            "connection reset", "connection aborted", "connection closed",
+            "remote end closed", "unexpected eof", "network is unreachable",
+            "temporary failure", "tls handshake", "tcpfull",
+        )
+        return any(marker in msg for marker in markers)
+
+    async def _verify_asset(self, tag: str, name: str, expected_size: int) -> bool:
+        """Check that GitHub has the completed asset with the expected byte size."""
+        try:
+            raw = await self._gh("release", "view", tag, "--json", "assets")
+            data = json.loads(raw or "{}")
+            for asset in data.get("assets", []):
+                if asset.get("name") == name:
+                    return (asset.get("state", "uploaded") == "uploaded"
+                            and int(asset.get("size", -1)) == expected_size)
+            return False
+        except Exception as exc:
+            logger.warning("Release asset verification failed for %s: %s", name, exc)
+            return False
+
+    async def _upload_one(self, tag: str, path: Path, *, attempts: int = 5):
+        """Upload one asset at a time, retry transient failures and verify completion.
+
+        A timeout can happen after GitHub has actually received the complete asset,
+        so verification is performed before every retry to avoid needless re-upload.
+        """
+        path = Path(path)
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise DistError(f"Upload source is missing or empty: {path}")
+
+        name = path.name
+        last_error = None
+        for attempt in range(1, attempts + 1):
+            # A previous request may have completed even if its client saw a timeout.
+            if await self._verify_asset(tag, name, path.stat().st_size):
+                logger.info("GitHub asset already verified: %s", name)
+                return
+
+            try:
+                await self._gh("release", "upload", tag, str(path), "--clobber")
+            except Exception as exc:
+                last_error = exc
+                if not self._upload_retryable(exc) or attempt >= attempts:
+                    raise DistError(
+                        f"GitHub upload failed for {name} (attempt {attempt}/{attempts}): {exc}"
+                    ) from exc
+                delay = min(5 * (2 ** (attempt - 1)), 60)
+                logger.warning(
+                    "Transient GitHub upload error for %s (attempt %s/%s); retrying in %ss: %s",
+                    name, attempt, attempts, delay, exc,
+                )
+                await asyncio.sleep(delay)
+
+            # Poll briefly because Release asset metadata can lag behind the upload.
+            for check_no in range(4):
+                if await self._verify_asset(tag, name, path.stat().st_size):
+                    logger.info("GitHub asset upload verified: %s (%s bytes)", name, path.stat().st_size)
+                    return
+                if check_no < 3:
+                    await asyncio.sleep(2 + check_no * 2)
+
+            if attempt < attempts:
+                delay = min(5 * (2 ** (attempt - 1)), 60)
+                logger.warning(
+                    "GitHub did not confirm asset %s after upload (attempt %s/%s); retrying in %ss",
+                    name, attempt, attempts, delay,
+                )
+                await asyncio.sleep(delay)
+
+        raise DistError(
+            f"GitHub upload could not be verified for {name} after {attempts} attempts"
+            + (f": {last_error}" if last_error else "")
+        )
+
     async def upload(self, tag, paths):
-        await self._gh("release", "upload", tag, *[str(p) for p in paths], "--clobber")
+        """Upload each release asset independently to isolate failures and enable retries."""
+        for path in paths:
+            await self._upload_one(tag, Path(path))
 
     async def download(self, tag, pattern, dest):
         await self._gh("release", "download", tag, "-p", pattern, "-D", str(dest), "--clobber")
@@ -816,9 +900,21 @@ class DistRun:
 
             async def up(ai, fs):
                 await self._ensure_release(ai)
-                await self._g(ai).upload(self.tag, fs)
+                # Account-level isolation: each account uploads only its own parts;
+                # GhBackend retries and verifies every asset independently.
+                try:
+                    await self._g(ai).upload(self.tag, fs)
+                except Exception as exc:
+                    raise DistError(f"raw-part upload failed for account #{ai}: {exc}") from exc
 
-            await asyncio.gather(*[up(ai, fs) for ai, fs in groups.items()])   # account එකකට එහි කොටස් විතරයි
+            # Different GitHub accounts can upload concurrently, while each account
+            # uploads its own assets sequentially to avoid saturating one connection.
+            upload_results = await asyncio.gather(
+                *[up(ai, fs) for ai, fs in groups.items()], return_exceptions=True
+            )
+            upload_errors = [str(r) for r in upload_results if isinstance(r, BaseException)]
+            if upload_errors:
+                raise DistError("One or more account raw-part uploads failed: " + " | ".join(upload_errors))
 
             # 3) progress board + audio + dispatch
             chat = int(config.DIST_PROGRESS_CHAT) if config.DIST_PROGRESS_CHAT else self.job.chat_id
