@@ -4,7 +4,7 @@
     "c_auto": "ask",
     "c_bframes": true,
     "c_crf": 18,
-    "c_dist": "auto",
+    "c_dist": "on",
     "c_lookahead": true,
     "c_pix_fmt": "yuv420p",
     "c_preset": "fast",
