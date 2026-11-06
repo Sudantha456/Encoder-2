@@ -252,7 +252,12 @@ class Relay:
         lanes = [p[0] for p in pairs]
         if total < 8 * 1024 * 1024:               # පොඩි file → userbot එකක් ඇති
             lanes = lanes[:1]
-        logger.info(f"📥 relay download: {total / 1048576:.1f}MB via {', '.join(l.name for l in lanes)}")
+        logger.info(
+            f"📥 relay download: {total / 1048576:.1f}MB via {len(lanes)} userbots, "
+            f"{config.UB_DL_CONNECTIONS} connections/userbot, "
+            f"{getattr(config, 'UB_DL_WORKERS_PER_CONN', 4)} workers/connection "
+            f"({', '.join(l.name for l in lanes)})"
+        )
         return await dl.download_lanes(lanes, total, save_path, job_id, progress_cb,
                                        max_flood_wait=config.UB_MAX_FLOOD_WAIT)
 
