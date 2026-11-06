@@ -16,7 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from dlparts import byte_ranges, verify_ranges                       # noqa: E402
+from dlparts import byte_ranges, verify_ranges, range_requests       # noqa: E402
 
 CHUNK = 1024 * 1024
 ASSET = 1900 * 1024 * 1024
@@ -357,3 +357,28 @@ class TestSessionPlan(unittest.TestCase):
                          helper_tokens=["t1","t2"], helper_dl=[True, False],
                          helper_sess=["s1x-unused","s2"], helpers_setup_done=True)
         self.assertEqual(len(got), len(set(got)))
+
+
+class TestRangeRequests(unittest.TestCase):
+    def test_request_limits_4096_aligned_and_cover(self):
+        for size in [1, 4096, 1048576, 1048576 * 3 + 7, 135792708, 683149380]:
+            reqs = list(range_requests(0, size, size, CHUNK))
+            written = sum(w for *_, w in reqs)
+            self.assertEqual(written, size)
+            for _, req_lim, _ in reqs:
+                self.assertEqual(req_lim % 4096, 0)
+
+    def test_eof_tail_aligned_up_clamped(self):
+        start, sln, total = 547356672, 135792708, 683149380
+        reqs = list(range_requests(start, start + sln, total, CHUNK))
+        off, req_lim, want = reqs[-1]
+        self.assertEqual((want, off + want), (526404, start + sln))
+        self.assertEqual(req_lim % 4096, 0)
+        self.assertGreaterEqual(req_lim, want)
+        self.assertEqual(sum(w for *_, w in reqs), sln)
+
+    def test_interior_chunks_exact(self):
+        reqs = list(range_requests(0, 3 * CHUNK, 100 * CHUNK, CHUNK))
+        for off, req_lim, want in reqs:
+            self.assertEqual(req_lim, want)
+            self.assertEqual(req_lim % 4096, 0)

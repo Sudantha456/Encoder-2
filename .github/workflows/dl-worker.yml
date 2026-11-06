@@ -59,6 +59,7 @@ jobs:
         with:
           sparse-checkout: |
             dl_worker.py
+            dlparts.py
             fast_conn.py
             channel.py
           sparse-checkout-cone-mode: false

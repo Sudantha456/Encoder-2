@@ -132,6 +132,7 @@ async def _bootstrap_inner(token: str, st: list, helper_no: int = 0) -> tuple:
              ".github/workflows/encode-worker.yml": root / ".github/workflows/encode-worker.yml",
              "dl_worker.py": root / "dl_worker.py", "asm_worker.py": root / "asm_worker.py",
              "fast_conn.py": root / "fast_conn.py", "channel.py": root / "channel.py",
+             "dlparts.py": root / "dlparts.py",
              ".github/workflows/dl-worker.yml": root / ".github/workflows/dl-worker.yml",
              ".github/workflows/asm-worker.yml": root / ".github/workflows/asm-worker.yml"}
     for path, src in files.items():
@@ -1160,8 +1161,7 @@ async def distributed_download(*, client, job, meta, live, workdir: Path, src_pa
                     recovery_notice = True
                     with contextlib.suppress(Exception):
                         await live.set("🧩 <b>Helper lanes failed</b> — main runner එක ඒ ranges ටික re-download කරනවා… "
-                                       "(වැරදි channel/membership නිසා වෙන්න පුළුවන් — <code>/check</code> බලන්න)",
-                                       force=True)
+                                       "(හේතුව: /check)", force=True)
                 try:
                     async def _noop_prog(*_):
                         return None

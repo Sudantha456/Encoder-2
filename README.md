@@ -50,7 +50,8 @@ Helper එකක් connect වෙන්නේ නැත්නම් (token/repo
 **Pre-flight:** bot start වෙද්දී (helpers bootstrap වෙද්දී) හැම helper dl session එකක් සමඟම channel resolve පරීක්ෂාවක් කරනවා — invite link නම් auto-join වෙනවා. Fail නම් job එක run වෙන වෙලාවට කලින්ම **dl lane OFF** කරලා හේතුව `HELPER_PROBLEMS` වලට දමනවා — `/check` එකේ **Helper #N (…): dl lane OFF — …** විදිහට පේනවා. නිවැරදි කළාට පස්සේ `/check` (queue එක හිස් වෙලාවක) එවන්න — ආයෙමත් test වෙලා, සාර්ථක නම් dl lane on කරලා, session එකs ආයෙ බෙදෙනවා.
 
 ## Integrity — එක byte එකක්වත් miss වෙන්නේ නෑ
-- `dlparts.byte_ranges(size, n, align=1MB)`: ranges gap/overlap නැතිව **[0, size)** සම්පූර්ණ cover කරනවා; `verify_ranges()` double-check; slice කිසිම වෙලාවක range මායිමෙන් පිටතට යන්නේ නෑ (GetFileRequest limit = `min(1MB, slice_remaining)`).
+- `dlparts.byte_ranges(size, n, align=1MB)`: ranges gap/overlap නැතිව **[0, size)** සම්පූර්ණ cover කරනවා; `verify_ranges()` double-check; slice කිසිම වෙලාවක range මායිමෙන් පිටතට යන්නේ නෑ (`range_requests` — 4096-aligned requests, absolute-EOF tail clamped).
+- Telegram `getFile` limits **4096 ගුණාකාරයක් විය යුතුයි** — ඒ නිසා file එකේ EOF tail chunk එක (1MB නොගිය) aligned-up request එකෙන් අරගෙන clamp කරනවා (හේතුව: "Short read" / "Incomplete slice" දැන් original හේතුව සහිතව පේනවා).
 - Helper lane: 1MB chunks → slice file (`ftruncate` exact) → `dl_slice_<n>` asset (size-verify).
 - Main එකේ settle loop: හැම slice එකකම release asset **size == expected** (byte-exact); හරි නැත්නම් main runner එක ඒ range එක Telegram එකෙන්ම re-download → verify → helper release එකට upload → ආයේ verify.
 - Assembler (`asm_worker.py`, helper #k): slices download → **cat order-verify** (concatenated size == `TOTAL_SIZE`) → ffprobe → keyframe parts (`raw_part_N.mp4`) + `audio.mka` → own release `enc-<job>` → marker `asm_done.json` (bounds/parts/audio).

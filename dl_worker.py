@@ -182,18 +182,22 @@ async def main():
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
     os.ftruncate(fd, SLICE_LEN)
 
+    from dlparts import range_requests
     queue: asyncio.Queue = asyncio.Queue()
-    for off in range(START, END, CHUNK_SIZE):
-        queue.put_nowait((off, min(CHUNK_SIZE, END - off)))   # slice මායිමෙන් පිටතට කවදාවත් යන්නේ නෑ
+    for off, req_lim, want in range_requests(START, END, TOTAL, CHUNK_SIZE):
+        queue.put_nowait((off, req_lim, want))
 
     stop = asyncio.Event()
     fail = asyncio.get_event_loop().create_future()
+    wd_reason = None
 
     async def watchdog():
+        nonlocal wd_reason
         while not stop.is_set():
             await asyncio.sleep(HB_CHECK)
             r = await asyncio.to_thread(gh, "release", "view", TAG, "--json", "id", check=False)
             if r.returncode != 0 and "not found" in (r.stderr or "").lower():
+                wd_reason = "watchdog: release නැති වුණා (job cancelled / cleanup?)"
                 print("release gone — aborting", flush=True)
                 stop.set()
                 return
@@ -210,7 +214,7 @@ async def main():
         nonlocal done_bytes
         while not stop.is_set():
             try:
-                off, lim = queue.get_nowait()
+                off, lim, want = queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
             req = GetFileRequest(location=location, offset=off, limit=lim)
@@ -222,8 +226,10 @@ async def main():
                     data = getattr(res, "bytes", None)
                     if data is None:
                         raise RuntimeError(f"Unexpected response {type(res).__name__}")
-                    if len(data) != lim:
-                        raise RuntimeError(f"Short read {len(data)}/{lim} @ {off}")
+                    if len(data) > want:
+                        data = data[:want]          # EOF aligned-up request — clamp
+                    if len(data) != want:
+                        raise RuntimeError(f"Short read {len(data)}/{want} @ {off}")
                     async with flush_lock:
                         os.pwrite(fd, data, off - START)
                         done_bytes += len(data)
@@ -247,7 +253,12 @@ async def main():
     try:
         await asyncio.gather(*tasks)
         if done_bytes != SLICE_LEN:
-            raise RuntimeError(f"Incomplete slice {done_bytes}/{SLICE_LEN}")
+            detail = []
+            if fail.done() and fail.exception():
+                detail.append(repr(fail.exception())[:160])
+            if wd_reason:
+                detail.append(wd_reason)
+            raise RuntimeError(f"Incomplete slice {done_bytes}/{SLICE_LEN}" + (" — " + "; ".join(detail) if detail else ""))
         stop.set()
     except BaseException as e:
         stop.set()
@@ -258,7 +269,7 @@ async def main():
         await pool.close()
         os.close(fd)
         await client.disconnect()
-        rep.send("failed", done_bytes, 0.0, str(e)[:80])
+        rep.send("failed", done_bytes, 0.0, str(e)[:190])
         raise
 
     wd.cancel(); tk.cancel()

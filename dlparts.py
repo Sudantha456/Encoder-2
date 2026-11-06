@@ -46,3 +46,21 @@ def verify_ranges(ranges: List[Tuple[int, int]], total_size: int) -> bool:
             return False
         pos = e
     return pos == total_size
+
+
+def range_requests(start: int, end: int, file_end: int, chunk_size: int = 1024 * 1024):
+    """(offset, request_limit, expected_bytes) ටික yield කරනවා — 4096-aligned requests.
+
+    Telegram getFileRequest limits 4096 ගුණාකාර විය යුතුයි; interior chunks ඒවා 1MB-aligned වගේම
+    4096-divisible. absolute EOF එකේ පමණක් 1MB නොගියයි — එතන request එක 4096-පේළියට උඩ ඉල්ලලා
+    (clamped) expected bytes ගන්නවා. දත්ත කැපුවේ caller එකට — ලැබුණු bytes want ට trim කරන්න.
+    """
+    for off in range(start, end, chunk_size):
+        lim = min(chunk_size, end - off)
+        if lim % 4096 == 0:
+            yield off, lim, lim
+            continue
+        if off + lim == file_end:                    # absolute EOF chunk — aligned-up request, clamp on write
+            yield off, -(-lim // 4096) * 4096, lim
+        else:                                        # 1MB-aligned plans වල මේ play එකට එන්නේ නෑ
+            yield off, lim, lim

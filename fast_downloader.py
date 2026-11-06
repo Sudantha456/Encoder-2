@@ -330,12 +330,15 @@ class FastDownloader:
                 rec = inflight.setdefault(off, [time.monotonic(), 0])
                 rec[1] += 1
                 try:
-                    req = GetFileRequest(location=ln.location, offset=off,
-                                         limit=min(CHUNK_SIZE, base + expected - off))
+                    lim = min(CHUNK_SIZE, base + expected - off)
+                    req_lim = lim if lim % 4096 == 0 else -(-lim // 4096) * 4096   # Telegram 4096 rule — tail aligned-up, clamp කරනවා
+                    req = GetFileRequest(location=ln.location, offset=off, limit=req_lim)
                     r = await asyncio.wait_for(ln.pool.send(req, widx + (1 if hedge else 0)), timeout=CHUNK_TIMEOUT)
                     data = getattr(r, "bytes", None)
                     if data is None:
                         raise RuntimeError(f"Unexpected response: {type(r).__name__}")
+                    if len(data) > lim:
+                        data = data[:lim]
                     ln.bad = 0
                     if off not in finished:                    # පළමුව ඉවර වූ copy එක විතරක් ගණන් වෙනවා
                         finished.add(off)
