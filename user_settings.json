@@ -10,7 +10,7 @@
     "c_preset": "veryfast",
     "c_sao": true,
     "c_workers": 30,
-    "codec": "libx264",
+    "codec": "libx265",
     "dist": "on",
     "mode": "res",
     "preset": "ultrafast",
