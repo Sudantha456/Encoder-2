@@ -22,6 +22,12 @@ CHANNEL_ID=-1001234567890                 # secret CHANNEL_ID
 Bot start වෙද්දී self-test එකක් run වෙනවා (userbot connect → channel resolve → permissions → bot↔userbot round-trip).
 Setup වැරදි නම් `ALLOWED_USERS` ට හේතුව සහිත message එකක් යනවා, bot එක **පරණ විදිහටම** (bot එකෙන් download/upload) වැඩ කරනවා. හදලා `/check` එවන්න.
 
+## ⚡ Turbo Download Engine
+- **Persistent Warm Pools & AuthKey Cache:** හැම userbot එකකටම DC අනුව warm Abridged-TCP connections (`FastTcpConnection` + 8MB buffers + `TCP_NODELAY` + `uvloop`) jobs අතරේත් සූදානම්ව තබා ගනී — cold handshake / `ExportAuthorization` ප්‍රමාදය ඉවත් කරයි.
+- **Multi-IP & `media_only` DC Routing:** එකම DC එකේ dedicated `media_only` සහ සාමාන්‍ය load-balancer IPs සියල්ල හරහා connections ස්වයංක්‍රීයව බෙදා හරිනවා.
+- **Streaming Swarm + Async `pwrite` Disk Engine:** පළමු userbot socket එක ready වූ සැණින් download ආරම්භ වන අතර, multi-thread `pwrite` disk pool එක නිසා network I/O කිසිවිටෙක block නොවේ.
+- Speed tuning variables (optional): `UB_DL_CONNECTIONS=16`, `UB_TARGET_TOTAL_CONNECTIONS=80`, `DL_WORKERS_PER_CONN=5`.
+
 ## Flood protection
 - Download: userbot එකකට ඒකේම connections; එක userbot එකකට FloodWait ආවොත් ඒ lane එක විතරක් pause — chunks අනිත් userbots ගන්නවා. `UB_MAX_FLOOD_WAIT` (30s) ඉක්මවුවොත් ඒ userbot එක cooldown (`UB_FLOOD_COOLDOWN` 60s).
 - Upload: flood අඩුම / cooldown නැති userbot එක; flood වුණොත් ඊළඟ userbot එකෙන් auto retry.

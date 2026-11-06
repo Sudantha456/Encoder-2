@@ -42,13 +42,18 @@ def short_name(name: str, limit: int = 40) -> str:
 
 
 class SpeedTracker:
-    """Sliding-window speed + ETA for download/upload."""
+    """Sliding-window speed + peak + ETA for download/upload."""
 
-    def __init__(self, total: int = 0, window: float = 10.0):
-        self.start = time.monotonic()
+    def __init__(self, total: int = 0, window: float = 6.0):
         self.total = total
-        self.current = 0
         self.window = window
+        self.peak_speed = 0.0
+        self.reset()
+
+    def reset(self):
+        self.start = time.monotonic()
+        self.current = 0
+        self.peak_speed = 0.0
         self.samples = deque([(self.start, 0)])
 
     def update(self, current: int, total: int = 0):
@@ -59,6 +64,9 @@ class SpeedTracker:
         self.samples.append((now, current))
         while len(self.samples) > 2 and now - self.samples[0][0] > self.window:
             self.samples.popleft()
+        sp = self.speed
+        if sp > self.peak_speed:
+            self.peak_speed = sp
 
     @property
     def elapsed(self) -> float:
@@ -71,7 +79,7 @@ class SpeedTracker:
     @property
     def speed(self) -> float:
         (t0, c0), (t1, c1) = self.samples[0], self.samples[-1]
-        if t1 - t0 < 0.5:
+        if t1 - t0 < 0.35:
             return self.avg_speed
         return max(0.0, (c1 - c0) / (t1 - t0))
 
@@ -85,8 +93,10 @@ class SpeedTracker:
         return self.current / self.total * 100 if self.total else 0.0
 
 
-def render_transfer(kind: str, tr: SpeedTracker, name: str) -> str:
+def render_transfer(kind: str, tr: SpeedTracker, name: str, badge: str = "") -> str:
     head = "📥 <b>Downloading</b>" if kind == "dl" else "📤 <b>Uploading</b>"
+    if badge:
+        head += f"  <i>({esc(badge)})</i>"
     return "\n".join([
         f"{head}\n<code>{esc(short_name(name))}</code>",
         "",

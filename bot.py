@@ -17,6 +17,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+try:
+    import uvloop
+    uvloop.install()
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+except ImportError:
+    pass
+
 from telethon import TelegramClient, events, Button
 from telethon.errors import MessageNotModifiedError, FloodWaitError, QueryIdInvalidError
 
@@ -25,7 +35,8 @@ from config import (API_ID, API_HASH, BOT_TOKEN, SESSION_NAME, ALLOWED_USERS,
                     PROGRESS_UPDATE_INTERVAL, DOWNLOAD_DIR, PRESETS, CODECS,
                     PRESET_INFO, CRF, AUDIO_BITRATE, MAX_UPLOAD_BYTES,
                     WORKER_CHOICES, QUEUE_MAX, QUEUE_RES_CHOICES)
-from fast_downloader import get_downloader, init_download_engine
+from fast_conn import FastTcpConnection
+from fast_downloader import close_download_engine, get_downloader, init_download_engine
 from fast_uploader import get_uploader
 from userbots import Relay
 from media import (VideoMeta, telegram_meta, probe_remote, ffprobe, apply_probe,
@@ -39,7 +50,7 @@ from ui import (SpeedTracker, render_transfer, render_encode, human_size,
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
 logger = logging.getLogger("EncoderBot")
 
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+client = TelegramClient(SESSION_NAME, API_ID, API_HASH, connection=FastTcpConnection)
 client.parse_mode = "html"
 store = SettingsStore()
 pool = dist.WorkerPool()
@@ -458,6 +469,8 @@ async def on_video(event):
     job = Job(id=uuid.uuid4().hex[:8], user_id=event.sender_id, chat_id=event.chat_id,
               message=msg, meta=telegram_meta(msg), status=status)
     jobs[job.id] = job
+    if relay.enabled:
+        relay.trigger_warmup(job.meta.dc)
 
     workdir = Path(DOWNLOAD_DIR) / ("probe_" + job.id)
     workdir.mkdir(parents=True, exist_ok=True)
@@ -595,29 +608,44 @@ async def run_job(job: Job, height: int):
             prestart = asyncio.create_task(_prestart())
 
         # 1) DOWNLOAD ─────────────────────────────
+        use_relay, ch_in = relay.enabled and bool(relay.ready), None
+        dl_badge = f"⚡ {len(relay.ready)}×UB" if use_relay else ""
         tr = SpeedTracker(total=meta.size)
-        await live.set(render_transfer("dl", tr, meta.name), force=True)
 
         async def dl_cb(cur, tot):
             if phase[0] != "dl":
                 return
             tr.update(cur, tot)
-            await live.set(render_transfer("dl", tr, meta.name))
+            await live.set(render_transfer("dl", tr, meta.name, dl_badge))
 
-        use_relay, ch_in = relay.enabled and bool(relay.ready), None
-        if use_relay:                                      # user ගේ video එක → private channel (userbots එතනින් ගන්නවා)
+        if use_relay:                                      # user ගේ video එක → private channel + parallel DC pool warmup
             try:
                 await live.set("📨 <b>Channel එකට forward කරනවා…</b>", force=True)
-                ch_in = await relay.forward_in(client, job.message)
-                ch_ids.append(ch_in)
+                fwd_task = asyncio.create_task(relay.forward_in(client, job.message))
+                warm_task = asyncio.create_task(relay.warmup(meta.dc))
+                try:
+                    ch_in = await fwd_task
+                    ch_ids.append(ch_in)
+                finally:
+                    if not warm_task.done():
+                        # Keep warmup running in background if not finished yet; download_lanes attaches seamlessly
+                        relay._bg_tasks.add(warm_task)
+                        warm_task.add_done_callback(relay._bg_tasks.discard)
+                    else:
+                        with contextlib.suppress(Exception):
+                            warm_task.result()
             except Exception as e:
                 logger.warning(f"relay forward failed ({e!r}) → bot download")
                 use_relay = False
-            await live.set(render_transfer("dl", tr, meta.name), force=True)
+                dl_badge = ""
+
+        tr.reset()
+        await live.set(render_transfer("dl", tr, meta.name, dl_badge), force=True)
+
         if use_relay:
             try:
                 await relay.download(dl, ch_in, str(src), job.id, dl_cb)
-                stats["via"] = [u.name for u in relay.ready]
+                stats["via"] = relay.last_used_lanes or [u.name for u in relay.ready]
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -626,9 +654,10 @@ async def run_job(job: Job, height: int):
                 logger.warning(f"relay download failed ({e!r}) → bot download")
                 await live.set("⚠️ Userbot download fail → bot එකෙන් download කරනවා…", force=True)
                 src.unlink(missing_ok=True)
-                tr = SpeedTracker(total=meta.size)
                 use_relay = False
+                dl_badge = ""
                 stats.pop("via", None)
+                tr.reset()
                 await dl.download(client, job.message, str(src), job.id, dl_cb)
         else:
             await dl.download(client, job.message, str(src), job.id, dl_cb)
@@ -819,6 +848,7 @@ async def main():
         await client.run_until_disconnected()
     finally:
         await relay.stop()
+        await close_download_engine()
 
 
 if __name__ == "__main__":
