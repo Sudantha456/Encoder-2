@@ -115,7 +115,16 @@ USER_STRINGS = _collect_user_strings()
 CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
 CHANNEL_CLEANUP = os.getenv("CHANNEL_CLEANUP", "1") == "1"      # delivery ඉවර වුණාම channel එකේ messages මකනවා
 
-UB_DL_CONNECTIONS = int(os.getenv("UB_DL_CONNECTIONS", str(DL_CONNECTIONS)))   # එක userbot එකකට connections
+# Download tuning for multi-userbot relay. With 4 userbots the default profile is
+# 4 × 8 connections × 3 concurrent requests = 96 in-flight chunk requests.
+# Keep these environment-overridable: Telegram/DC/network limits vary by account.
+UB_DL_CONNECTIONS = max(1, int(os.getenv("UB_DL_CONNECTIONS", "8")))
+UB_DL_WORKERS_PER_CONN = max(1, int(os.getenv("UB_DL_WORKERS_PER_CONN", "4")))
+UB_DL_MAX_WORKERS = max(1, int(os.getenv("UB_DL_MAX_WORKERS", "128")))
+UB_DL_MAX_RETRIES = max(1, int(os.getenv("UB_DL_MAX_RETRIES", "10")))
+UB_DL_CHUNK_TIMEOUT = max(5.0, float(os.getenv("UB_DL_CHUNK_TIMEOUT", "35")))
+UB_DL_HEDGE_AFTER = max(1.0, float(os.getenv("UB_DL_HEDGE_AFTER", "6")))
+UB_DL_HEDGE_MAX = max(1, int(os.getenv("UB_DL_HEDGE_MAX", "2")))
 UB_UL_CONNECTIONS = int(os.getenv("UB_UL_CONNECTIONS", str(UL_CONNECTIONS)))
 UB_MAX_FLOOD_WAIT = int(os.getenv("UB_MAX_FLOOD_WAIT", "30"))   # මීට වැඩි FloodWait එකක් ආවොත් ඒ userbot එක පැත්තකට දාලා තව එකක් use කරනවා
 UB_FLOOD_COOLDOWN = int(os.getenv("UB_FLOOD_COOLDOWN", "60"))   # FloodWait ආපු userbot එක ඊළඟ jobs වලට මෙච්චර වෙලාවක් skip
