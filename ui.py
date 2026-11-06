@@ -161,6 +161,23 @@ def _render_merge(st) -> str:
     return "\n".join(lines)
 
 
+def _part_cell_compact(p) -> str:
+    """Fixed-width compact cell for 2-column 13..50 worker board."""
+    num = f"{p.idx + 1:02d}"
+    if p.status == "running":
+        return f"{num} {_mini(p.pct, 4)} {p.pct:3.0f}% {p.speed:3.1f}x"
+    short_labels = {
+        "ready":       "✅ 100% done ",
+        "uploading":   "☁️ uploading ",
+        "remote_done": "📥 fetching  ",
+        "downloading": "⬇️ dl segment",
+        "waiting":     "⏳ waiting   ",
+        "held":        "📦 held      ",
+        "failed":      "♻️ retry     ",
+    }
+    return f"{num} {short_labels.get(p.status, p.status[:13].ljust(13))}"
+
+
 def render_dist(
     st,
     name: str,
@@ -181,25 +198,61 @@ def render_dist(
         return head + f"\n☁️ කොටස් {len(st.parts)} Release එකට upload කරනවා…"
     if st.phase == "merge":
         return head + "\n" + _render_merge(st)
-    labels = {
-        "waiting": "⏳ runner start වෙන්න බලාගෙන", "held": "📦 held • idle runner එකක් එනකම්",
-        "uploading": "☁️ result upload", "remote_done": "📥 fetching",
-        "failed": "♻️ retry queue", "ready": "✅ done",
-    }
-    lines = [head, f"<code>[{bar(st.percent)}] {st.percent:5.1f}%</code>",
-             f"🎞 Video: <code>{human_time(st.out_time)} / {human_time(st.duration)}</code>",
-             f"🚀 Speed: <code>{st.speed:.2f}x</code> realtime (මුළු එකතුව) • <code>{st.fps:.0f} fps</code>"]
+
+    n_total = len(st.parts)
+    n_done = sum(1 for p in st.parts if p.ready)
+    n_run = sum(1 for p in st.parts if p.status == "running" and not p.ready)
+    n_xfer = sum(1 for p in st.parts if p.status in ("downloading", "uploading", "remote_done") and not p.ready)
+    n_wait = n_total - n_done - n_run - n_xfer
+
+    summary_bits = [f"✅ {n_done}/{n_total}"]
+    if n_run:
+        summary_bits.append(f"▶️ {n_run} enc")
+    if n_xfer:
+        summary_bits.append(f"☁️ {n_xfer} io")
+    if n_wait:
+        summary_bits.append(f"⏳ {n_wait} wait")
+
+    lines = [
+        head,
+        f"<code>[{bar(st.percent)}] {st.percent:5.1f}%</code>",
+        f"🎞 Video: <code>{human_time(st.out_time)} / {human_time(st.duration)}</code>",
+        f"🚀 Speed: <code>{st.speed:.2f}x</code> realtime (මුළු එකතුව) • <code>{st.fps:.0f} fps</code>",
+    ]
     if st.est_total_frames:
         lines.append(f"🖼 Frames: <code>{st.frame:,} / ≈{st.est_total_frames:,}</code>")
     lines.append(f"⏳ ETA: <code>{human_time(st.eta)}</code>   ⏱ Elapsed: <code>{human_time(st.elapsed)}</code>")
     size = f"📦 Output so far: <code>{human_size(st.out_size)}</code>"
     if st.est_final_size:
         size += f"  (≈ final <code>{human_size(st.est_final_size)}</code>)"
-    lines += [size, "", "<b>Workers</b>"]
-    for p in st.parts:
-        if p.status == "running":
-            txt = f"{_mini(p.pct)} {p.pct:3.0f}% • {p.speed:.1f}x"
-        else:
-            txt = labels.get(p.status, p.status)
-        lines.append(f"<code>{p.idx + 1}</code> {txt}")
+    lines += [size, "", f"👷 <b>Workers ({' • '.join(summary_bits)})</b>"]
+
+    if n_total <= 12:
+        labels = {
+            "waiting": "⏳ runner start වෙන්න බලාගෙන",
+            "downloading": "⬇️ raw segment download",
+            "held": "📦 held • idle runner එකක් එනකම්",
+            "uploading": "☁️ result upload",
+            "remote_done": "📥 fetching",
+            "failed": "♻️ retry queue",
+            "ready": "✅ done",
+        }
+        w_rows = []
+        for p in st.parts:
+            if p.status == "running":
+                txt = f"{_mini(p.pct)} {p.pct:3.0f}% • {p.speed:.1f}x"
+            else:
+                txt = labels.get(p.status, p.status)
+            w_rows.append(f"{p.idx + 1:02d} {txt}")
+        lines.append("<code>" + esc("\n".join(w_rows)) + "</code>")
+    else:
+        # 2-column single <code> block: 30 workers = 15 compact lines, 50 workers = 25 compact lines, 1 HTML entity!
+        cells = [_part_cell_compact(p) for p in st.parts]
+        grid_rows = []
+        for i in range(0, len(cells), 2):
+            if i + 1 < len(cells):
+                grid_rows.append(f"{cells[i]} │ {cells[i + 1]}")
+            else:
+                grid_rows.append(cells[i])
+        lines.append("<code>" + esc("\n".join(grid_rows)) + "</code>")
     return "\n".join(lines)

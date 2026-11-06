@@ -4,8 +4,9 @@ Modes:
   • serve: queue session එකට bot විසින් dispatch කරනවා → ready වෙලා hold → job එන්නම encode → queue ඉවර වුණාම exit.
       Job signal = Release "enc-q-<SESSION>" හි body (ETag conditional polling → rate limit එකට ගණන් වෙන්නේ නෑ)
   • single (dispatch): CONFIG env එකෙන් එක කොටසක් encode කරලා ඉවර වෙනවා
-Progress: Telegram Bot API editMessageText (main bot හදපු message එක edit කරනවා).
-Env: PART, SESSION, BOT_TOKEN, GH_TOKEN, GH_REPO  (single mode: CONFIG)
+Progress: Main bot එකේ HTTP ProgressHub වෙත direct JSON POST (Telegram editMessageText භාවිතා නොකරන නිසා
+          workers 30–50 ක් වුණත් Telegram FloodWait කිසිවිටෙක ඇති නොවේ).
+Env: PART, SESSION, GH_TOKEN, GH_REPO  (single mode: CONFIG)
 """
 import asyncio
 import json
@@ -29,30 +30,68 @@ STANDBY_BASE = 100    # idx >= 100 → hot standby worker (කොටසක් �
 
 
 class Reporter:
-    def __init__(self, cfg, idx):
-        self.cfg, self.idx = cfg, idx
-        self.token = os.getenv("BOT_TOKEN", "")
-        self.msg_id = cfg["ids"][idx]
+    """Direct HTTP progress reporter → main bot ProgressHub (0 Telegram API calls)."""
+
+    def __init__(self, cfg: dict, idx: int, attempt: int = 0):
+        self.cfg = cfg
+        self.idx = idx
+        self.attempt = int(attempt)
+        self.report_url = (cfg.get("report_url") or os.getenv("DIST_REPORT_URL") or "").strip()
+        self.report_token = (cfg.get("report_token") or "").strip()
         self.test_dir = os.getenv("PROGRESS_DIR")
 
-    def _send_blocking(self, text):
+    def _send_blocking(self, status: str, payload_bytes: bytes, text_line: str, critical: bool) -> bool:
         if self.test_dir:
             with open(os.path.join(self.test_dir, f"{self.idx}.txt"), "w") as f:
-                f.write(text)
-            return
-        if not self.token:
-            print(text)
-            return
-        data = urllib.parse.urlencode({"chat_id": self.cfg["chat"], "message_id": self.msg_id, "text": text}).encode()
-        try:
-            urllib.request.urlopen(f"https://api.telegram.org/bot{self.token}/editMessageText", data, timeout=15).read()
-        except Exception as e:  # not modified / flood — ignore
-            print(f"[report] {e}", flush=True)
+                f.write(text_line)
+            return True
+        if not self.report_url:
+            print(text_line, flush=True)
+            return False
 
-    async def send(self, status, st: EncState, note=""):
-        text = (f"🧩 Part {self.idx + 1} • {status} • {st.percent:.0f}%{(' • ' + note) if note else ''}\n"
-                f"PROG|{self.cfg['job']}|{self.idx}|{status}|{st.out_time:.2f}|{st.fps:.1f}|{st.speed:.2f}|{st.out_size}|{st.frame}")
-        await asyncio.to_thread(self._send_blocking, text)
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "encoder-worker/2.0",
+        }
+        if self.report_token:
+            headers["X-Auth-Token"] = self.report_token
+
+        tries = 2 if critical else 1
+        for i in range(tries):
+            req = urllib.request.Request(self.report_url, data=payload_bytes, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    resp.read()
+                    if 200 <= resp.status < 300:
+                        return True
+            except Exception as e:
+                if i == tries - 1:
+                    print(f"[report {self.idx}] {status}: {e}", flush=True)
+                else:
+                    time.sleep(0.5)
+        return False
+
+    async def send(self, status: str, st: EncState, note: str = "") -> bool:
+        payload = {
+            "job": self.cfg["job"],
+            "idx": self.idx,
+            "attempt": self.attempt,
+            "state": status,
+            "out_time": round(st.out_time, 2),
+            "fps": round(st.fps, 1),
+            "speed": round(st.speed, 2),
+            "size": int(st.out_size),
+            "frame": int(st.frame),
+            "note": note,
+        }
+        text_line = (
+            f"🧩 Part {self.idx + 1} • {status} • {st.percent:.0f}%{(' • ' + note) if note else ''}\n"
+            f"PROG|{self.cfg['job']}|{self.idx}|{status}|{st.out_time:.2f}|"
+            f"{st.fps:.1f}|{st.speed:.2f}|{st.out_size}|{st.frame}"
+        )
+        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        critical = status in ("downloading", "uploading", "done", "failed")
+        return await asyncio.to_thread(self._send_blocking, status, raw, text_line, critical)
 
 
 def gh(*args, check=True):
@@ -62,15 +101,33 @@ def gh(*args, check=True):
     return r
 
 
-async def run_part(cfg: dict, idx: int, workdir: str = "."):
+def announce_started(tag: str, idx: int, attempt: int, workdir: str) -> None:
+    """Fallback liveness marker (used ONLY when HTTP ProgressHub tunnel is unreachable)."""
+    if os.getenv("PROGRESS_DIR") or os.getenv("QUEUE_FILE"):
+        return
+    p = os.path.join(workdir, f"started_{idx}_{attempt}")
+    try:
+        with open(p, "w") as f:
+            f.write("1")
+        gh("release", "upload", tag, p, "--clobber", check=False)
+    except Exception as e:
+        print(f"[worker {idx}] started marker warning: {e}", flush=True)
+    finally:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+async def run_part(cfg: dict, idx: int, workdir: str = ".", attempt: int = 0):
     """එක කොටසක් encode + upload. Fail වුණොත් 'failed' report කරලා exception raise."""
     tag = f"enc-{cfg['job']}"
     raw = os.path.join(workdir, f"raw_part_{idx}.mp4")
     dst = os.path.join(workdir, f"encoded_part_{idx}.mkv")
     st = EncState(duration=cfg["durations"][idx], src_fps=cfg["fps"])
-    rep = Reporter(cfg, idx)
+    rep = Reporter(cfg, idx, attempt=attempt)
     ctl = types.SimpleNamespace(cancelled=False, proc=None)
-    interval = float(cfg.get("interval", 3))
+    interval = max(float(cfg.get("interval", 3)), 2.5)
 
     async def ticker():
         while True:
@@ -89,12 +146,16 @@ async def run_part(cfg: dict, idx: int, workdir: str = "."):
 
     bg = []
     try:
-        await rep.send("running", st)
+        dl_ack = await rep.send("downloading", st)
         if not os.path.exists(raw):
             await asyncio.to_thread(gh, "release", "download", tag, "-p", f"raw_part_{idx}.mp4",
                                     "-D", workdir, "--clobber")
         if not os.path.exists(raw):
             raise RuntimeError("raw part not found")
+        run_ack = await rep.send("running", st)
+        if not (dl_ack or run_ack):
+            # Tunnel offline fallback: upload 1-byte started marker so main bot never falsely reassigns
+            await asyncio.to_thread(announce_started, tag, idx, attempt, workdir)
         bg = [asyncio.create_task(ticker()), asyncio.create_task(watchdog())]
         await transcode(raw, dst, st, ctl, target=cfg["target"], scale=cfg["scale"], portrait=cfg["portrait"],
                         preset=cfg["preset"], codec=cfg["codec"], crf=cfg["crf"], maxrate_kbps=cfg["maxrate"],
@@ -228,7 +289,7 @@ async def serve():
                     wd = os.path.join("work", f"{key[0]}_{part}")
                     os.makedirs(wd, exist_ok=True)
                     try:
-                        await run_part(cfg, part, wd)
+                        await run_part(cfg, part, wd, attempt=attempt)
                     except BaseException as e:
                         print(f"[worker {idx}] job failed: {e}", file=sys.stderr, flush=True)
                     finally:

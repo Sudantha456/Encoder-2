@@ -114,7 +114,7 @@ class SettingsStore:
         gh_repo: Optional[str] = None,
         gh_path: Optional[str] = None,
         gh_branch: Optional[str] = None,
-        debounce_sec: float = 0.6,
+        debounce_sec: float = 2.5,
     ):
         self.path = path
         self.gh_token = (

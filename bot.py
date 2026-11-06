@@ -101,27 +101,83 @@ def safe_stem(name: str) -> str:
 
 
 class Live:
-    """Message එක throttle කරලා edit කරන helper (FloodWait / same-text safe)."""
+    """
+    Per-chat FloodWait-safe message editor.
+    • Spaces edits per chat so Telegram's ~20 edits/min per-chat limit is never exceeded.
+    • Coalesces rapid force=True transitions so final states ('Done!', 'Cancelled') always land cleanly.
+    """
+
+    _chat_next_edit: dict = {}
+    _chat_locks: dict = {}
 
     def __init__(self, msg, buttons=None):
         self.msg, self.buttons = msg, buttons
-        self._busy, self._last = False, None
+        self._busy = False
+        self._last = None
+        self._next_own = 0.0
+        self._seq = 0
+        self._lock = asyncio.Lock()
+
+    @property
+    def _chat_id(self) -> int:
+        return int(getattr(self.msg, "chat_id", 0) or 0)
+
+    def _chat_lock(self) -> asyncio.Lock:
+        cid = self._chat_id
+        lk = Live._chat_locks.get(cid)
+        if lk is None:
+            lk = asyncio.Lock()
+            Live._chat_locks[cid] = lk
+        return lk
 
     async def set(self, text: str, force: bool = False):
-        if text == self._last or (self._busy and not force):
+        if text == self._last:
             return
-        self._busy = True
-        try:
-            await self.msg.edit(text, buttons=self.buttons)
-            self._last = text
-        except MessageNotModifiedError:
-            self._last = text
-        except FloodWaitError as e:
-            logger.warning(f"edit FloodWait {e.seconds}s — skipped")
-        except Exception as e:
-            logger.warning(f"edit failed: {e}")
-        finally:
-            self._busy = False
+        min_iv = max(PROGRESS_UPDATE_INTERVAL, getattr(config, "MIN_EDIT_INTERVAL", 3.8))
+        cid = self._chat_id
+        now = time.monotonic()
+
+        if not force:
+            if self._busy or now < self._next_own or now < Live._chat_next_edit.get(cid, 0.0):
+                return
+            if self._lock.locked() or self._chat_lock().locked():
+                return
+
+        self._seq += 1
+        my_seq = self._seq
+
+        async with self._lock:
+            if my_seq < self._seq or text == self._last:
+                return
+            self._busy = True
+            try:
+                async with self._chat_lock():
+                    if my_seq < self._seq or text == self._last:
+                        return
+                    wait_rem = Live._chat_next_edit.get(cid, 0.0) - time.monotonic()
+                    if wait_rem > 0:
+                        if not force:
+                            return
+                        await asyncio.sleep(min(wait_rem, 5.0))
+                        if my_seq < self._seq or text == self._last:
+                            return
+
+                    await self.msg.edit(text, buttons=self.buttons)
+                    t_done = time.monotonic()
+                    self._last = text
+                    self._next_own = t_done + (1.2 if force else min_iv)
+                    Live._chat_next_edit[cid] = t_done + (1.4 if force else 2.2)
+            except MessageNotModifiedError:
+                self._last = text
+            except FloodWaitError as e:
+                wait_s = max(float(getattr(e, "seconds", 3) or 3), 1.0)
+                Live._chat_next_edit[cid] = time.monotonic() + wait_s + 1.0
+                self._next_own = Live._chat_next_edit[cid]
+                logger.warning(f"edit FloodWait {e.seconds}s — backing off chat {cid}")
+            except Exception as e:
+                logger.warning(f"edit failed: {e}")
+            finally:
+                self._busy = False
 
 
 # ───────────────────────── preview / settings panels ─────────────────────────
@@ -636,15 +692,33 @@ async def cancel_waiting(job: Job):
     await refresh_positions()
 
 
+_refresh_pos_task: Optional[asyncio.Task] = None
+_refresh_pos_dirty: bool = False
+
+
+async def _refresh_positions_inner():
+    global _refresh_pos_dirty
+    while _refresh_pos_dirty:
+        await asyncio.sleep(0.8)
+        _refresh_pos_dirty = False
+        snap = list(queue)
+        total = len(snap)
+        for i, j in enumerate(snap, 1):
+            if j.live and not j.cancelled and j in queue:
+                await j.live.set(
+                    f"⏳ <b>Queued #{i}</b> / {total}\n"
+                    f"<code>{esc(j.meta.name[:50])}</code> → {esc(job_target_badge(j))}\n"
+                    "ඉස්සරහ jobs ඉවර වුණාම ස්වයංක්‍රීයව පටන් ගන්නවා.",
+                    force=True,
+                )
+
+
 async def refresh_positions():
-    for i, j in enumerate(list(queue), 1):
-        if j.live:
-            await j.live.set(
-                f"⏳ <b>Queued #{i}</b> / {len(queue)}\n"
-                f"<code>{esc(j.meta.name[:50])}</code> → {esc(job_target_badge(j))}\n"
-                "ඉස්සරහ jobs ඉවර වුණාම ස්වයංක්‍රීයව පටන් ගන්නවා.",
-                force=True,
-            )
+    """Coalesce burst queue changes so batch-forwarding 10+ videos doesn't fire O(N²) edits."""
+    global _refresh_pos_task, _refresh_pos_dirty
+    _refresh_pos_dirty = True
+    if _refresh_pos_task is None or _refresh_pos_task.done():
+        _refresh_pos_task = asyncio.create_task(_refresh_positions_inner())
 
 
 async def enqueue(job: Job, height: int, *, mode: str = "res") -> bool:
@@ -1107,6 +1181,8 @@ async def run_job(job: Job, height: int):
         if dist.should_distribute(meta, 0 if is_compress else height, preset, codec, cur_dst, pix_fmt=pix_fmt):
             dst_state = dist.DistState(meta.duration, meta.fps, n_workers)
 
+            tick_iv = max(PROGRESS_UPDATE_INTERVAL, getattr(config, "MIN_EDIT_INTERVAL", 3.8))
+
             async def dist_ticker():
                 while True:
                     await live.set(
@@ -1115,7 +1191,7 @@ async def run_job(job: Job, height: int):
                             target_label=t_label, extra_info=extra_lbl,
                         )
                     )
-                    await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
+                    await asyncio.sleep(tick_iv)
 
             dticker = asyncio.create_task(dist_ticker())
             try:

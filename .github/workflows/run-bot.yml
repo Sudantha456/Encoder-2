@@ -29,12 +29,15 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Fast Install FFmpeg
+      - name: Fast Install FFmpeg & Progress Tunnel
         run: |
           curl -fsSL --retry 3 https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
             | tar -xJ --strip-components=1 -C /tmp --wildcards '*/ffmpeg' '*/ffprobe'
           sudo mv /tmp/ffmpeg /tmp/ffprobe /usr/local/bin/
           ffmpeg -hide_banner -encoders | grep -E "libx264|libx265"
+          if curl -fsSL --retry 3 -o /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64; then
+            chmod +x /tmp/cloudflared && sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+          fi
 
       - name: Install Python Dependencies
         run: |

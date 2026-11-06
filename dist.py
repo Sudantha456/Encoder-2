@@ -16,6 +16,7 @@ Job එකකට:
 import asyncio
 import base64
 import contextlib
+import hmac
 import json
 import logging
 import os
@@ -25,7 +26,7 @@ import time
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, Dict, List, Optional
 
 import config
 from config import PROGRESS_UPDATE_INTERVAL
@@ -113,11 +114,6 @@ async def _bootstrap_inner(token: str, st: list) -> tuple:
         if sha:
             args += ["-f", f"sha={sha}"]
         await _helper_gh(token, repo, *args)
-    st[0] = "secret BOT_TOKEN"
-    try:
-        await _helper_gh(token, repo, "secret", "set", "BOT_TOKEN", "--repo", repo, "--body", config.BOT_TOKEN)
-    except Exception as e:                       # fatal නෑ: workers වැඩ කරනවා, progress edits විතරක් නැති වෙනවා
-        HELPER_PROBLEMS.append(f"{repo}: BOT_TOKEN secret set වුණේ නෑ ({e}) — progress පෙන්වන්නේ නෑ")
     return token, repo
 
 
@@ -191,6 +187,7 @@ class Part:
     attempt: int = 0              # unique lease generation for worker-side de-duplication
     orphan: bool = False          # owner account එක fail → raw part එක තවම upload වෙලා නෑ
     last_try: float = 0.0
+    via_http: bool = False        # HTTP ProgressHub හරහා live updates ලැබෙනවාද යන්න
 
     @property
     def pct(self) -> float:
@@ -450,6 +447,190 @@ class GhBackend:
             return []
 
 
+# ───────────────────────── Direct HTTP Progress Hub ─────────────────────────
+class ProgressHub:
+    """
+    Lightweight async HTTP receiver + automatic Quick-Tunnel (cloudflared / ssh localhost.run).
+    Workers POST JSON progress directly to main bot memory → 0 Telegram messages, 0 EditMessageRequest
+    FloodWaits even with 50 concurrent workers!
+    """
+
+    def __init__(self):
+        self.token: str = os.urandom(16).hex()
+        self.port: int = 0
+        self.public_url: str = ""
+        self._server: Optional[asyncio.AbstractServer] = None
+        self._tunnel_proc: Optional[asyncio.subprocess.Process] = None
+        self._drain_task: Optional[asyncio.Task] = None
+        self._jobs: Dict[str, Callable[[dict], None]] = {}
+        self._lock = asyncio.Lock()
+
+    def register(self, job_id: str, cb: Callable[[dict], None]) -> None:
+        self._jobs[str(job_id)] = cb
+
+    def unregister(self, job_id: str) -> None:
+        self._jobs.pop(str(job_id), None)
+
+    async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        status_line = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+        try:
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5.0)
+            lines = head.decode("latin-1", errors="ignore").split("\r\n")
+            req_line = lines[0] if lines else ""
+            headers: Dict[str, str] = {}
+            for ln in lines[1:]:
+                if ":" in ln:
+                    k, v = ln.split(":", 1)
+                    headers[k.strip().lower()] = v.strip()
+
+            if req_line.startswith("POST "):
+                got_tok = headers.get("x-auth-token", "")
+                if not hmac.compare_digest(got_tok, self.token):
+                    status_line = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\nConnection: close\r\n\r\nforbidden"
+                else:
+                    clen = min(max(int(headers.get("content-length", "0") or 0), 0), 32768)
+                    body = await asyncio.wait_for(reader.readexactly(clen), timeout=5.0) if clen else b"{}"
+                    data = json.loads(body.decode("utf-8", errors="ignore") or "{}")
+                    if isinstance(data, dict):
+                        cb = self._jobs.get(str(data.get("job", "")))
+                        if cb:
+                            cb(data)
+        except Exception:
+            status_line = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad"
+        finally:
+            with contextlib.suppress(Exception):
+                writer.write(status_line)
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+    async def _start_server_unlocked(self) -> None:
+        if self._server is not None:
+            return
+        manual_url = getattr(config, "DIST_REPORT_URL", "").strip()
+        bind_host = "0.0.0.0" if manual_url else "127.0.0.1"
+        bind_port = int(os.getenv("DIST_REPORT_PORT", "0") or 0)
+        self._server = await asyncio.start_server(self._handle_client, bind_host, bind_port)
+        socks = self._server.sockets or []
+        if socks:
+            self.port = int(socks[0].getsockname()[1])
+
+    async def _spawn_tunnel(self, cmd: List[str], url_regex: str, timeout: float) -> str:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            stdin=asyncio.subprocess.DEVNULL,
+        )
+        pat = re.compile(url_regex)
+        found_url = ""
+        deadline = time.monotonic() + timeout
+        try:
+            while time.monotonic() < deadline:
+                rem = max(0.2, deadline - time.monotonic())
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout=rem)
+                if not line:
+                    break
+                txt = line.decode("utf-8", errors="ignore")
+                m = pat.search(txt)
+                if m:
+                    found_url = m.group(0).rstrip("/")
+                    break
+        except asyncio.TimeoutError:
+            pass
+
+        if not found_url:
+            with contextlib.suppress(Exception):
+                proc.kill()
+                await proc.wait()
+            return ""
+
+        self._tunnel_proc = proc
+
+        async def _drain():
+            with contextlib.suppress(Exception):
+                while True:
+                    ln = await proc.stdout.readline()
+                    if not ln:
+                        break
+
+        self._drain_task = asyncio.create_task(_drain())
+        return found_url
+
+    async def ensure(self) -> str:
+        async with self._lock:
+            await self._start_server_unlocked()
+            manual_url = getattr(config, "DIST_REPORT_URL", "").strip()
+            if manual_url:
+                self.public_url = manual_url if manual_url.endswith("/prog") else manual_url.rstrip("/") + "/prog"
+                return self.public_url
+
+            if self._tunnel_proc is not None and self._tunnel_proc.returncode is None and self.public_url:
+                return self.public_url
+
+            await self._stop_tunnel_unlocked()
+
+            if shutil.which("cloudflared"):
+                base = await self._spawn_tunnel(
+                    ["cloudflared", "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{self.port}"],
+                    r"https://[a-zA-Z0-9-]+\.trycloudflare\.com",
+                    timeout=15.0,
+                )
+                if base:
+                    self.public_url = f"{base}/prog"
+                    logger.info(f"🌐 ProgressHub tunnel active (cloudflared): {self.public_url}")
+                    return self.public_url
+
+            if shutil.which("ssh"):
+                base = await self._spawn_tunnel(
+                    [
+                        "ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+                        "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes",
+                        "-o", "ServerAliveInterval=30",
+                        "-R", f"80:127.0.0.1:{self.port}", "nokey@localhost.run",
+                    ],
+                    r"https://[a-zA-Z0-9-]+\.lhr\.life",
+                    timeout=12.0,
+                )
+                if base:
+                    self.public_url = f"{base}/prog"
+                    logger.info(f"🌐 ProgressHub tunnel active (localhost.run): {self.public_url}")
+                    return self.public_url
+
+            logger.warning("🌐 ProgressHub tunnel unavailable — using GitHub Release asset liveness fallback")
+            self.public_url = ""
+            return ""
+
+    async def _stop_tunnel_unlocked(self) -> None:
+        if self._drain_task:
+            self._drain_task.cancel()
+            with contextlib.suppress(BaseException):
+                await self._drain_task
+            self._drain_task = None
+        if self._tunnel_proc is not None:
+            if self._tunnel_proc.returncode is None:
+                with contextlib.suppress(Exception):
+                    self._tunnel_proc.terminate()
+                try:
+                    await asyncio.wait_for(self._tunnel_proc.wait(), timeout=2.0)
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        self._tunnel_proc.kill()
+            self._tunnel_proc = None
+        self.public_url = ""
+
+    async def stop(self) -> None:
+        async with self._lock:
+            await self._stop_tunnel_unlocked()
+            if self._server is not None:
+                self._server.close()
+                with contextlib.suppress(Exception):
+                    await self._server.wait_closed()
+                self._server = None
+            self.port = 0
+            self._jobs.clear()
+
+
 # ───────────────────────── Worker pool (queue session) ─────────────────────────
 class Acct:
     """GitHub account එකක් (0 = main, 1.. = helpers) — තමන්ගේම mailbox session + workers."""
@@ -475,6 +656,7 @@ class WorkerPool:
         self.accts: List[Acct] = []
         self._lock = asyncio.Lock()
         self.halted = False            # /End_Work පස්සේ අලුත් workers dispatch වෙන එක නවත්තනවා
+        self.hub = ProgressHub()
 
     def build(self):
         want = 1 + len(HELPERS)
@@ -533,7 +715,10 @@ class WorkerPool:
                     errors.append(e)
                     logger.warning(f"🌐 [acct {a.idx}] dispatch failed: {e}")
 
+            hub_task = asyncio.create_task(self.hub.ensure())
             await asyncio.gather(*[one(a) for a in self.accts])
+            with contextlib.suppress(Exception):
+                await hub_task
             # A single account failure must not collapse the distributed job.
             # Its parts are held and will be assigned to an idle runner elsewhere.
             if not any(a.active and not a.failed for a in self.accts):
@@ -660,6 +845,7 @@ class WorkerPool:
                 a.dispatched, a.standby, a.sb_busy, a.assign, a.skip = set(), set(), {}, {}, set()
                 a.claimed_idle = set()
                 a.session = a.tag = ""
+            await self.hub.stop()
             self.halted = False
             left = sum(len(v) for v in res["left"].values())
             if left:
@@ -672,6 +858,7 @@ class WorkerPool:
         """Stop the worker pool and cancel active + queued encode-worker runs only."""
         self.build()
         self.halted = True
+        await self.hub.stop()
         for a in self.accts:
             a.active = False
             if a.hb:
@@ -801,7 +988,7 @@ class DistRun:
         self.meta, self.state, self.opts, self.work = meta, state, opts, Path(workdir)
         self.used: set = set()                 # parts release එකක් හදපු accounts
         self.job_cfg: dict = {}
-        self.board_cls = board_cls or TgBoard
+        self.board_cls = board_cls             # None in production (0 Telegram messages; ProgressHub HTTP instead)
         self.tag = f"enc-{job.id}"
         self.board = None
         self.tasks: List[asyncio.Task] = []
@@ -926,13 +1113,24 @@ class DistRun:
             if upload_errors:
                 raise DistError("One or more account raw-part uploads failed: " + " | ".join(upload_errors))
 
-            # 3) progress board + audio + dispatch
+            # 3) ProgressHub HTTP registration + dispatch (0 Telegram messages created!)
             chat = int(config.DIST_PROGRESS_CHAT) if config.DIST_PROGRESS_CHAT else self.job.chat_id
-            self.board = self.board_cls(self.client, chat, self.job.id, len(files))
-            await self.board.create()
+            if self.board_cls is not None:
+                self.board = self.board_cls(self.client, chat, self.job.id, len(files))
+                await self.board.create()
+
+            report_url = ""
+            report_tok = ""
+            if hasattr(self.pool, "hub") and self.pool.hub is not None:
+                self.pool.hub.register(self.job.id, self._on_http_report)
+                report_url = await self.pool.hub.ensure()
+                report_tok = self.pool.hub.token
+
             o = self.opts
             job_cfg = {
-                "job": self.job.id, "n": len(files), "chat": chat, "ids": self.board.ids,
+                "job": self.job.id, "n": len(files), "chat": chat,
+                "ids": self.board.ids if self.board else [],
+                "report_url": report_url, "report_token": report_tok,
                 "durations": [p.duration for p in s.parts], "fps": meta.fps,
                 "target": o["target"], "scale": o["scale"], "portrait": o["portrait"],
                 "preset": o["preset"], "codec": o["codec"], "crf": o["crf"],
@@ -955,6 +1153,8 @@ class DistRun:
             await self._merge(audio_task)
             return self.stats
         finally:
+            if hasattr(self.pool, "hub") and self.pool.hub is not None:
+                self.pool.hub.unregister(self.job.id)
             if self._ensure:
                 with contextlib.suppress(BaseException):
                     await self._ensure
@@ -989,6 +1189,44 @@ class DistRun:
         return out
 
     # ── monitor + idle-runner scheduler ──
+    def _on_http_report(self, d: dict) -> None:
+        try:
+            idx = int(d.get("idx", -1))
+        except (TypeError, ValueError):
+            return
+        if idx < 0 or idx >= len(self.state.parts):
+            return
+        p = self.state.parts[idx]
+        if p.ready:
+            return
+        try:
+            rep_attempt = int(d.get("attempt", 0))
+        except (TypeError, ValueError):
+            rep_attempt = 0
+        if rep_attempt < p.attempt:
+            return
+
+        p.last_change = time.monotonic()
+        p.via_http = True
+        st = str(d.get("state", ""))
+        if st == "downloading":
+            if p.status in ("waiting", "held", "downloading"):
+                p.status = "downloading"
+        elif st in ("running", "uploading"):
+            p.status = st
+            p.out_time = float(d.get("out_time") or 0.0)
+            p.fps = float(d.get("fps") or 0.0)
+            p.speed = float(d.get("speed") or 0.0)
+            p.size = int(d.get("size") or 0)
+            p.frame = int(d.get("frame") or 0)
+            if st == "uploading":
+                p.out_time = p.duration
+        elif st == "done":
+            p.out_time = p.duration
+            p.status = "remote_done"
+        elif st == "failed":
+            p.status = "failed"
+
     def _apply(self, p: Part, txt: str):
         if p.ready:
             return
@@ -998,7 +1236,9 @@ class DistRun:
         if not d:
             return
         st = d["state"]
-        if st in ("running", "uploading"):
+        if st == "downloading":
+            p.status = "downloading"
+        elif st in ("running", "uploading"):
             p.status = st
             p.out_time, p.fps, p.speed, p.size, p.frame = (
                 d["out_time"], d["fps"], d["speed"], d["size"], d["frame"]
@@ -1128,6 +1368,7 @@ class DistRun:
         p.out_time = p.fps = p.speed = 0.0
         p.frame = p.size = 0
         p.last_raw = ""
+        p.via_http = False
         p.last_change = time.monotonic()
         self.stats["reassigned_parts"] += 1
         logger.info(f"♻️ part {p.idx} reassigned → acct {ai}, worker {worker_idx}, attempt {p.attempt}")
@@ -1166,22 +1407,32 @@ class DistRun:
     async def _monitor(self):
         s = self.state
         last_assets = 0.0
+        last_sched = 0.0
         while not all(p.ready for p in s.parts):
             if self.job.cancelled:
                 raise asyncio.CancelledError()
             if self.pool.halted:
                 raise DistError("worker pool stopped (/End_Work); distributed job cannot continue")
             now = time.monotonic()
-            try:
-                texts = await self.board.read()
-                for p, t in zip(s.parts, texts):
-                    self._apply(p, t)
-            except Exception as e:
-                logger.debug(f"board read failed: {e}")
+            if self.board is not None:
+                try:
+                    texts = await self.board.read()
+                    for p, t in zip(s.parts, texts):
+                        self._apply(p, t)
+                except Exception as e:
+                    logger.debug(f"board read failed: {e}")
 
-            # A worker may have uploaded its output even if its final Telegram
-            # progress edit was lost. Check all releases used by this job.
-            if now - last_assets > 20 and self.used:
+            # Self-heal tunnel if cloudflared/ssh ever exited mid-job
+            hub = getattr(self.pool, "hub", None)
+            if hub is not None and hub._tunnel_proc is not None and hub._tunnel_proc.returncode is not None:
+                new_url = await hub.ensure()
+                if new_url and new_url != self.job_cfg.get("report_url"):
+                    self.job_cfg["report_url"] = new_url
+                    with contextlib.suppress(Exception):
+                        await self.pool.post_job(self.job.id, self.job_cfg)
+
+            # Check all releases used by this job for completed outputs & fallback started markers.
+            if now - last_assets > 15 and self.used:
                 last_assets = now
                 async def assets_of(ai):
                     try:
@@ -1191,35 +1442,43 @@ class DistRun:
                 all_assets = await asyncio.gather(*[assets_of(ai) for ai in sorted(self.used)])
                 uploaded = set()
                 for ai, assets in all_assets:
-                    uploaded.update(name for name, st in assets.items()
-                                    if st == "uploaded" and name.startswith("encoded_part_"))
+                    uploaded.update(name for name, st in assets.items() if st == "uploaded")
                 for p in s.parts:
-                    if (not p.ready and not p.fetching
-                            and f"encoded_part_{p.idx}.mkv" in uploaded):
+                    if p.ready or p.fetching:
+                        continue
+                    if f"encoded_part_{p.idx}.mkv" in uploaded:
                         p.status = "remote_done"
+                    elif p.status == "waiting" and f"started_{p.idx}_{p.attempt}" in uploaded:
+                        p.status = "running"
+                        p.last_change = now
 
             for p in s.parts:
                 if p.ready or p.fetching:
                     continue
                 idle = now - p.last_change
+                stale_lim = config.DIST_STALE_SECONDS if p.via_http else max(config.DIST_STALE_SECONDS * 4, 900)
                 if p.status == "remote_done":
-                    if now - p.last_try >= 5:
+                    if now - p.last_try >= 2.0:
                         self.tasks.append(asyncio.create_task(self._fetch(p)))
                 elif p.status == "failed":
                     self._hold(p, "worker reported failure")
                 elif p.status == "waiting" and idle > config.DIST_START_TIMEOUT:
                     self._hold(p, "runner has not started")
-                elif p.status in ("running", "uploading") and idle > config.DIST_STALE_SECONDS:
+                elif p.status == "downloading" and idle > max(config.DIST_START_TIMEOUT * 3, 120):
+                    self._hold(p, "raw download stalled")
+                elif p.status in ("running", "uploading") and idle > stale_lim:
                     self._hold(p, "runner stopped reporting progress")
 
-            await self._schedule_held()
+            if now - last_sched >= 6.0:
+                last_sched = now
+                await self._schedule_held()
 
             # Surface fetch errors promptly; held parts deliberately stay in the
             # scheduler queue instead of being encoded by the main bot runner.
             for task in self.tasks:
                 if task.done() and not task.cancelled() and task.exception():
                     raise task.exception()
-            await asyncio.sleep(max(1.0, PROGRESS_UPDATE_INTERVAL))
+            await asyncio.sleep(max(1.0, min(PROGRESS_UPDATE_INTERVAL, 2.5)))
 
     # ── merge ──
     async def _merge(self, audio_task):

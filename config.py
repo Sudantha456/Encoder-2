@@ -16,6 +16,7 @@ ALLOWED_USERS = [int(x) for x in os.getenv("ALLOWED_USERS", "").split(",") if x.
 
 # ── 🔁 Progress update interval (තත්පර) — මෙතනින් වෙනස් කරන්න ──
 PROGRESS_UPDATE_INTERVAL = float(os.getenv("PROGRESS_UPDATE_INTERVAL", "3"))
+MIN_EDIT_INTERVAL = float(os.getenv("MIN_EDIT_INTERVAL", "3.8"))   # එකම chat එකේ EditMessageRequest FloodWait වළක්වන අවම පරතරය
 
 # ── Paths & Cloud Settings Sync (GitHub JSON) ─────────────
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
@@ -133,11 +134,12 @@ HELPER_TOKENS = [t for t in re.split(r"[,\s]+", os.getenv("HELPER_TOKENS", "").s
 HELPER_REPO = os.getenv("HELPER_REPO", "encoder-workers")
 DIST_WORKFLOW = os.getenv("DIST_WORKFLOW", "encode-worker.yml")
 DIST_AUTO_MIN_SECONDS = int(os.getenv("DIST_AUTO_MIN_SECONDS", "240"))  # auto mode: single-runner encode මීට වැඩි නම් විතරයි
-DIST_START_TIMEOUT = int(os.getenv("DIST_START_TIMEOUT", "10"))    # runner එක start නොවුණොත් part එක held queue එකට යනවා
+DIST_START_TIMEOUT = int(os.getenv("DIST_START_TIMEOUT", "30"))    # runner එක start නොවුණොත් part එක held queue එකට යනවා
 DIST_STANDBY = int(os.getenv("DIST_STANDBY", "0"))                # optional extra idle runners — 0 = off
 STANDBY_BASE = 100                                                 # standby worker index (worker.py එකේත් 100)
 DIST_STALE_SECONDS = int(os.getenv("DIST_STALE_SECONDS", "180"))   # runner progress නතර වුණොත් part එක held queue එකට
-DIST_PROGRESS_CHAT = os.getenv("DIST_PROGRESS_CHAT", "")           # හිස් = user ගේ chat එකම (messages පස්සේ delete වෙනවා)
+DIST_REPORT_URL = os.getenv("DIST_REPORT_URL", "").strip()         # හිස් = auto tunnel (cloudflared/ssh) → main bot HTTP hub
+DIST_PROGRESS_CHAT = os.getenv("DIST_PROGRESS_CHAT", "")           # legacy compatibility
 
 # ── 📋 Queue ──
 QUEUE_MAX = int(os.getenv("QUEUE_MAX", "20"))      # එකවර queue එකේ තියෙන්න පුළුවන් උපරිම videos
