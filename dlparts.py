@@ -48,19 +48,32 @@ def verify_ranges(ranges: List[Tuple[int, int]], total_size: int) -> bool:
     return pos == total_size
 
 
-def range_requests(start: int, end: int, file_end: int, chunk_size: int = 1024 * 1024):
-    """(offset, request_limit, expected_bytes) ටික yield කරනවා — 4096-aligned requests.
+_FRAG = 1024 * 1024
 
-    Telegram getFileRequest limits 4096 ගුණාකාර විය යුතුයි; interior chunks ඒවා 1MB-aligned වගේම
-    4096-divisible. absolute EOF එකේ පමණක් 1MB නොගියයි — එතන request එක 4096-පේළියට උඩ ඉල්ලලා
-    (clamped) expected bytes ගන්නවා. දත්ත කැපුවේ caller එකට — ලැබුණු bytes want ට trim කරන්න.
+
+def _largest_pow2_le(x: int) -> int:
+    return 1 << (x.bit_length() - 1)
+
+
+def range_requests(start: int, end: int, file_end: int, chunk_size: int = 1024 * 1024):
+    """(offset, request_limit, expected_bytes) — Telegram getFile නීති 4ම සපුරන requests:
+
+      1) offset % 4096 == 0        2) limit % 4096 == 0        3) 1048576 % limit == 0
+      4) [offset, offset+limit) එකම 1MB fragment එකේ රැඳිය යුතුයි
+
+    Interior 1MB chunks හැමදාම හරි. Partial/tail chunk එක power-of-two divisors වලට කඩලා
+    fragment මතනවා; EOF එකේ <4096 ඉතුරු උනොත් 4096 overshoot + caller clamp (ලැබුණු bytes want ට trim).
     """
     for off in range(start, end, chunk_size):
         lim = min(chunk_size, end - off)
-        if lim % 4096 == 0:
-            yield off, lim, lim
-            continue
-        if off + lim == file_end:                    # absolute EOF chunk — aligned-up request, clamp on write
-            yield off, -(-lim // 4096) * 4096, lim
-        else:                                        # 1MB-aligned plans වල මේ play එකට එන්නේ නෑ
-            yield off, lim, lim
+        pos, remaining = off, lim
+        while remaining > 0:
+            space = min(remaining, (pos // _FRAG + 1) * _FRAG - pos)   # fragment එක මතනවා, file_end ඉක්මෙන්නේ නෑ
+            if space >= 4096:
+                req = _largest_pow2_le(space)      # 4096 ≤ req ≤ 1MB, power of two ⇒ 1MB % req == 0
+                yield pos, req, min(req, remaining)
+                pos += req
+                remaining -= req
+            else:                                   # <4096 ඉතුරු = absolute EOF — overshoot (clamp on write)
+                yield pos, 4096, remaining
+                remaining = 0

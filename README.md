@@ -51,7 +51,7 @@ Helper එකක් connect වෙන්නේ නැත්නම් (token/repo
 
 ## Integrity — එක byte එකක්වත් miss වෙන්නේ නෑ
 - `dlparts.byte_ranges(size, n, align=1MB)`: ranges gap/overlap නැතිව **[0, size)** සම්පූර්ණ cover කරනවා; `verify_ranges()` double-check; slice කිසිම වෙලාවක range මායිමෙන් පිටතට යන්නේ නෑ (`range_requests` — 4096-aligned requests, absolute-EOF tail clamped).
-- Telegram `getFile` limits **4096 ගුණාකාරයක් විය යුතුයි** — ඒ නිසා file එකේ EOF tail chunk එක (1MB නොගිය) aligned-up request එකෙන් අරගෙන clamp කරනවා (හේතුව: "Short read" / "Incomplete slice" දැන් original හේතුව සහිතව පේනවා).
+- Telegram `getFile` නීති (docs): `offset % 4096 == 0`, `limit % 4096 == 0`, **`1048576 % limit == 0`** (limit එක 1MB divisor එකක් වෙන්න ඕනේ), **request එක එකම 1MB fragment එකේ** රැඳිය යුතුයි (`offset/1MB == (offset+limit-1)/1MB`). ඒ නිසා EOF tail chunk එක power-of-two divisor chunks වලට කැඩලා fragment මත නොපැරෙන විදිහට ගන්නවා (`dlparts.range_requests()` — tests එක invariants ඔක්කොම enforce කරනවා); "Short read" / "Incomplete slice" දැන් original හේතුව සහිතව පේනවා.
 - Helper lane: 1MB chunks → slice file (`ftruncate` exact) → `dl_slice_<n>` asset (size-verify).
 - Main එකේ settle loop: හැම slice එකකම release asset **size == expected** (byte-exact); හරි නැත්නම් main runner එක ඒ range එක Telegram එකෙන්ම re-download → verify → helper release එකට upload → ආයේ verify.
 - Assembler (`asm_worker.py`, helper #k): slices download → **cat order-verify** (concatenated size == `TOTAL_SIZE`) → ffprobe → keyframe parts (`raw_part_N.mp4`) + `audio.mka` → own release `enc-<job>` → marker `asm_done.json` (bounds/parts/audio).

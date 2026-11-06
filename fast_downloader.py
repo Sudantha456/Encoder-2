@@ -151,6 +151,7 @@ class FastDownloader:
                     os.write(fd, data)
 
         async def fetch(off: int, worker_idx: int):
+            req_lim, want = spec[off]
             for attempt in range(max_retries):
                 if self.is_cancelled(download_id):
                     raise asyncio.CancelledError("Cancelled")
@@ -158,12 +159,14 @@ class FastDownloader:
                 if wait > 0:
                     await asyncio.sleep(wait + random.uniform(0.0, 0.5))
                 try:
-                    req = GetFileRequest(location=location, offset=off, limit=CHUNK_SIZE)
+                    req = GetFileRequest(location=location, offset=off, limit=req_lim)
                     # retry වෙනකොට වෙන connection එකකට මාරු වෙනවා
                     res = await asyncio.wait_for(pool.send(req, worker_idx + attempt), timeout=60.0)
                     data = getattr(res, "bytes", None)
                     if data is None:
                         raise RuntimeError(f"Unexpected response: {type(res).__name__}")
+                    if len(data) > want:              # EOF overshoot — clamp
+                        data = data[:want]
                     await write_at(off, data)
                     _prog(len(data))
                     return
@@ -186,8 +189,11 @@ class FastDownloader:
                         raise
                     await asyncio.sleep(min(2 ** attempt, 8))
 
+        from dlparts import range_requests
+        spec = {}
         queue: asyncio.Queue = asyncio.Queue()
-        for off in range(0, total_size, CHUNK_SIZE):
+        for off, req_lim, want in range_requests(0, total_size, total_size, CHUNK_SIZE):
+            spec[off] = (req_lim, want)
             queue.put_nowait(off)
 
         async def worker(idx: int):
@@ -260,8 +266,11 @@ class FastDownloader:
         has_pwrite = hasattr(os, "pwrite")
         write_lock = asyncio.Lock()
 
+        from dlparts import range_requests
         queue: asyncio.Queue = asyncio.Queue()
-        for off in range(base, base + expected, CHUNK_SIZE):
+        spec = {}
+        for off, req_lim, want in range_requests(base, base + expected, base + expected, CHUNK_SIZE):
+            spec[off] = (req_lim, want)
             queue.put_nowait(off)
         remaining = [queue.qsize()]
         fails: Dict[int, int] = {}
@@ -327,18 +336,17 @@ class FastDownloader:
                     hedge = True
                 if off in finished:
                     continue
+                req_lim, want = spec[off]
                 rec = inflight.setdefault(off, [time.monotonic(), 0])
                 rec[1] += 1
                 try:
-                    lim = min(CHUNK_SIZE, base + expected - off)
-                    req_lim = lim if lim % 4096 == 0 else -(-lim // 4096) * 4096   # Telegram 4096 rule — tail aligned-up, clamp කරනවා
                     req = GetFileRequest(location=ln.location, offset=off, limit=req_lim)
                     r = await asyncio.wait_for(ln.pool.send(req, widx + (1 if hedge else 0)), timeout=CHUNK_TIMEOUT)
                     data = getattr(r, "bytes", None)
                     if data is None:
                         raise RuntimeError(f"Unexpected response: {type(r).__name__}")
-                    if len(data) > lim:
-                        data = data[:lim]
+                    if len(data) > want:                       # EOF overshoot — clamp
+                        data = data[:want]
                     ln.bad = 0
                     if off not in finished:                    # පළමුව ඉවර වූ copy එක විතරක් ගණන් වෙනවා
                         finished.add(off)

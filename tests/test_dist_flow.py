@@ -360,22 +360,37 @@ class TestSessionPlan(unittest.TestCase):
 
 
 class TestRangeRequests(unittest.TestCase):
-    def test_request_limits_4096_aligned_and_cover(self):
-        for size in [1, 4096, 1048576, 1048576 * 3 + 7, 135792708, 683149380]:
-            reqs = list(range_requests(0, size, size, CHUNK))
-            written = sum(w for *_, w in reqs)
-            self.assertEqual(written, size)
-            for _, req_lim, _ in reqs:
+    def test_all_requests_satisfy_telegram_rules(self):
+        # Telegram getFile: offset%4096==0, limit%4096==0, 1048576%limit==0, same 1MB fragment
+        for start, size, total in [(0, 1, 1), (0, 2138, 2138), (0, 1048576, 1048576),
+                                   (0, 1048576 * 3 + 7, 1048576 * 3 + 7),
+                                   (547356672, 135792708, 683149380),
+                                   (0, 683149380, 683149380),
+                                   (131072, 7 * 1048576 + 123, 9 * 1048576 + 123)]:
+            reqs = list(range_requests(start, start + size, total, CHUNK))
+            got = set()
+            for off, req_lim, want in reqs:
+                self.assertEqual(off % 4096, 0, f"offset not aligned: {hex(off)}")
                 self.assertEqual(req_lim % 4096, 0)
+                self.assertEqual(1048576 % req_lim, 0, f"limit {req_lim} not a 1MB divisor")
+                self.assertEqual(off // 1048576, (off + req_lim - 1) // 1048576,
+                                 f"crosses 1MB fragment: {hex(off)}+{req_lim}")
+                self.assertLessEqual(want, req_lim)
+                got.add((off, off + want))
+            self.assertEqual(sum(w for *_, w in reqs), size)
+            # no overlaps, no gaps, exact cover of [start, start+size)
+            pos = start
+            for off, end in sorted(got):
+                self.assertEqual(off, pos)
+                pos = end
+            self.assertEqual(pos, start + size)
 
-    def test_eof_tail_aligned_up_clamped(self):
+    def test_eof_tail_decomposes_correctly(self):
         start, sln, total = 547356672, 135792708, 683149380
         reqs = list(range_requests(start, start + sln, total, CHUNK))
-        off, req_lim, want = reqs[-1]
-        self.assertEqual((want, off + want), (526404, start + sln))
-        self.assertEqual(req_lim % 4096, 0)
-        self.assertGreaterEqual(req_lim, want)
         self.assertEqual(sum(w for *_, w in reqs), sln)
+        self.assertEqual(reqs[-1], (683147264, 4096, 2116))
+        self.assertEqual(reqs[-2], (682622976, 524288, 524288))
 
     def test_interior_chunks_exact(self):
         reqs = list(range_requests(0, 3 * CHUNK, 100 * CHUNK, CHUNK))
