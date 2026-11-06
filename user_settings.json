@@ -1,7 +1,7 @@
 {
   "5132917762": {
     "c_aq": true,
-    "c_auto": "auto",
+    "c_auto": "ask",
     "c_bframes": true,
     "c_crf": 24,
     "c_dist": "on",
