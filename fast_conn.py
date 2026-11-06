@@ -73,10 +73,15 @@ class SenderPool:
             return await self.client(req)
         return await s.send(req)
 
-    async def close(self):
+    async def close(self, timeout: float = 8.0):
+        """
+        Connections close කරනවා — **timeout එකක් එක්ක**.
+        (stuck connection එකක disconnect() එකක් hang වුණොත් download එක ඉවර වුණත්
+         function එක return වෙන්නේ නෑ → progress 100% ගිහිල්ලා හිර වෙනවා වගේ පේනවා.)
+        """
         for s in self._extras:
             try:
-                await s.disconnect()
+                await asyncio.wait_for(s.disconnect(), timeout=timeout)
             except Exception:
                 pass
         self._extras.clear()

@@ -248,8 +248,10 @@ class FastDownloader:
             gtask.cancel()
             with contextlib.suppress(BaseException):
                 await gtask
-            os.close(fd)
-            await pool.close()
+            with contextlib.suppress(Exception):
+                os.close(fd)
+            # close එක hang වුණොත් download එක ඉවර වුණත් return වෙන්නේ නෑ → background
+            _close_later(pool)
 
 
     # ═════════ Multi-userbot download: chunks lanes අතර බෙදනවා ═════════
@@ -539,9 +541,16 @@ class FastDownloader:
             bal_task.cancel()
             for t in tasks:
                 t.cancel()
-            await asyncio.gather(done_task, bal_task, *tasks, return_exceptions=True)
-            os.close(fd)
-            await asyncio.gather(*[ln.pool.close() for ln in lanes if ln.pool], return_exceptions=True)
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(
+                    asyncio.gather(done_task, bal_task, *tasks, return_exceptions=True), timeout=20)
+            with contextlib.suppress(Exception):
+                os.close(fd)
+            # ⚠️ stuck connection එකක close() එකක් hang වුණොත් download එක ඉවර වුණත්
+            #    function එක return වෙන්නේ නෑ (panel එක 100% ගිහිල්ලා හිර වෙනවා වගේ පේනවා)
+            #    → දැන් පස්සේ (background) close වෙනවා, return එක ක්ෂණිකයි.
+            for ln in lanes:
+                _close_later(ln.pool)
 
     async def _download_native(self, client, message, save_path, download_id, progress_callback, max_retries=10):
         last_update = [0.0]
@@ -586,6 +595,25 @@ class FastDownloader:
                 await asyncio.sleep(2 ** attempt)
 
         raise RuntimeError(f"Native Download failed after {max_retries} attempts")
+
+
+_close_bg: set = set()
+
+
+def _close_later(pool, timeout: float = 15.0):
+    """Connection pool එකක් පස්සේ close කරනවා — download එක ඉවර වුණාම caller එක block නොකර."""
+    if pool is None:
+        return
+
+    async def _run():
+        try:
+            await asyncio.wait_for(pool.close(), timeout=timeout)
+        except BaseException:
+            pass
+
+    t = asyncio.create_task(_run())
+    _close_bg.add(t)
+    t.add_done_callback(_close_bg.discard)
 
 
 _downloader: Optional[FastDownloader] = None

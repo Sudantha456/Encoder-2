@@ -63,6 +63,9 @@ DL_CONNECTIONS = int(os.getenv("DL_CONNECTIONS", "8"))
 DL_WORKERS_PER_CONN = int(os.getenv("DL_WORKERS_PER_CONN", "4"))
 UL_CONNECTIONS = int(os.getenv("UL_CONNECTIONS", "8"))
 UL_WORKERS_PER_CONN = int(os.getenv("UL_WORKERS_PER_CONN", "4"))
+# 🚑 Last-resort watchdog: download phase එකේ bytes එකක්වත් නැතුව මෙච්චර වෙලාවක් ගියොත්
+# job එක hang වෙන්නේ නැතුව නවත්තලා හේතුව පෙන්නනවා.
+DL_WATCHDOG = float(os.getenv("DL_WATCHDOG", "300"))
 
 # ── 🌐 Distributed encoding (GitHub Actions workers) ──
 # Workers ගාන දැන් settings (/settings → 👷 Workers) වලින් — 2…16. මේ default එක විතරයි.

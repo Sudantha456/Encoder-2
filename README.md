@@ -68,6 +68,8 @@ Worker එකට `ghassets.py` copy වෙන්නේ bot start වෙද්ද
 * තත්පර 6ක් data නැත්නම් `Speed: 0 B/s` + `⚠️ තත්පර N ක් දත්ත එන්නේ නෑ` පෙන්නනවා (පරණ වේගය පෙන්වන්නේ නෑ).
 * `DL_STALL_WARN` (45s): FloodWait parks clear කරලා stuck chunks ආයෙ requeue.
 * `DL_STALL_FAIL` (150s): download abort → userbot path නම් **bot download එකට auto fallback**, bot path නම් native download.
+* `DL_WATCHDOG` (300s): job-level last-resort net — තාමත් හිර වුණොත් "Download stalled" කියලා නවත්තනවා (හැමවෙලේම timer දුවනවා වගේ ඉතුරු වෙන්නේ නෑ).
+* connection pool `close()` hang වුණොත් download එක ඉවර වුණත් return වෙන එක නවත්තනවා → දැන් background එකේ close වෙනවා (instant return).
 * අඩක් ආපු (truncated) chunk එකක් accept කරන්නේ නෑ → 0-byte "holes" නෑ.
 
 ### 5. Download speed
@@ -81,6 +83,7 @@ Worker එකට `ghassets.py` copy වෙන්නේ bot start වෙද්ද
 GH_UPLOAD_CHUNK_MB=24      GH_UPLOAD_PARALLEL=3     GH_UPLOAD_TIMEOUT=300
 PROGRESS_UPDATE_INTERVAL=2 PROGRESS_TICK=0.5         PROGRESS_MIN_EDIT_GAP=1.2
 UB_DL_CONNECTIONS=8        UB_UL_CONNECTIONS=8       PROBE_CONNECTIONS=10
-DL_STALL_WARN=45           DL_STALL_FAIL=150         DL_WORKERS_PER_CONN=4
+DL_STALL_WARN=45           DL_STALL_FAIL=150         DL_WATCHDOG=300
+DL_WORKERS_PER_CONN=4
 DIST_LOCAL_RESCUE=1        DIST_RESCUE_AFTER=180     PROBE_CACHE=1
 ```

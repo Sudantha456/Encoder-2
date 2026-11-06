@@ -284,10 +284,12 @@ async def _probe_fetch(client, message, path: str, size: int) -> None:
 
         await asyncio.gather(native(head), native(tail))
     finally:
-        os.close(fd)
+        with contextlib.suppress(Exception):
+            os.close(fd)
         if pool is not None:
-            with contextlib.suppress(Exception):
-                await pool.close()
+            # close එක hang වුණොත් preview එක කවදාවත් එන්නේ නෑ → timeout
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(pool.close(), timeout=10)
 
 
 async def probe_remote(client, message, meta: VideoMeta, workdir: str,

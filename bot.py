@@ -67,6 +67,7 @@ class Job:
     height: int = 0
     queued: bool = False
     live: object = None
+    dl_stalled: bool = False
 
 
 jobs = {}
@@ -712,6 +713,7 @@ async def run_job(job: Job, height: int):
     t_start = time.monotonic()
     stats = {}
     xfer: Optional[asyncio.Task] = None
+    wd: Optional[asyncio.Task] = None
     dl, ul = get_downloader(), get_uploader()
     ch_ids, ch_out = [], [None, None]       # channel messages (cleanup): bot ගේ ids, [userbot msg, userbot]
 
@@ -740,6 +742,23 @@ async def run_job(job: Job, height: int):
                 await asyncio.sleep(PROGRESS_TICK)
 
         xfer = asyncio.create_task(transfer_ticker())
+
+        # 🚑 last-resort watchdog: download එකේ bytes එකක්වත් නැතුව හිර වුණොත් නවත්තනවා
+        async def dl_watchdog():
+            last, t0 = -1, time.monotonic()
+            while phase[0] == "dl":
+                await asyncio.sleep(5)
+                if phase[0] != "dl":
+                    return
+                if tr.current != last:
+                    last, t0 = tr.current, time.monotonic()
+                elif time.monotonic() - t0 > config.DL_WATCHDOG:
+                    logger.warning(f"download watchdog: no progress {config.DL_WATCHDOG:.0f}s")
+                    job.dl_stalled = True
+                    dl.cancel(job.id)
+                    return
+
+        wd = asyncio.create_task(dl_watchdog())
 
         async def dl_cb(cur, tot):
             if phase[0] != "dl":
@@ -936,17 +955,25 @@ async def run_job(job: Job, height: int):
     except asyncio.CancelledError:
         phase[0] = "stop"
         live.buttons = None
-        await live.set("❌ <b>Cancelled</b>", force=True)
+        if job.dl_stalled:
+            await live.set("⚠️ <b>Download stalled</b>\n"
+                           f"තත්පර {config.DL_WATCHDOG:.0f} ක් තිස්සේ data ආවේ නෑ — නවත්තලා දැම්මා. "
+                           "ආයෙ එවන්න.", force=True)
+        else:
+            await live.set("❌ <b>Cancelled</b>", force=True)
     except Exception as e:
         phase[0] = "stop"
         logger.exception("job failed")
         live.buttons = None
         await live.set(f"⚠️ <b>Failed</b>\n<code>{esc(str(e)[-900:])}</code>", force=True)
     finally:
-        if xfer and not xfer.done():
-            xfer.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await xfer
+        for task in (xfer, wd):
+            if task and not task.done():
+                task.cancel()
+        for task in (xfer, wd):
+            if task:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
         # අන්තිම progress එක (✅ Done / ❌ Cancel) edit වෙනකම් ඉන්නවා → message එක හිර වෙන්නේ නෑ
         with contextlib.suppress(Exception):
             await live.flush(timeout=10)
