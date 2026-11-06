@@ -78,6 +78,17 @@ STANDBY_BASE = 100                                                 # standby wor
 DIST_STALE_SECONDS = int(os.getenv("DIST_STALE_SECONDS", "180"))   # runner progress නතර වුණොත් part එක held queue එකට
 DIST_PROGRESS_CHAT = os.getenv("DIST_PROGRESS_CHAT", "")           # හිස් = user ගේ chat එකම (messages පස්සේ delete වෙනවා)
 
+# ── 🌐 Distributed DOWNLOAD (main runner + helper runners, byte-exact range split) ──
+# File එක main runner එක analyze කරලා — bytes range හරියටම account/runner 5ට බෙදනවා (ගැප්/අතිපිහිටුමක් නෑ).
+# Helper runner එකක් final කළාම ඒ slice එක own repo release `enc-dl-<job>` එකට upload →
+# helper assembler එකක් (හෝ main fallback) reassemble (cat) + verify → keyframe parts → encode workers.
+DIST_DOWNLOAD = os.getenv("DIST_DOWNLOAD", "1") == "1"
+DIST_DL_MIN_BYTES = int(os.getenv("DIST_DL_MIN_BYTES", str(50 * 1024 * 1024)))   # මීට කුඩා නම් සාමාන්‍ය download
+DIST_DL_CONNECTIONS = int(os.getenv("DIST_DL_CONNECTIONS", "12"))   # එක helper runner එකකට connections
+DIST_DL_TIMEOUT = int(os.getenv("DIST_DL_TIMEOUT", "2700"))    # download phase උපරිම කාලය (s)
+DIST_DL_STALE = int(os.getenv("DIST_DL_STALE", "180"))         # lane එකක් progress නතර කළොත් dead
+DIST_ASM_TIMEOUT = int(os.getenv("DIST_ASM_TIMEOUT", "1500"))  # helper assembler බලාගෙන ඉන්න උපරිම (s)
+
 # ── 📋 Queue ──
 QUEUE_MAX = int(os.getenv("QUEUE_MAX", "20"))      # එකවර queue එකේ තියෙන්න පුළුවන් උපරිම videos
 QUEUE_RES_CHOICES = ["ask", "smart"] + [str(r) for r in RESOLUTIONS]   # auto-queue: "ask" = බොත්තම්, "smart" = source එකට අඩුවෙන් තියෙන හොඳම resolution එක
@@ -110,6 +121,20 @@ def _collect_user_strings() -> list:
 
 
 USER_STRINGS = _collect_user_strings()
+
+
+def main_user_strings() -> list:
+    """Main runner එකේ relay පාවිච්චි කරන sessions (0-based ගණිතයෙන්).
+
+    Distributed download on + helper tokens තිබේ නම්: 5 user accounts එක බැගින් බෙදෙන්න ඕනේ
+    (0 → main runner, 1..4 → helpers). එකම session එක රනිං යන්ත දෙකක පාවිච්චි කළොත් Telethon
+    "session already running" වලින් disconnect වෙනවා — ඒ නිසා main runner එකට 0 (+ index >4
+    අතිරේක ඒවා) ලැබෙනවා, helper #N එකට sessions[N] ලැබෙනවා.
+    """
+    if DIST_DOWNLOAD and HELPER_TOKENS and len(USER_STRINGS) > 1:
+        return USER_STRINGS[:1] + USER_STRINGS[5:]
+    return list(USER_STRINGS)
+
 
 # Private channel: "-1001234567890" (හොඳම)  |  "@username"  |  "https://t.me/+AbCdEf…" invite link
 CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()

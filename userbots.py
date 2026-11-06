@@ -69,6 +69,7 @@ class Relay:
         self.bot_peer = None               # main bot ගේ InputPeerChannel
         self.enabled = False
         self.problems: List[str] = []      # user ට පෙන්වන්න setup errors
+        self.channel_num: int = 0          # private channel ගේ numeric id (helper dl lanes resolve කරන්න)
 
     # ───────────────────────── setup ─────────────────────────
     @property
@@ -116,7 +117,11 @@ class Relay:
             logger.error(e)
             return False
 
-        self.userbots = [UserBot(i + 1, s) for i, s in enumerate(config.USER_STRINGS)]
+        main_sessions = config.main_user_strings()   # distributed dl දී: sessions බෙදලා — main එකට 0 වැඩේ
+        if len(main_sessions) != len(config.USER_STRINGS):
+            logger.info(f"👤 userbot relay: main runner එකට session(s) {len(main_sessions)}/{len(config.USER_STRINGS)} "
+                        "(ඉතිරි ඒවා helper dl lanes)")
+        self.userbots = [UserBot(i + 1, s) for i, s in enumerate(main_sessions)]
         for i, ub in enumerate(self.userbots):                       # invite-join / dialogs load එකවර flood නොවෙන්න stagger
             await self._start_userbot(ub, ref)
         good = self.ready
@@ -130,6 +135,7 @@ class Relay:
             return False
 
         first = good[0]
+        self.channel_num = int(getattr(first.entity, "id", 0) or 0)
 
         async def pinger():
             m = await first.client.send_message(first.entity, "🔧 encoder setup ping")
@@ -241,20 +247,28 @@ class Relay:
             await asyncio.sleep(1)
         return None
 
-    async def download(self, dl, ch_msg_id: int, save_path: str, job_id: str, progress_cb) -> str:
-        """සියලුම ready userbots (cooldown නැති) එකවර — chunks ඒ අතර බෙදෙනවා."""
+    async def download(self, dl, ch_msg_id: int, save_path: str, job_id: str, progress_cb,
+                       offset: int = 0, length: Optional[int] = None) -> str:
+        """සියලුම ready userbots (cooldown නැති) එකවර — chunks ඒ අතර බෙදෙනවා.
+        offset/length: [offset, offset+length) byte range විතරක් (distributed download slice)."""
         order = [u for u in self._order() if not u.cooling] or self._order()
         got = await asyncio.gather(*[self._lane_for(u, ch_msg_id, config.UB_DL_CONNECTIONS) for u in order])
         pairs = [g for g in got if g]
         if not pairs:
             raise RuntimeError("Userbot කිසිවෙකුට channel එකේ file එක පේන්නේ නෑ")
         total = pairs[0][1]
+        if length is not None and (offset < 0 or length <= 0 or offset + length > total):
+            raise RuntimeError(f"Invalid byte range [{offset}, {offset + length}) vs {total}")
+        full = length is None
+        eff = total if full else length
         lanes = [p[0] for p in pairs]
-        if total < 8 * 1024 * 1024:               # පොඩි file → userbot එකක් ඇති
+        if eff < 8 * 1024 * 1024:                 # පොඩි range → userbot එකක් ඇති
             lanes = lanes[:1]
-        logger.info(f"📥 relay download: {total / 1048576:.1f}MB via {', '.join(l.name for l in lanes)}")
-        return await dl.download_lanes(lanes, total, save_path, job_id, progress_cb,
-                                       max_flood_wait=config.UB_MAX_FLOOD_WAIT)
+        what = f"{eff / 1048576:.1f}MB" + ("" if full else f" (range @{offset})")
+        logger.info(f"📥 relay download: {what} via {', '.join(l.name for l in lanes)}")
+        return await dl.download_lanes(lanes, eff, save_path, job_id, progress_cb,
+                                       max_flood_wait=config.UB_MAX_FLOOD_WAIT,
+                                       offset=offset, length=length)
 
     async def upload(self, up, path: str, job_id: str, progress_cb):
         """(userbot, channel message). Flood වුණොත් ඊළඟ userbot එකෙන්."""

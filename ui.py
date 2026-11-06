@@ -128,6 +128,9 @@ def _render_merge(st) -> str:
     if getattr(st, "merge_step", "") == "audio":
         lines.append(f"🔊 Audio track එක ready වෙනකම් බලාගෙන… <code>{human_time(st.merge_elapsed)}</code>")
         return "\n".join(lines)
+    if getattr(st, "merge_step", "") == "upload-main":
+        lines.append(f"📦 Encoded කොටස් main account එකේ release එකට push කරනවා… <code>{human_time(st.merge_elapsed)}</code>")
+        return "\n".join(lines)
     pct = st.merge_pct
     sp = st.merge_speed
     left = (st.duration - st.merge_out) / sp if sp > 0 else 0.0
@@ -137,6 +140,30 @@ def _render_merge(st) -> str:
         f"🚀 Speed: <code>{sp:.1f}x</code>   📦 <code>{human_size(st.merge_size)}</code>",
         f"⏳ ETA: <code>{human_time(left)}</code>   ⏱ Merge: <code>{human_time(st.merge_elapsed)}</code>",
     ]
+    return "\n".join(lines)
+
+
+def render_dl(st, name: str) -> str:
+    """Distributed download UI — හැම account/runner එකේම speed + progress, එකතුව (TOTAL speed) සමඟ."""
+    head = (f"🌐 <b>Distributed Download</b>\n<code>{esc(short_name(name))}</code>\n"
+            f"⚙️ <code>{st.n_accounts} accounts • byte-exact, gap-free ranges</code>\n\n"
+            f"<code>[{bar(st.percent)}] {st.percent:5.1f}%</code>\n"
+            f"📦 <code>{human_size(st.downloaded)} / {human_size(st.total_size)}</code>\n"
+            f"⚡ <b>TOTAL Speed: <code>{human_speed(st.speed)}</code></b>  "
+            f"<i>(5 accounts එකතුව)</i>\n"
+            f"⏳ ETA: <code>{human_time(st.eta)}</code>   ⏱ Elapsed: <code>{human_time(st.elapsed)}</code>\n\n"
+            f"<b>Slices</b>")
+    lines = [head]
+    for ln in st.lanes:
+        icon = "🏠" if ln.acct == 0 else "🤝"
+        if ln.state == "done":
+            rows = f"<code>{_mini(100, 10)}</code> done"
+        elif ln.state == "failed":
+            rows = f"<code>{_mini(ln.pct, 10)}</code> ⚠️ failed"
+        else:
+            rows = f"<code>{_mini(ln.pct, 10)}</code> {ln.pct:5.1f}% • {human_speed(ln.speed)}"
+        lines.append(f"{icon} {esc(ln.label)}: {rows}")
+    lines.append(f"\n<i>Main runner එක analyze කරලා bytes range හරියටම බෙදලා — එක byte එකක්වත් miss වෙන්නේ නෑ.</i>")
     return "\n".join(lines)
 
 

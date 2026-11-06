@@ -64,7 +64,8 @@ def gh(*args, check=True):
 
 async def run_part(cfg: dict, idx: int, workdir: str = "."):
     """එක කොටසක් encode + upload. Fail වුණොත් 'failed' report කරලා exception raise."""
-    tag = f"enc-{cfg['job']}"
+    tag = cfg.get("raw_tag") or f"enc-{cfg['job']}"   # remote(assembler) mode: raw parts asm repo එකේ
+    raw_repo = cfg.get("raw_repo")                     # None = own repo (සාමාන්‍ය), else cross-account public repo
     raw = os.path.join(workdir, f"raw_part_{idx}.mp4")
     dst = os.path.join(workdir, f"encoded_part_{idx}.mkv")
     st = EncState(duration=cfg["durations"][idx], src_fps=cfg["fps"])
@@ -91,8 +92,11 @@ async def run_part(cfg: dict, idx: int, workdir: str = "."):
     try:
         await rep.send("running", st)
         if not os.path.exists(raw):
-            await asyncio.to_thread(gh, "release", "download", tag, "-p", f"raw_part_{idx}.mp4",
-                                    "-D", workdir, "--clobber")
+            args = ["release", "download", tag, "-p", f"raw_part_{idx}.mp4",
+                    "-D", workdir, "--clobber"]
+            if raw_repo:
+                args += ["-R", raw_repo]
+            await asyncio.to_thread(gh, *args)
         if not os.path.exists(raw):
             raise RuntimeError("raw part not found")
         bg = [asyncio.create_task(ticker()), asyncio.create_task(watchdog())]
@@ -102,7 +106,14 @@ async def run_part(cfg: dict, idx: int, workdir: str = "."):
         for t in bg:
             t.cancel()
         await rep.send("uploading", st)
-        await asyncio.to_thread(gh, "release", "upload", tag, dst, "--clobber")
+        # encoded part → own repo release enc-<job> (GH_REPO) — main runner fetches from here
+        enc_tag = f"enc-{cfg['job']}"
+        r = await asyncio.to_thread(gh, "release", "view", enc_tag, "--json", "id", check=False)
+        if r.returncode != 0:
+            await asyncio.to_thread(gh, "release", "create", enc_tag, "--prerelease",
+                                    "--title", f"Encoder job {enc_tag}", "--notes", "encoder parts",
+                                    check=False)
+        await asyncio.to_thread(gh, "release", "upload", enc_tag, dst, "--clobber")
         st.finished = True
         await rep.send("done", st)
     except BaseException as e:

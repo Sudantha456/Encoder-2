@@ -30,6 +30,7 @@ from typing import List, Optional
 import config
 from config import PROGRESS_UPDATE_INTERVAL
 from pathlib import Path as _P
+from dlparts import byte_ranges, verify_ranges
 
 logger = logging.getLogger("Dist")
 
@@ -47,6 +48,7 @@ def available() -> bool:
 
 # ───────────── 🤝 Helper GitHub accounts ─────────────
 HELPERS: List[tuple] = []          # (token, "owner/repo") — bootstrap සාර්ථක වූ ඒවා
+HELPER_DL: List[bool] = []         # ඒ HELPERS ටිකේ DL_SESSION secret auto-දාලද (parallel)
 HELPER_PROBLEMS: List[str] = []
 PER_ACCT = config.WORKERS_PER_ACCOUNT
 
@@ -67,15 +69,15 @@ async def _helper_gh(token: str, repo: str, *args, check=True) -> str:
     return out.decode(errors="ignore")
 
 
-async def _bootstrap_helper(token: str) -> tuple:
+async def _bootstrap_helper(token: str, helper_no: int) -> tuple:
     st = ["login"]
     try:
-        return await _bootstrap_inner(token, st)
+        return await _bootstrap_inner(token, st, helper_no)
     except Exception as e:                       # කුමන පියවරේද fail වුණේ කියලා පෙන්නනවා
         raise DistError(f"පියවර '{st[0]}' fail: {e}") from e
 
 
-async def _bootstrap_inner(token: str, st: list) -> tuple:
+async def _bootstrap_inner(token: str, st: list, helper_no: int = 0) -> tuple:
     """Helper account එකේ public repo එක හදලා worker files + BOT_TOKEN secret එක දානවා (idempotent)."""
     login = (await _helper_gh(token, "", "api", "user", "-q", ".login")).strip()
     repo = f"{login}/{config.HELPER_REPO}"
@@ -95,7 +97,11 @@ async def _bootstrap_inner(token: str, st: list) -> tuple:
         logger.info(f"🤝 repo exists: {repo} — නැවත හදන්නේ නෑ")
     root = _P(__file__).resolve().parent
     files = {"worker.py": root / "worker.py", "transcoder.py": root / "transcoder.py",
-             ".github/workflows/encode-worker.yml": root / ".github/workflows/encode-worker.yml"}
+             ".github/workflows/encode-worker.yml": root / ".github/workflows/encode-worker.yml",
+             "dl_worker.py": root / "dl_worker.py", "asm_worker.py": root / "asm_worker.py",
+             "fast_conn.py": root / "fast_conn.py",
+             ".github/workflows/dl-worker.yml": root / ".github/workflows/dl-worker.yml",
+             ".github/workflows/asm-worker.yml": root / ".github/workflows/asm-worker.yml"}
     for path, src in files.items():
         st[0] = f"push {path} (token එකට 'workflow' scope ඕනේ)"
         raw = src.read_bytes()
@@ -118,21 +124,46 @@ async def _bootstrap_inner(token: str, st: list) -> tuple:
         await _helper_gh(token, repo, "secret", "set", "BOT_TOKEN", "--repo", repo, "--body", config.BOT_TOKEN)
     except Exception as e:                       # fatal නෑ: workers වැඩ කරනවා, progress edits විතරක් නැති වෙනවා
         HELPER_PROBLEMS.append(f"{repo}: BOT_TOKEN secret set වුණේ නෑ ({e}) — progress පෙන්වන්නේ නෑ")
-    return token, repo
+    # ── Distributed download secrets: API_ID / API_HASH (userbot ට ඕනේ) + DL_SESSION (මේ account එකේ userbot) ──
+    dl_ok = False
+    if config.API_ID and config.API_HASH:
+        for k, v in (("API_ID", str(config.API_ID)), ("API_HASH", config.API_HASH)):
+            try:
+                await _helper_gh(token, repo, "secret", "set", k, "--repo", repo, "--body", v)
+            except Exception as e:
+                HELPER_PROBLEMS.append(f"{repo}: {k} secret set වුණේ නෑ ({e}) — dl lane off")
+    session = config.USER_STRINGS[helper_no] if 0 < helper_no < len(config.USER_STRINGS) else ""
+    if session:
+        st[0] = "secret DL_SESSION"
+        try:
+            await _helper_gh(token, repo, "secret", "set", "DL_SESSION", "--repo", repo, "--body", session)
+            dl_ok = True
+        except Exception as e:                   # dl lane off, encode workers නම් සාමාන්‍ය විදිහට වැඩ කරනවා
+            HELPER_PROBLEMS.append(f"{repo}: DL_SESSION secret set වුණේ නෑ ({e}) — download lane off")
+    return token, repo, dl_ok
+
+
+def dl_sessions_ready() -> int:
+    """DL_SESSION secret දාපු helper accounts ගාන (distributed download lanes)."""
+    return sum(1 for x in HELPER_DL if x)
 
 
 async def setup_helpers():
     HELPERS.clear()
+    HELPER_DL.clear()
     HELPER_PROBLEMS.clear()
-    res = await asyncio.gather(*[_bootstrap_helper(t) for t in config.HELPER_TOKENS], return_exceptions=True)
+    res = await asyncio.gather(*[_bootstrap_helper(t, i) for i, t in enumerate(config.HELPER_TOKENS, 1)],
+                               return_exceptions=True)
     for i, r in enumerate(res, 1):
         if isinstance(r, BaseException):
             t = config.HELPER_TOKENS[i - 1]
             HELPER_PROBLEMS.append(f"Token #{i} (…{t[-4:]}): {r}")
             logger.error(HELPER_PROBLEMS[-1])
         else:
-            HELPERS.append(r)
-            logger.info(f"🤝 token #{i} ready: {r[1]}")
+            token, repo, dl_ok = r
+            HELPERS.append((token, repo))          # HELPERS/HELPER_DL aligned (සාර්ථක ඒවා විතරයි)
+            HELPER_DL.append(dl_ok)
+            logger.info(f"🤝 token #{i} ready: {repo}" + (" • dl lane ✅" if dl_ok else " • dl lane off"))
 
 
 # ───────────── single-runner encode time estimate (auto mode) ─────────────
@@ -377,6 +408,24 @@ class GhBackend:
     async def assets(self, tag) -> dict:
         data = json.loads(await self._gh("release", "view", tag, "--json", "assets") or "{}")
         return {a["name"]: a.get("state", "uploaded") for a in data.get("assets", [])}
+
+    async def assets_sized(self, tag) -> dict:
+        """name → {state, size} — byte-exact verification (download slices / yields)."""
+        raw = await self._gh("release", "view", tag, "--json", "assets", check=False)
+        try:
+            data = json.loads(raw or "{}")
+        except Exception:
+            return {}
+        return {a["name"]: {"state": a.get("state", "uploaded"), "size": int(a.get("size", -1))}
+                for a in data.get("assets", [])}
+
+    async def dispatch_workflow(self, workflow: str, inputs: dict, ref: Optional[str] = None):
+        args = ["workflow", "run", workflow]
+        if ref:
+            args += ["--ref", ref]
+        for k, v in inputs.items():
+            args += ["-f", f"{k}={v}"]
+        await self._gh(*args)
 
     async def dispatch_workers(self, session: str, indices):
         await self._gh("workflow", "run", config.DIST_WORKFLOW, "--ref", self.ref,
@@ -750,6 +799,470 @@ class TgBoard:
                 )
 
 
+# ───────────────────────── Distributed download (byte-exact ranges) ─────────────────────────
+PROGD_RE = re.compile(r"PROGD\|([^|]*)\|(\d+)\|(\w+)\|(\d+)\|(\d+)\|([\d.]+)")
+MAX_ASSET_BYTES = 1900 * 1024 * 1024          # GitHub release asset ≈ 2GB — slice මීට වැඩි නම් distributed dl off
+
+
+def parse_prog_dl(text: str, job_id: str, idx: int):
+    m = PROGD_RE.search(text or "")
+    if not m or m.group(1) != job_id or int(m.group(2)) != idx:
+        return None
+    return dict(state=m.group(3), done=int(m.group(4)), total=int(m.group(5)), speed=float(m.group(6)))
+
+
+class DlLane:
+    """එක account එකේ එක byte-range slice එකක්."""
+
+    def __init__(self, acct: int, slice_idx: int, label: str, total: int):
+        self.acct, self.slice_idx, self.label, self.total = acct, slice_idx, label, total
+        self.done, self.speed, self.state = 0, 0.0, "waiting"
+        self._samples = [(time.monotonic(), 0)]
+
+    @property
+    def pct(self) -> float:
+        return min(self.done / self.total * 100, 100.0) if self.total else 0.0
+
+    def update(self, done: int, state: Optional[str] = None):
+        done = max(0, min(int(done), self.total)) if self.total else max(0, int(done))
+        now = time.monotonic()
+        if done != self.done:
+            self.done = done
+            self._samples.append((now, done))
+            self._samples = [s for s in self._samples if now - s[0] <= 10.0][-30:]
+        if state:
+            self.state = state
+        self.speed = self.current_speed()
+
+    def current_speed(self) -> float:
+        now = time.monotonic()
+        s = [x for x in self._samples if now - x[0] <= 10.0]
+        if len(s) >= 2:
+            (t0, c0), (t1, c1) = s[0], s[-1]
+            if t1 > t0:
+                return max(0.0, (c1 - c0) / (t1 - t0))
+        return 0.0
+
+    def mark(self, state: str):
+        self.state = state
+        if state == "done":
+            self.done = self.total
+        self.speed = 0.0
+
+
+class DlState:
+    def __init__(self, total_size: int, lanes: List[DlLane]):
+        self.total_size, self.lanes = total_size, lanes
+        self.t0 = time.monotonic()
+
+    @property
+    def n_accounts(self) -> int:
+        return len(self.lanes)
+
+    @property
+    def downloaded(self) -> int:
+        return sum(l.done for l in self.lanes)
+
+    @property
+    def speed(self) -> float:
+        return sum(l.speed for l in self.lanes if l.state == "running")
+
+    @property
+    def percent(self) -> float:
+        return min(self.downloaded / self.total_size * 100, 100.0) if self.total_size else 0.0
+
+    @property
+    def elapsed(self) -> float:
+        return time.monotonic() - self.t0
+
+    @property
+    def eta(self) -> float:
+        sp = self.speed
+        return (self.total_size - self.downloaded) / sp if sp > 0 else 0.0
+
+
+class DlBoard:
+    """Helper lanes ගේ Telegram progress messages (main bot හදනවා, helper bot token එකෙන් edit කරනවා)."""
+
+    def __init__(self, client, chat_id: int, job_id: str, helper_lanes: List[DlLane]):
+        self.client, self.chat_id, self.job_id = client, chat_id, job_id
+        self.lanes = list(helper_lanes)
+        self.ids: List[tuple] = []           # (DlLane, message_id)
+
+    async def create(self):
+        for ln in self.lanes:
+            try:
+                m = await self.client.send_message(
+                    self.chat_id,
+                    f"🧩 Slice {ln.slice_idx + 1} • waiting\n"
+                    f"PROGD|{self.job_id}|{ln.slice_idx}|waiting|0|{ln.total}|0.0",
+                    parse_mode=None, silent=True)
+                self.ids.append((ln, m.id))
+            except Exception as e:
+                logger.warning(f"dl board message failed (slice {ln.slice_idx}): {e}")
+
+    async def read(self) -> List[tuple]:
+        if not self.ids:
+            return []
+        try:
+            msgs = await self.client.get_messages(self.chat_id, ids=[i for _, i in self.ids])
+        except Exception:
+            return []
+        return [(ln, (m.message if m else "")) for (ln, _), m in zip(self.ids, msgs)]
+
+    async def delete(self):
+        if not self.ids:
+            return
+        with contextlib.suppress(BaseException):
+            await self.client.delete_messages(self.chat_id, [i for _, i in self.ids])
+
+
+
+async def _ensure_release(gh: "GhBackend", tag: str):
+    raw = await gh._gh("release", "view", tag, "--json", "id", check=False)
+    if not (raw or "").strip():
+        await gh.release_create(tag)
+
+
+def _enc_tag(job_id: str) -> str:
+    return f"enc-{job_id}"
+
+
+def _dl_tag(job_id: str) -> str:
+    return f"enc-dl-{job_id}"
+
+
+async def _release_size_ok(gh: "GhBackend", tag: str, name: str, expected: int) -> bool:
+    assets = await gh.assets_sized(tag)
+    a = assets.get(name)
+    return bool(a and a.get("state") == "uploaded" and int(a.get("size", -1)) == expected)
+
+
+async def distributed_download(*, client, job, meta, live, workdir: Path, src_path: Path,
+                               dl_fn, want_distributed: bool, n_parts: int,
+                               audio_mode: str, abitrate: int,
+                               n_main_ubs: int = 0, channel_num: int = 0,
+                               ch_msg_id: Optional[int] = None) -> Optional[dict]:
+    """
+    Distributed download — file එක main runner එකේ analyze කරලා bytes range හරියටම 5 accounts ට බෙදනවා.
+    dl_fn(offset, length, path, progress_cb) — main lane download (relay/bot) — bytes range විතරයි ගන්නේ.
+
+    Returns:
+      None    → distributed unavailable/worthless → caller සාමාන්‍ය download එකට යනවා
+      dict    → {mode: "remote", ...}  (helper assembled; main එක file එක hold කරන්නේ නෑ)
+              | {mode: "local",  ...}  (main runner reassembled → src_path සම්පූර්ණ)
+    Raises asyncio.CancelledError (user cancel) / RuntimeError (totally dead → caller falls back).
+    Bytes accounting: ranges gap/overlap නැතුව [0, total) cover කරයි (dlparts.verify_ranges);
+    හැම slice එකකම exact size එකෙන් verify; reassemble අවසානයේදීත් total එක check — එක byte එකවත් miss වෙන්නේ නෑ.
+    """
+    from ui import render_dl
+
+    total = int(meta.size or 0)
+    if not config.DIST_DOWNLOAD or not available() or total <= 0:
+        return None
+    workdir = Path(workdir)
+
+    # ── 1) lanes: main + DL-capable helpers (connect/bootstrap fail වුණු helper → ඒක අතාරිනවා) ──
+    helpers = [(i + 1, t, r) for i, ((t, r), ok) in enumerate(zip(HELPERS, HELPER_DL)) if ok]
+    lane_accts = [0] + [h[0] for h in helpers]
+    while len(lane_accts) > 1:                      # 1MB blocks වලටත් අඩු file නම් අවසන් helper lanes drop
+        rs = byte_ranges(total, len(lane_accts), align=1024 * 1024)
+        if all(e > s for s, e in rs):
+            break
+        lane_accts.pop()
+    if len(lane_accts) < 2:
+        logger.info("🌐 distributed download: dl-capable helpers නෑ → normal download")
+        return None
+    ranges = byte_ranges(total, len(lane_accts), align=1024 * 1024)
+    if not verify_ranges(ranges, total):            # අපේම බෙදීම තහවුරු කරනවා
+        logger.error("🌐 byte range verify failed — distributed download disabled")
+        return None
+    if max(e - s for s, e in ranges) >= MAX_ASSET_BYTES:
+        logger.warning("🌐 slice ≥ ~1.9GB (GitHub asset limit) → distributed download disabled")
+        return None
+
+    hrepo = {ai: r for ai, t, r in helpers}
+    htok = {ai: t for ai, t, r in helpers}
+    gh_of = {0: GhBackend()}
+    gh_of.update({ai: GhBackend(t, r) for ai, t, r in helpers})
+    slice_of = {i: ranges[i] for i in range(len(ranges))}
+
+    # ── 2) lanes + labels ──
+    lanes: List[DlLane] = []
+    for i, ai in enumerate(lane_accts):
+        s, e = ranges[i]
+        label = f"Main • UB×{n_main_ubs}" if (ai == 0 and n_main_ubs) else ("Main" if ai == 0 else f"Helper #{ai}")
+        lanes.append(DlLane(ai, i, label, e - s))
+    lane_by_idx = {ln.slice_idx: ln for ln in lanes}
+    state = DlState(total, lanes)
+    main_lane = lanes[0]
+
+    dl_tag = _dl_tag(job.id)
+    enc_tag = _enc_tag(job.id)
+    main_path = workdir / "dl_slice_0"
+    dl_cleanup: List[tuple] = [(ln.acct, dl_tag) for ln in lanes if ln.acct != 0]
+    stats = {"dl_time": 0.0, "dl_avg": 0.0, "dl_via": [l.label for l in lanes],
+             "downloaded": total, "accounts": len(lanes)}
+
+    # ── 3) board + helper dispatch (helpers කලින්ම boot වෙන්න dispatch FIRST) ──
+    chat_id = int(config.DIST_PROGRESS_CHAT) if config.DIST_PROGRESS_CHAT else job.chat_id
+    board = DlBoard(client, chat_id, job.id, [ln for ln in lanes if ln.acct != 0])
+    await board.create()
+    msg_id_of = {ln.slice_idx: mid for ln, mid in board.ids}
+    for ai, t, r in helpers:                         # helper watchdog එක job-cancel detect කරන්නේ මේ empty release එක නැති වීමෙන්
+        with contextlib.suppress(Exception):
+            await _ensure_release(gh_of[ai], dl_tag)  # dl-worker upload gate — release එකලින්ම තියෙන්න ඕනේ
+    if channel_num:                                  # එක පාරක් විතරයි secret එක (helper එකෙන් එක)
+        for ai, t, r in helpers:
+            with contextlib.suppress(Exception):
+                await gh_of[ai]._gh("secret", "set", "CHANNEL_NUM", "--repo", r, "--body", str(channel_num))
+    try:
+        if ch_msg_id:
+            for i, ln in enumerate(lanes):
+                if ln.acct == 0:
+                    continue
+                s, e = ranges[i]
+                try:
+                    await gh_of[ln.acct].dispatch_workflow("dl-worker.yml", {
+                        "job": job.id, "slice": str(ln.slice_idx),
+                        "range_start": str(s), "range_end": str(e), "total_size": str(total),
+                        "ch_msg": str(ch_msg_id), "connections": str(config.DIST_DL_CONNECTIONS),
+                        "chat": str(chat_id), "msg_id": str(msg_id_of.get(ln.slice_idx, 0)),
+                    })
+                    logger.info(f"🌐 dl lane dispatched → acct {ln.acct} slice {ln.slice_idx} [{s},{e})")
+                except Exception as ex:
+                    logger.warning(f"🌐 dl dispatch failed acct {ln.acct} ({ex}) → main runner එක recover කරනවා")
+        else:
+            logger.warning("🌐 channel message id නෑ — helper dl lanes skip (main recovers)")
+
+        # ── 4) main slice download — helpers boot වෙද්දී ම parallel ──
+        async def _main_prog(cur, _tot):
+            main_lane.update(cur, "running")
+
+        main_task = asyncio.create_task(dl_fn(0, main_lane.total, str(main_path), _main_prog))
+        main_err = None
+
+        # ── 5) monitor: aggregate UI (per-lane + TOTAL speed) ──
+        render_every = max(1.0, PROGRESS_UPDATE_INTERVAL)
+        last_render = 0.0
+        stale = {ln.slice_idx: time.monotonic() for ln in lanes if ln.acct != 0}
+        deadline = time.monotonic() + config.DIST_DL_TIMEOUT
+        try:
+            while True:
+                if job.cancelled:
+                    raise asyncio.CancelledError()
+                now = time.monotonic()
+                if now > deadline:
+                    logger.warning("🌐 dl phase timeout — ඉතිරි lanes failed mark")
+                    for ln in lanes:
+                        if ln.acct != 0 and ln.state not in ("done", "failed"):
+                            ln.mark("failed")
+                    break
+                for ln, txt in await board.read():
+                    d = parse_prog_dl(txt, job.id, ln.slice_idx)
+                    if not d:
+                        continue
+                    prev = ln.done
+                    st = d["state"]
+                    ln.update(d["done"], st if st in ("running", "done", "failed") else None)
+                    if ln.done != prev:
+                        stale[ln.slice_idx] = now
+                for ln in lanes:
+                    if ln.acct == 0 or ln.state in ("done", "failed"):
+                        continue
+                    if now - stale[ln.slice_idx] > config.DIST_DL_STALE:
+                        logger.warning(f"🌐 slice {ln.slice_idx} stale → failed")
+                        ln.mark("failed")
+                if main_task.done():
+                    if main_task.exception() is not None:
+                        main_err = main_task.exception()
+                        logger.warning(f"🌐 main slice download failed: {main_err!r}")
+                    else:
+                        main_lane.mark("done")
+                if (all(ln.state in ("done", "failed") for ln in lanes if ln.acct != 0)
+                        and main_task.done()):
+                    break
+                if now - last_render >= render_every:
+                    last_render = now
+                    with contextlib.suppress(Exception):
+                        await live.set(render_dl(state, meta.name))
+                await asyncio.sleep(min(2.0, render_every))
+        except asyncio.CancelledError:
+            main_task.cancel()
+            with contextlib.suppress(BaseException):
+                await main_task
+            await board.delete()
+            raise
+        await asyncio.gather(main_task, return_exceptions=True)
+
+        # ── 6) settle: helper slices EXACT size verify; missing/mismatch → main Telegram එකෙන් re-fetch ──
+        for ln in lanes:
+            if ln.acct == 0:
+                continue
+            if ln.state == "done" and not await _release_size_ok(gh_of[ln.acct], dl_tag, f"dl_slice_{ln.slice_idx}", ln.total):
+                logger.warning(f"🌐 slice {ln.slice_idx} size mismatch/missing in release → re-fetch")
+                ln.mark("failed")
+            if ln.state != "done":
+                s, e = slice_of[ln.slice_idx]
+                rp = workdir / f"dl_slice_{ln.slice_idx}"
+                logger.warning(f"🌐 slice {ln.slice_idx}: main runner Telegram එකෙන් re-download [{s},{e})")
+                try:
+                    async def _noop_prog(*_):
+                        return None
+                    await dl_fn(s, ln.total, str(rp), _noop_prog)
+                    if rp.stat().st_size != ln.total:
+                        raise RuntimeError(f"recovered slice size {rp.stat().st_size} != {ln.total}")
+                    await _ensure_release(gh_of[ln.acct], dl_tag)
+                    await gh_of[ln.acct].upload(dl_tag, [rp])
+                    if not await _release_size_ok(gh_of[ln.acct], dl_tag, f"dl_slice_{ln.slice_idx}", ln.total):
+                        raise RuntimeError("recovered slice verify failed")
+                except Exception as ex:
+                    logger.error(f"🌐 slice {ln.slice_idx} unrecoverable: {ex!r}")
+                    await board.delete()
+                    raise RuntimeError(f"slice {ln.slice_idx} download failed (lane + recovery): {ex}") from ex
+
+        # main slice sanity
+        if main_err is not None or not main_path.exists() or main_path.stat().st_size != main_lane.total:
+            await board.delete()
+            raise RuntimeError(f"main slice download failed: {main_err!r}")
+
+        await live.set(render_dl(state, meta.name), force=True)
+        await board.delete()
+        stats["dl_time"] = state.elapsed
+        stats["dl_avg"] = total / state.elapsed if state.elapsed > 0 else 0.0
+
+        # ── 7a) want_distributed → helper assembler (main එක file එක hold කරන්නේ නෑ) ──
+        asm_acct = None
+        if want_distributed:
+            cand = [ln.acct for ln in lanes if ln.acct != 0 and ln.state == "done"] or \
+                   [ai for ai, _, _ in helpers]
+            for ai in cand:
+                with contextlib.suppress(Exception):
+                    await gh_of[ai]._gh("api", "user", "-q", ".login")
+                    asm_acct = ai
+                    break
+        if want_distributed and asm_acct is not None:
+            g_asm = gh_of[asm_acct]
+            asm_repo = hrepo[asm_acct]
+            await _ensure_release(g_asm, dl_tag)
+            try:
+                await g_asm.upload(dl_tag, [main_path])        # main slice → assembler repo (verify+retries)
+            except Exception as e:
+                logger.warning(f"main slice → assembler upload failed ({e}) → local reassemble")
+                asm_acct = None
+        if want_distributed and asm_acct is not None:
+            g_asm = gh_of[asm_acct]
+            asm_repo = hrepo[asm_acct]
+            srcs = dict(hrepo)
+            srcs[0] = asm_repo                                  # main slice asm repo එකේ
+            sources = [{"repo": srcs[ln.acct], "tag": dl_tag,
+                        "name": f"dl_slice_{ln.slice_idx}", "size": ln.total} for ln in lanes]
+            try:
+                await g_asm.dispatch_workflow("asm-worker.yml", {
+                    "job": job.id, "sources": json.dumps(sources, separators=(",", ":")),
+                    "total_size": str(total), "duration": str(meta.duration),
+                    "splits": str(n_parts), "audio_mode": audio_mode, "abitrate": str(abitrate)})
+                logger.info(f"🧩 assembler dispatched → acct {asm_acct} ({asm_repo}) • splits={n_parts}")
+                await live.set(f"🧩 <b>Slices verified (byte-exact)</b> — assembling on Helper #{asm_acct}…",
+                               force=True)
+            except Exception as e:
+                logger.warning(f"asm dispatch failed: {e} → local reassemble")
+                dl_cleanup.append((asm_acct, dl_tag))         # main slice දැනටමත් asm repo එකේ — cleanupට දානවා
+                asm_acct = None
+        if want_distributed and asm_acct is not None:
+            g_asm = gh_of[asm_acct]
+            asm_repo = hrepo[asm_acct]
+            deadline = time.monotonic() + config.DIST_ASM_TIMEOUT
+            marker = None
+            while time.monotonic() < deadline:
+                if job.cancelled:
+                    raise asyncio.CancelledError()
+                try:
+                    if "asm_done.json" in await g_asm.assets_sized(enc_tag):
+                        await g_asm.download(enc_tag, "asm_done.json", workdir)
+                        marker = json.loads((Path(workdir) / "asm_done.json").read_text())
+                        break
+                except Exception as e:
+                    logger.debug(f"asm poll: {e}")
+                await asyncio.sleep(3)
+            if marker and marker.get("ok"):
+                bounds = marker.get("bounds") or []
+                parts = int(marker.get("parts", 0))
+                ok_shape = parts >= 1 and len(bounds) == parts + 1 and bounds[0] == 0
+                ok_audio = (audio_mode == "none" or not meta.acodec or bool(marker.get("audio")))
+                if ok_shape and ok_audio:
+                    audio_path = None
+                    if marker.get("audio"):
+                        with contextlib.suppress(Exception):
+                            await g_asm.download(enc_tag, marker["audio"], workdir)
+                            audio_path = str(Path(workdir) / marker["audio"])
+                    dl_cleanup.append((asm_acct, dl_tag))     # asm repo එකේ main slice release එක
+                    with contextlib.suppress(Exception):
+                        os.remove(main_path)                    # main එකට downloaded parts ඕනේ නෑ ✔
+                    return {"mode": "remote", "bounds": list(map(float, bounds)), "n_parts": parts,
+                            "raw_repo": asm_repo, "raw_tag": enc_tag, "audio_path": audio_path,
+                            "asm_acct": asm_acct, "enc_tag": enc_tag,
+                            "dl_cleanup": dl_cleanup, "stats": stats}
+                logger.warning(f"asm marker invalid (shape={ok_shape} audio={ok_audio}) → local reassemble")
+            else:
+                logger.warning(f"assembler failed/timeout: {(marker or {}).get('error', 'timeout')} → local reassemble")
+            dl_cleanup.append((asm_acct, dl_tag))             # main slice (asm repo) cleanup
+
+        # ── 7b) LOCAL reassemble — single-runner encode | assembler නොමැති/fail ──
+        logger.info("🧩 reassembling slices on main runner…")
+        slices_dir = Path(workdir) / "dl_slices"
+        slices_dir.mkdir(parents=True, exist_ok=True)
+        local: dict = {}
+        for idx, ln in lane_by_idx.items():
+            if ln.acct == 0:
+                if main_path.exists() and main_path.stat().st_size == ln.total:
+                    local[idx] = main_path
+                    continue
+                if want_distributed and asm_acct is not None:    # main slice asm repo එකට ගිහින් — ආපහු ගන්න
+                    try:
+                        await gh_of[asm_acct].download(dl_tag, "dl_slice_0", slices_dir)
+                        p = slices_dir / "dl_slice_0"
+                        if p.exists() and p.stat().st_size == ln.total:
+                            local[idx] = p
+                            continue
+                    except Exception:
+                        pass
+                raise RuntimeError("main slice local නෑ")
+            rp = workdir / f"dl_slice_{idx}"
+            if rp.exists() and rp.stat().st_size == ln.total:
+                local[idx] = rp                                # recovery එකෙන් ඇවිල්ලා තියෙනවා
+                continue
+            try:
+                await gh_of[ln.acct].download(dl_tag, f"dl_slice_{idx}", slices_dir)
+                p = slices_dir / f"dl_slice_{idx}"
+                if not p.exists() or p.stat().st_size != ln.total:
+                    raise RuntimeError(f"slice {idx} size mismatch")
+                local[idx] = p
+            except Exception as e:
+                raise RuntimeError(f"slice {idx} local reassemble fail: {e}") from e
+        total_written = 0
+        with open(src_path, "wb") as out:
+            for idx in sorted(local):
+                sz = os.path.getsize(local[idx])
+                with open(local[idx], "rb") as f:
+                    shutil.copyfileobj(f, out, 8 * 1024 * 1024)
+                total_written += sz
+        if total_written != total or os.path.getsize(src_path) != total:
+            raise RuntimeError(f"reassembled {total_written} bytes != {total} (byte-exact අවශ්‍යතාවය කඩ වුණා)")
+        with contextlib.suppress(Exception):
+            os.remove(main_path)
+        shutil.rmtree(slices_dir, ignore_errors=True)
+        for idx, p in local.items():
+            if p != main_path:
+                with contextlib.suppress(Exception):
+                    os.remove(p)
+        return {"mode": "local", "src": str(src_path), "dl_cleanup": dl_cleanup, "stats": stats}
+    except asyncio.CancelledError:
+        with contextlib.suppress(BaseException):
+            await board.delete()
+        raise
+
+
 # ───────────────────────── ffmpeg helpers ─────────────────────────
 async def keyframes(path: str) -> List[float]:
     proc = await asyncio.create_subprocess_exec(
@@ -785,10 +1298,12 @@ def pick_splits(kfs: List[float], duration: float, n: int, min_len: float = 3.0)
 # ───────────────────────── orchestrator ─────────────────────────
 class DistRun:
     def __init__(self, *, client, job, src, dst, meta, state: DistState, opts: dict, workdir: Path,
-                 pool: "WorkerPool", n_workers: int, gh=None, board_cls=None):
+                 pool: "WorkerPool", n_workers: int, gh=None, board_cls=None, plan: Optional[dict] = None):
         self.pool, self.n_workers = pool, n_workers
         self.client, self.job, self.src, self.dst = client, job, str(src), str(dst)
         self.meta, self.state, self.opts, self.work = meta, state, opts, Path(workdir)
+        self.plan = plan or {}
+        self.pre_audio = self.plan.get("audio_path")          # remote (assembler) mode: audio.mka දැනටමත් download වෙලා
         self.used: set = set()                 # parts release එකක් හදපු accounts
         self.job_cfg: dict = {}
         self.board_cls = board_cls or TgBoard
@@ -858,75 +1373,89 @@ class DistRun:
         audio_task = None
         try:
             # 0) AUDIO — encoding runners run කරන අතරේ background එකේ extract වෙනවා
-            if self.meta.acodec and self.opts["audio_mode"] != "none":
+            #    (remote assembler mode: audio.mka දැනටමත් ඕනේම — main runner க்கு extract ඕනේ නෑ)
+            if self.pre_audio is None and self.meta.acodec and self.opts["audio_mode"] != "none":
                 audio_task = asyncio.create_task(self._extract_audio())
                 self.tasks.append(audio_task)
 
-            # 1) SPLIT
+            # 1) SPLIT — හෝ assembler plan එක (remote mode: parts දැනටමත් helper release එකේ තියෙනවා)
+            remote = self.plan.get("mode") == "remote"
             s.phase = "split"
             # pool එක ready කරන්න (download එකේදී කලින්ම පටන් අරන් නම් මේක no-op / අලුත් workers විතරක් dispatch)
             ensure = self._ensure = asyncio.create_task(self.pool.ensure(self.n_workers))
-            splits = pick_splits(await keyframes(self.src), meta.duration, self.n_workers)
-            if splits:
-                bounds = [0.0] + splits + [meta.duration]
-                await self._ff("-i", self.src, "-map", "0:v:0", "-c", "copy", "-an", "-sn", "-dn",
-                               "-f", "segment", "-segment_times", ",".join(f"{t:.3f}" for t in splits),
-                               "-reset_timestamps", "1", "-segment_format", "mp4",
-                               str(self.work / "raw_part_%d.mp4"))
-            else:
-                # A video without enough keyframes is still sent to one GitHub
-                # worker instead of silently falling back to the main runner.
-                bounds = [0.0, meta.duration]
-                await self._ff("-i", self.src, "-map", "0:v:0", "-c", "copy", "-an", "-sn", "-dn",
-                               str(self.work / "raw_part_0.mp4"))
-            files = sorted(self.work.glob("raw_part_*.mp4"), key=lambda p: int(re.findall(r"\d+", p.stem)[0]))
-            if len(files) != len(bounds) - 1:
-                raise DistError(f"Split parts mismatch ({len(files)} vs {len(bounds) - 1})")
             k = len(self.pool.accts)
-            s.parts = [Part(i, bounds[i], bounds[i + 1] - bounds[i], acct=i % k, runner_idx=i)
-                       for i in range(len(files))]
-            self.stats["workers"] = len(files)
+            files = None
+            if remote:
+                bounds = list(self.plan["bounds"])
+                self.used.add(self.plan["asm_acct"])      # assembler release එක (enc-<job>) search ට ඇතුළත්
+                s.parts = [Part(i, bounds[i], bounds[i + 1] - bounds[i], acct=i % k, runner_idx=i)
+                           for i in range(len(bounds) - 1)]
+                self.stats["workers"] = len(s.parts)
+                logger.info(f"🧩 assembler parts: {len(s.parts)} (asm acct {self.plan['asm_acct']})")
+            else:
+                splits = pick_splits(await keyframes(self.src), meta.duration, self.n_workers)
+                if splits:
+                    bounds = [0.0] + splits + [meta.duration]
+                    await self._ff("-i", self.src, "-map", "0:v:0", "-c", "copy", "-an", "-sn", "-dn",
+                                   "-f", "segment", "-segment_times", ",".join(f"{t:.3f}" for t in splits),
+                                   "-reset_timestamps", "1", "-segment_format", "mp4",
+                                   str(self.work / "raw_part_%d.mp4"))
+                else:
+                    # A video without enough keyframes is still sent to one GitHub
+                    # worker instead of silently falling back to the main runner.
+                    bounds = [0.0, meta.duration]
+                    await self._ff("-i", self.src, "-map", "0:v:0", "-c", "copy", "-an", "-sn", "-dn",
+                                   str(self.work / "raw_part_0.mp4"))
+                files = sorted(self.work.glob("raw_part_*.mp4"), key=lambda p: int(re.findall(r"\d+", p.stem)[0]))
+                if len(files) != len(bounds) - 1:
+                    raise DistError(f"Split parts mismatch ({len(files)} vs {len(bounds) - 1})")
+                s.parts = [Part(i, bounds[i], bounds[i + 1] - bounds[i], acct=i % k, runner_idx=i)
+                           for i in range(len(files))]
+                self.stats["workers"] = len(files)
             await ensure                               # partial account failures are tolerated; all-fail raises
             for p in s.parts:                           # failed account parts remain held for idle-runner scheduling
                 if self.pool.accts[p.acct].failed:
                     p.orphan = True
 
-            # 2) UPLOAD → Release
+            # 2) UPLOAD → Release (remote assembler mode: parts දැනටමත් asm release එකේ — upload එකක් නෑ)
             s.phase = "upload"
-            groups: dict = {}
-            for p, f in zip(s.parts, files):
-                if not p.orphan:
-                    groups.setdefault(p.acct, []).append(f)
+            if not remote:
+                groups: dict = {}
+                for pp, f in zip(s.parts, files):
+                    if not pp.orphan:
+                        groups.setdefault(pp.acct, []).append(f)
 
-            async def up(ai, fs):
-                await self._ensure_release(ai)
-                # Account-level isolation: each account uploads only its own parts;
-                # GhBackend retries and verifies every asset independently.
-                try:
-                    await self._g(ai).upload(self.tag, fs)
-                except Exception as exc:
-                    raise DistError(f"raw-part upload failed for account #{ai}: {exc}") from exc
+                async def up(ai, fs):
+                    await self._ensure_release(ai)
+                    # Account-level isolation: each account uploads only its own parts;
+                    # GhBackend retries and verifies every asset independently.
+                    try:
+                        await self._g(ai).upload(self.tag, fs)
+                    except Exception as exc:
+                        raise DistError(f"raw-part upload failed for account #{ai}: {exc}") from exc
 
-            # Different GitHub accounts can upload concurrently, while each account
-            # uploads its own assets sequentially to avoid saturating one connection.
-            upload_results = await asyncio.gather(
-                *[up(ai, fs) for ai, fs in groups.items()], return_exceptions=True
-            )
-            upload_errors = [str(r) for r in upload_results if isinstance(r, BaseException)]
-            if upload_errors:
-                raise DistError("One or more account raw-part uploads failed: " + " | ".join(upload_errors))
+                # Different GitHub accounts can upload concurrently, while each account
+                # uploads its own assets sequentially to avoid saturating one connection.
+                upload_results = await asyncio.gather(
+                    *[up(ai, fs) for ai, fs in groups.items()], return_exceptions=True
+                )
+                upload_errors = [str(r) for r in upload_results if isinstance(r, BaseException)]
+                if upload_errors:
+                    raise DistError("One or more account raw-part uploads failed: " + " | ".join(upload_errors))
 
             # 3) progress board + audio + dispatch
             chat = int(config.DIST_PROGRESS_CHAT) if config.DIST_PROGRESS_CHAT else self.job.chat_id
-            self.board = self.board_cls(self.client, chat, self.job.id, len(files))
+            self.board = self.board_cls(self.client, chat, self.job.id, len(s.parts))
             await self.board.create()
             o = self.opts
             job_cfg = {
-                "job": self.job.id, "n": len(files), "chat": chat, "ids": self.board.ids,
+                "job": self.job.id, "n": len(s.parts), "chat": chat, "ids": self.board.ids,
                 "durations": [p.duration for p in s.parts], "fps": meta.fps,
                 "target": o["target"], "scale": o["scale"], "portrait": o["portrait"],
                 "preset": o["preset"], "codec": o["codec"], "crf": o["crf"],
                 "maxrate": o["maxrate_kbps"], "interval": PROGRESS_UPDATE_INTERVAL,
+                "raw_repo": self.plan.get("raw_repo"),     # remote: raw parts asm repo එකේ; else නෑ (own release)
+                "raw_tag": self.plan.get("raw_tag"),
             }
             self.job_cfg = job_cfg
             await self.pool.post_job(self.job.id, job_cfg)        # hold වෙලා ඉන්න workers තත්පර 3කින් අල්ලගන්නවා
@@ -1083,7 +1612,12 @@ class DistRun:
         old = self.pool.accts[old_ai]
         raw = self.work / f"raw_part_{p.idx}.mp4"
         if not raw.exists() or raw.stat().st_size <= 0:
-            raise DistError(f"raw part {p.idx} is missing; cannot reassign")
+            if self.plan.get("raw_repo"):
+                # remote (assembler) mode: raw part එක assembler release එකෙන් fetch කරලා reassign
+                asm_acct = self.plan["asm_acct"]
+                await self._g(asm_acct).download(self.plan["raw_tag"], f"raw_part_{p.idx}.mp4", self.work)
+            if not raw.exists() or raw.stat().st_size <= 0:
+                raise DistError(f"raw part {p.idx} is missing; cannot reassign")
 
         await self._ensure_release(ai)
         if p.orphan or old_ai != ai:
@@ -1210,11 +1744,27 @@ class DistRun:
             await asyncio.sleep(max(1.0, PROGRESS_UPDATE_INTERVAL))
 
     # ── merge ──
+    async def _push_parts_to_main(self):
+        """Req #8: workers → own releases → main account release `enc-<job>` → main runner merge.
+        හැම encoded part එකක්ම main repo release එකට size-verify සමඟ upload කරනවා (fail ⇒ job fail)."""
+        await self._ensure_release(0)                       # main repo — release create + marks used (auto cleanup)
+        files = [self.work / f"encoded_part_{p.idx}.mkv" for p in self.state.parts]
+        missing = [f.name for f in files if not f.exists() or f.stat().st_size <= 0]
+        if missing:
+            raise DistError(f"encoded parts missing on main runner: {', '.join(missing)}")
+        logger.info(f"📦 pushing {len(files)} encoded parts → main account release {self.tag}")
+        try:
+            await self._g(0).upload(self.tag, files)
+        except Exception as exc:
+            raise DistError(f"encoded parts → main account release upload failed: {exc}") from exc
+
     async def _merge(self, audio_task):
         s = self.state
         s.merge_t0 = time.monotonic()
+        s.merge_step = "upload-main"                    # req #8: encoded parts → main account release, ඉන්පස්සේ merge
+        await self._push_parts_to_main()
         s.merge_step = "audio"                      # audio extract තාම ඉවර නැත්නම් මෙතන තමයි බලාගෙන ඉන්නේ
-        audio = await audio_task if audio_task else None
+        audio = self.pre_audio or (await audio_task if audio_task else None)
         s.merge_step, s.merge_out, s.merge_size = "mux", 0.0, 0
         lst = self.work / "concat.txt"
         lst.write_text("".join(f"file '{Path(p.path).resolve()}'\n" for p in s.parts))
@@ -1237,8 +1787,12 @@ class DistRun:
 
 
 def helpers_status() -> str:
-    lines = [f"🤝 <b>Helper accounts: {len(HELPERS)}/{len(config.HELPER_TOKENS)}</b> • workers capacity <b>{capacity()}</b>"]
-    lines += [f"• ✅ {r}" for _, r in HELPERS]
+    n_dl = sum(1 for x in HELPER_DL if x)
+    lines = [f"🤝 <b>Helper accounts: {len(HELPERS)}/{len(config.HELPER_TOKENS)}</b> • workers capacity <b>{capacity()}</b>",
+             f"🌐 <b>Distributed download lanes: {1 + n_dl}/5</b> (🏠 main + 🤝 {n_dl} helpers)"
+             + ("" if n_dl else "  <i>— helpers වලට DL_SESSION නෑ / helpers නෑ</i>")]
+    for i, (_, r) in enumerate(HELPERS):
+        lines.append(f"• ✅ {r}" + (" 🌐 dl" if i < len(HELPER_DL) and HELPER_DL[i] else ""))
     lines += [f"• ❌ {p}" for p in HELPER_PROBLEMS]
     if not config.HELPER_TOKENS:
         lines.append("HELPER_TOKENS set කරලා නෑ.")

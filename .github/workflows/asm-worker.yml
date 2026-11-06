@@ -1,0 +1,77 @@
+name: Assemble & Split Worker
+
+# Slices ඔක්කොම release වලට ආවාම main runner එක මේක dispatch කරනවා — අතින් run කරන්න එපා.
+# Slices verify + cat (byte-identical) → keyframe parts → own repo release `enc-<job>`.
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: 'Job id'
+        required: true
+        type: string
+      sources:
+        description: 'JSON list [{"repo","tag","name","size"}...] (slice index order irrelevant)'
+        required: true
+        type: string
+      total_size:
+        description: 'Total file bytes (exact)'
+        required: true
+        type: string
+      duration:
+        description: 'Source duration seconds'
+        required: true
+        type: string
+      splits:
+        description: 'Desired encode parts'
+        required: true
+        type: string
+      audio_mode:
+        description: 'copy | aac | none'
+        required: false
+        default: 'aac'
+        type: string
+      abitrate:
+        description: 'AAC bitrate kbps'
+        required: false
+        default: '128'
+        type: string
+
+permissions:
+  contents: write   # enc-<job> release එකට parts upload
+
+jobs:
+  asm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            asm_worker.py
+          sparse-checkout-cone-mode: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Fast Install FFmpeg
+        run: |
+          curl -fsSL --retry 3 https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+            | tar -xJ --strip-components=1 -C /tmp --wildcards '*/ffmpeg' '*/ffprobe'
+          sudo mv /tmp/ffmpeg /tmp/ffprobe /usr/local/bin/
+
+      - name: Assemble & Split ${{ inputs.job }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          JOB: ${{ inputs.job }}
+          SOURCES: ${{ inputs.sources }}
+          TOTAL_SIZE: ${{ inputs.total_size }}
+          DURATION: ${{ inputs.duration }}
+          SPLITS: ${{ inputs.splits }}
+          AUDIO_MODE: ${{ inputs.audio_mode }}
+          ABITRATE: ${{ inputs.abitrate }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: python3 -u asm_worker.py

@@ -25,7 +25,7 @@ from config import (API_ID, API_HASH, BOT_TOKEN, SESSION_NAME, ALLOWED_USERS,
                     PROGRESS_UPDATE_INTERVAL, DOWNLOAD_DIR, PRESETS, CODECS,
                     PRESET_INFO, CRF, AUDIO_BITRATE, MAX_UPLOAD_BYTES,
                     WORKER_CHOICES, QUEUE_MAX, QUEUE_RES_CHOICES)
-from fast_downloader import get_downloader, init_download_engine
+from fast_downloader import get_downloader, init_download_engine, Lane
 from fast_uploader import get_uploader
 from userbots import Relay
 from media import (VideoMeta, telegram_meta, probe_remote, ffprobe, apply_probe,
@@ -581,6 +581,7 @@ async def run_job(job: Job, height: int):
     t_start = time.monotonic()
     stats = {}
     dl, ul = get_downloader(), get_uploader()
+    dl_plan = None                          # distributed download plan (finally cleanup ට ඕනේ)
     ch_ids, ch_out = [], [None, None]       # channel messages (cleanup): bot ගේ ids, [userbot msg, userbot]
 
     try:
@@ -594,6 +595,18 @@ async def run_job(job: Job, height: int):
                     await pool.ensure(min(store.get(job.user_id)["workers"], dist.capacity()))
             prestart = asyncio.create_task(_prestart())
 
+        # Audio decision (source bitrate එකට වඩා වැඩි කරන්නේ නෑ; AAC & අඩු නම් copy)
+        ab = AUDIO_BITRATE.get(height, 96)
+        src_ab = meta.abitrate // 1000
+        ac = meta.acodec == "aac" and 0 < src_ab <= ab
+        if src_ab and not ac:
+            ab = min(ab, src_ab)
+        enc_opts = dict(
+            target=height, scale=short_side(meta) > height, portrait=meta.height > meta.width,
+            preset=preset, codec=codec, crf=CRF[codec], maxrate_kbps=guard_kbps(meta, height),
+            abitrate=ab, audio_mode="copy" if ac else "aac",
+        )
+
         # 1) DOWNLOAD ─────────────────────────────
         tr = SpeedTracker(total=meta.size)
         await live.set(render_transfer("dl", tr, meta.name), force=True)
@@ -604,17 +617,70 @@ async def run_job(job: Job, height: int):
             tr.update(cur, tot)
             await live.set(render_transfer("dl", tr, meta.name))
 
-        use_relay, ch_in = relay.enabled and bool(relay.ready), None
-        if use_relay:                                      # user ගේ video එක → private channel (userbots එතනින් ගන්නවා)
+        # 1a) Forward — distributed download lanes ටත් ඕනේ (helper userbots channel එකෙන්ම range එක ගන්නවා)
+        use_relay = relay.enabled and bool(relay.ready)
+        want_dist_probe = (config.DIST_DOWNLOAD and dist.available()
+                           and meta.size >= config.DIST_DL_MIN_BYTES
+                           and (1 + dist.dl_sessions_ready()) >= 2)
+        ch_in = None
+        if use_relay or want_dist_probe:                 # user ගේ video එක → private channel
             try:
                 await live.set("📨 <b>Channel එකට forward කරනවා…</b>", force=True)
                 ch_in = await relay.forward_in(client, job.message)
                 ch_ids.append(ch_in)
             except Exception as e:
-                logger.warning(f"relay forward failed ({e!r}) → bot download")
+                logger.warning(f"channel forward failed ({e!r})")
+                ch_in = None
                 use_relay = False
             await live.set(render_transfer("dl", tr, meta.name), force=True)
-        if use_relay:
+
+        # 1b) Distributed download — main runner + 4 helper runners, byte-exact range split
+        dl_plan = None
+        want_dist = (ch_in is not None and config.DIST_DOWNLOAD and dist.available()
+                     and meta.size >= config.DIST_DL_MIN_BYTES
+                     and (1 + dist.dl_sessions_ready()) >= 2)
+        if want_dist:
+            async def dl_fn(offset, length, path, on_progress):
+                async def _cb(cur, tot):
+                    with contextlib.suppress(Exception):
+                        await on_progress(cur, tot)
+                if relay.ready:                           # main lane — main runner එකේ userbots ඔක්කොම එකවර
+                    return await relay.download(dl, ch_in, path, f"{job.id}:dl{offset}", _cb,
+                                                offset=offset, length=length)
+                from telethon.tl.types import InputDocumentFileLocation
+                doc = job.message.document
+                loc = InputDocumentFileLocation(id=doc.id, access_hash=doc.access_hash,
+                                                file_reference=doc.file_reference,
+                                                thumb_size="")
+                lane = Lane(name="bot", client=client, location=loc,
+                            dc_id=getattr(doc, "dc_id", None),
+                            connections=config.UB_DL_CONNECTIONS, on_flood=None)
+                return await dl.download_lanes([lane], length, path, f"{job.id}:dl{offset}", _cb,
+                                               offset=offset, length=length)
+
+            n_workers_planned = min(cfg["workers"], dist.capacity())
+            try:
+                dl_plan = await dist.distributed_download(
+                    client=client, job=job, meta=meta, live=live, workdir=workdir, src_path=src,
+                    dl_fn=dl_fn, want_distributed=dist.should_distribute(meta, height, preset, codec, cfg["dist"]),
+                    n_parts=n_workers_planned, audio_mode=enc_opts["audio_mode"],
+                    abitrate=ab, n_main_ubs=len(relay.ready),
+                    channel_num=relay.channel_num, ch_msg_id=ch_in)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.exception(f"Distributed download failed ({e!r}) → falling back to normal download")
+                await live.set("⚠️ Distributed download fail → සාමාන්‍ය විදිහට download කරනවා…", force=True)
+                dl_plan = None
+                with contextlib.suppress(Exception):
+                    src.unlink(missing_ok=True)
+
+        if dl_plan:
+            st = dl_plan["stats"]
+            stats["via"] = st["dl_via"]
+            stats["dl_avg"], stats["dl_time"] = st["dl_avg"], st["dl_time"]
+            stats["dl_distributed"] = True
+        elif use_relay and ch_in is not None:
             try:
                 await relay.download(dl, ch_in, str(src), job.id, dl_cb)
                 stats["via"] = [u.name for u in relay.ready]
@@ -632,35 +698,30 @@ async def run_job(job: Job, height: int):
                 await dl.download(client, job.message, str(src), job.id, dl_cb)
         else:
             await dl.download(client, job.message, str(src), job.id, dl_cb)
-        stats["dl_avg"], stats["dl_time"] = tr.avg_speed, tr.elapsed
+        if not dl_plan:
+            stats["dl_avg"], stats["dl_time"] = tr.avg_speed, tr.elapsed
         if job.cancelled:
             raise asyncio.CancelledError()
 
         # 2) REAL PROBE ───────────────────────────
         phase[0] = "probe"
-        await live.set("🔍 <b>Analyzing downloaded file…</b>", force=True)
-        if not apply_probe(meta, await ffprobe(str(src))):
-            raise RuntimeError("Valid video stream එකක් හමු වුණේ නෑ.")
+        if dl_plan and dl_plan["mode"] == "remote":
+            # Assembler එක byte-exact verify + ffprobe sanity check කරලා parts හැදුවා — main runner file එක hold කරන්නේ නෑ
+            await live.set("🔍 <b>Assembler verified source (byte-exact) ✓</b>", force=True)
+        else:
+            await live.set("🔍 <b>Analyzing downloaded file…</b>", force=True)
+            if not apply_probe(meta, await ffprobe(str(src))):
+                raise RuntimeError("Valid video stream එකක් හමු වුණේ නෑ.")
 
         # 3) ENCODE ───────────────────────────────
         phase[0] = "enc"
-        # Audio: source එකේ bitrate එකට වඩා වැඩි කරන්නේ නෑ; AAC & අඩු නම් copy
-        ab = AUDIO_BITRATE.get(height, 96)
-        src_ab = meta.abitrate // 1000
-        ac = meta.acodec == "aac" and 0 < src_ab <= ab
-        if src_ab and not ac:
-            ab = min(ab, src_ab)
-        enc_opts = dict(
-            target=height, scale=short_side(meta) > height, portrait=meta.height > meta.width,
-            preset=preset, codec=codec, crf=CRF[codec], maxrate_kbps=guard_kbps(meta, height),
-            abitrate=ab, audio_mode="copy" if ac else "aac",
-        )
         encoded = False
 
         # 3a) Distributed (GitHub Actions workers) ─
         cfg = store.get(job.user_id)         # download අතරේ settings (workers…) වෙනස් කළා නම් අලුත් එක
         n_workers = min(cfg["workers"], dist.capacity())       # accounts වලින් දෙන්න පුළුවන් උපරිමය
-        if dist.should_distribute(meta, height, preset, codec, cfg["dist"]):
+        force_remote = bool(dl_plan and dl_plan.get("mode") == "remote")   # remote mode: file main runner එකේ නෑ — distributed encode අනිවාර්යයි
+        if force_remote or dist.should_distribute(meta, height, preset, codec, cfg["dist"]):
             dst_state = dist.DistState(meta.duration, meta.fps, n_workers)
 
             async def dist_ticker():
@@ -672,7 +733,7 @@ async def run_job(job: Job, height: int):
             try:
                 run = dist.DistRun(client=client, job=job, src=src, dst=dst, meta=meta,
                                    state=dst_state, opts=enc_opts, workdir=workdir,
-                                   pool=pool, n_workers=n_workers)
+                                   pool=pool, n_workers=n_workers, plan=dl_plan)
                 dstats = await run.run()
                 stats["enc_time"], stats["enc_speed"] = dst_state.elapsed, meta.duration / max(dst_state.elapsed, 1)
                 stats["workers"] = dstats["workers"]
@@ -771,7 +832,7 @@ async def run_job(job: Job, height: int):
             f"📦 <code>{human_size(meta.size)}</code> → <code>{human_size(out_size)}</code> "
             f"({'−' if saved >= 0 else '+'}{abs(saved):.0f}%)"
             + (f"  •  est ≈{human_size(est_size)}" if est_size else ""),
-            f"📥 DL{' 👤×' + str(len(stats['via'])) if stats.get('via') else ''}: "
+            f"📥 DL{' 🌐×' + str(len(stats['via'])) if stats.get('dl_distributed') else (' 👤×' + str(len(stats['via']))) if stats.get('via') else ''}: "
             f"<code>{human_speed(stats['dl_avg'])}</code> • <code>{human_time(stats['dl_time'])}</code>",
             f"🎬 Encode{' 🌐×' + str(stats['workers']) if 'workers' in stats else ''}: "
             f"<code>{stats['enc_speed']:.2f}x</code> • <code>{human_time(stats['enc_time'])}</code>"
@@ -792,6 +853,14 @@ async def run_job(job: Job, height: int):
         live.buttons = None
         await live.set(f"⚠️ <b>Failed</b>\n<code>{esc(str(e)[-900:])}</code>", force=True)
     finally:
+        if dl_plan and dl_plan.get("dl_cleanup"):
+            for ai, tag in dl_plan["dl_cleanup"]:
+                with contextlib.suppress(Exception):
+                    if ai == 0:
+                        await dist.GhBackend().release_delete(tag)
+                    else:
+                        _t, _r = dist.HELPERS[ai - 1]
+                        await dist.GhBackend(_t, _r).release_delete(tag)
         if ch_ids or ch_out[0] is not None:
             with contextlib.suppress(Exception):
                 await relay.cleanup(client, ch_ids, ch_out[0], ch_out[1])

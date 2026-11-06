@@ -1,0 +1,91 @@
+name: Download Slice Worker
+
+# Main runner එක bytes range දීලා මේක dispatch කරනවා — අතින් run කරන්න එපා.
+# එක dispatch = එක byte range එකක්. Secrets (DL_SESSION, API_ID, API_HASH, BOT_TOKEN, CHANNEL_NUM)
+# main bot එකෙන්ම auto-දානවා (helper repo එකට). File_reference අවශ්‍ය නෑ — userbot එතනින්ම channel message එක read කරනවා.
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: 'Job id'
+        required: true
+        type: string
+      slice:
+        description: 'Slice index (0-based)'
+        required: true
+        type: string
+      range_start:
+        description: 'Byte range start (inclusive)'
+        required: true
+        type: string
+      range_end:
+        description: 'Byte range end (exclusive)'
+        required: true
+        type: string
+      total_size:
+        description: 'Expected total file bytes (exact)'
+        required: true
+        type: string
+      ch_msg:
+        description: 'Channel message id (forwarded source video)'
+        required: true
+        type: string
+      connections:
+        description: 'Connections per slice'
+        required: false
+        default: '12'
+        type: string
+      chat:
+        description: 'Telegram chat id (progress message)'
+        required: false
+        default: ''
+        type: string
+      msg_id:
+        description: 'Telegram message id (progress message)'
+        required: false
+        default: '0'
+        type: string
+
+permissions:
+  contents: write   # enc-dl-<job> release එකට slice upload
+
+jobs:
+  dl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            dl_worker.py
+            fast_conn.py
+          sparse-checkout-cone-mode: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Telethon
+        run: pip install --no-cache-dir telethon cryptg
+
+      - name: Download Slice ${{ inputs.slice }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          JOB: ${{ inputs.job }}
+          SLICE: ${{ inputs.slice }}
+          RANGE_START: ${{ inputs.range_start }}
+          RANGE_END: ${{ inputs.range_end }}
+          TOTAL_SIZE: ${{ inputs.total_size }}
+          CH_MSG: ${{ inputs.ch_msg }}
+          CONNECTIONS: ${{ inputs.connections }}
+          CHAT: ${{ inputs.chat }}
+          MSG_ID: ${{ inputs.msg_id }}
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          DL_SESSION: ${{ secrets.DL_SESSION }}      # මේ helper account එකට අදාල Telegram userbot
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHANNEL_NUM: ${{ secrets.CHANNEL_NUM }}    # private channel ගේ numeric id (get_dialogs එකෙන් resolve)
+        run: python3 -u dl_worker.py

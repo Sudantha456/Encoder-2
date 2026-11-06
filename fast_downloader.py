@@ -220,7 +220,8 @@ class FastDownloader:
     # ═════════ Multi-userbot download: chunks lanes අතර බෙදනවා ═════════
     async def download_lanes(self, lanes: List[Lane], total_size: int, save_path: str, download_id: str,
                              progress_callback: Optional[Callable] = None, max_retries: int = 8,
-                             max_flood_wait: float = 30.0, workers_per_conn: Optional[int] = None) -> str:
+                             max_flood_wait: float = 30.0, workers_per_conn: Optional[int] = None,
+                             offset: int = 0, length: Optional[int] = None) -> str:
         """
         • Shared chunk queue — හැම lane එකක්ම queue එකෙන් chunk අරන් ඒ ඒ userbot ගේ connections හරහා ගන්නවා.
         • Lane එකක FloodWait ආවොත්: chunk එක queue එකට ආපහු දානවා (වෙන lanes ගන්නවා), ඒ lane එක විතරක් නතර වෙලා ඉන්නවා.
@@ -230,6 +231,8 @@ class FastDownloader:
         wpc = workers_per_conn or DL_WORKERS_PER_CONN
         self._cancel_flags[download_id] = False
         loop = asyncio.get_running_loop()
+        expected = int(length) if length is not None else int(total_size)
+        base = int(offset)
 
         # 1) pools (පොඩි stagger එකක් — එකවර connect කරද්දී flood වෙන එක අඩු කරන්න)
         async def start_lane(i: int, ln: Lane):
@@ -253,12 +256,12 @@ class FastDownloader:
 
         flags = os.O_RDWR | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
         fd = os.open(save_path, flags)
-        os.ftruncate(fd, total_size)
+        os.ftruncate(fd, expected)
         has_pwrite = hasattr(os, "pwrite")
         write_lock = asyncio.Lock()
 
         queue: asyncio.Queue = asyncio.Queue()
-        for off in range(0, total_size, CHUNK_SIZE):
+        for off in range(base, base + expected, CHUNK_SIZE):
             queue.put_nowait(off)
         remaining = [queue.qsize()]
         fails: Dict[int, int] = {}
@@ -275,10 +278,10 @@ class FastDownloader:
         def _prog(n: int):
             downloaded[0] += n
             now = time.monotonic()
-            if now - last_update[0] >= PROGRESS_UPDATE_INTERVAL or downloaded[0] >= total_size:
+            if now - last_update[0] >= PROGRESS_UPDATE_INTERVAL or downloaded[0] >= expected:
                 last_update[0] = now
                 if progress_callback:
-                    asyncio.create_task(progress_callback(downloaded[0], total_size))
+                    asyncio.create_task(progress_callback(downloaded[0], expected))
 
         async def write_at(off: int, data: bytes):
             if has_pwrite:
@@ -327,7 +330,8 @@ class FastDownloader:
                 rec = inflight.setdefault(off, [time.monotonic(), 0])
                 rec[1] += 1
                 try:
-                    req = GetFileRequest(location=ln.location, offset=off, limit=CHUNK_SIZE)
+                    req = GetFileRequest(location=ln.location, offset=off,
+                                         limit=min(CHUNK_SIZE, base + expected - off))
                     r = await asyncio.wait_for(ln.pool.send(req, widx + (1 if hedge else 0)), timeout=CHUNK_TIMEOUT)
                     data = getattr(r, "bytes", None)
                     if data is None:
@@ -335,7 +339,7 @@ class FastDownloader:
                     ln.bad = 0
                     if off not in finished:                    # පළමුව ඉවර වූ copy එක විතරක් ගණන් වෙනවා
                         finished.add(off)
-                        await write_at(off, data)
+                        await write_at(off - base, data)
                         ln.got += len(data)
                         _prog(len(data))
                         remaining[0] -= 1
@@ -396,8 +400,8 @@ class FastDownloader:
                         raise t.exception()
                 if done_ev.is_set():
                     break
-            if downloaded[0] < total_size:
-                raise RuntimeError(f"Incomplete download {downloaded[0]}/{total_size}")
+            if downloaded[0] < expected:
+                raise RuntimeError(f"Incomplete download {downloaded[0]}/{expected}")
             logger.info("lane summary: " + ", ".join(f"{l.name}={l.got / 1048576:.0f}MB" for l in lanes))
             return save_path
         except BaseException:
