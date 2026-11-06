@@ -78,14 +78,7 @@ jobs:
           USER_STRINGS: ${{ env.USER_STRINGS || secrets.USER_STRINGS }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}          # -100xxxxxxxxxx  (හෝ invite link)
           HELPER_TOKENS: ${{ secrets.HELPER_TOKENS }}    # tokenA,tokenB,tokenC,tokenD (classic PAT: repo + workflow)
-          # Balanced download tuning (4 Userbots × 4 connections × 2 workers = up to 32 active workers)
-          UB_DL_CONNECTIONS: ${{ vars.UB_DL_CONNECTIONS || '4' }}
-          UB_DL_WORKERS_PER_CONN: ${{ vars.UB_DL_WORKERS_PER_CONN || '2' }}
-          UB_DL_MAX_WORKERS: ${{ vars.UB_DL_MAX_WORKERS || '32' }}
-          UB_DL_MAX_RETRIES: ${{ vars.UB_DL_MAX_RETRIES || '10' }}
-          UB_DL_CHUNK_TIMEOUT: ${{ vars.UB_DL_CHUNK_TIMEOUT || '45' }}
-          UB_DL_HEDGE_AFTER: ${{ vars.UB_DL_HEDGE_AFTER || '0' }}
-          UB_DL_HEDGE_MAX: ${{ vars.UB_DL_HEDGE_MAX || '1' }}
+          UB_DL_CONNECTIONS: ${{ vars.UB_DL_CONNECTIONS || '12' }}
           UB_UL_CONNECTIONS: ${{ vars.UB_UL_CONNECTIONS || '12' }}
           UB_MAX_FLOOD_WAIT: ${{ vars.UB_MAX_FLOOD_WAIT || '30' }}
           PROGRESS_UPDATE_INTERVAL: ${{ vars.PROGRESS_UPDATE_INTERVAL || '3' }}
