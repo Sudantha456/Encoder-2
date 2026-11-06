@@ -12,7 +12,7 @@
     "c_workers": 30,
     "codec": "libx265",
     "dist": "on",
-    "mode": "res",
+    "mode": "compress",
     "preset": "veryfast",
     "qres": "ask",
     "workers": 30
