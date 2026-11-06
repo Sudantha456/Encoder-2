@@ -19,6 +19,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import ghassets
 from transcoder import EncState, transcode
 
 QUEUE_TAG = "enc-queue"
@@ -87,12 +88,14 @@ async def run_part(cfg: dict, idx: int, workdir: str = "."):
                     ctl.proc.kill()
                 return
 
+    repo = os.environ.get("GH_REPO", "")
+    env = os.environ
     bg = []
     try:
         await rep.send("running", st)
         if not os.path.exists(raw):
-            await asyncio.to_thread(gh, "release", "download", tag, "-p", f"raw_part_{idx}.mp4",
-                                    "-D", workdir, "--clobber")
+            # chunked raw part එකක් නම් chunks concat කරලා දෙනවා (retries සමඟ)
+            await asyncio.to_thread(ghassets.download, tag, f"raw_part_{idx}.mp4", workdir, repo, env)
         if not os.path.exists(raw):
             raise RuntimeError("raw part not found")
         bg = [asyncio.create_task(ticker()), asyncio.create_task(watchdog())]
@@ -102,7 +105,8 @@ async def run_part(cfg: dict, idx: int, workdir: str = "."):
         for t in bg:
             t.cancel()
         await rep.send("uploading", st)
-        await asyncio.to_thread(gh, "release", "upload", tag, dst, "--clobber")
+        # chunked + retry upload: 'HTTP 408 upload body timed out' නිසා job එක fail වෙන්නේ නෑ
+        await asyncio.to_thread(ghassets.upload, tag, [dst], repo, env)
         st.finished = True
         await rep.send("done", st)
     except BaseException as e:

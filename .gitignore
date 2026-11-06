@@ -1,0 +1,8 @@
+# runtime artifacts
+__pycache__/
+*.pyc
+*.session
+*.session-journal
+user_settings.json
+media_cache.json
+downloads/

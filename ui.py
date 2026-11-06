@@ -81,8 +81,16 @@ class SpeedTracker:
         return (self.total - self.current) / sp if sp > 0 and self.total else 0.0
 
     @property
+    def current_live(self) -> float:
+        """අන්තිම sample එකෙන් පස්සේ ගත වුණු වෙලාව × speed → bar එක smooth වෙන්න."""
+        c = self.current
+        if self.total and c < self.total and self.speed > 0 and self.samples:
+            c = min(c + (time.monotonic() - self.samples[-1][0]) * self.speed, self.total)
+        return c
+
+    @property
     def percent(self) -> float:
-        return self.current / self.total * 100 if self.total else 0.0
+        return self.current_live / self.total * 100 if self.total else 0.0
 
 
 def render_transfer(kind: str, tr: SpeedTracker, name: str) -> str:
@@ -91,7 +99,7 @@ def render_transfer(kind: str, tr: SpeedTracker, name: str) -> str:
         f"{head}\n<code>{esc(short_name(name))}</code>",
         "",
         f"<code>[{bar(tr.percent)}] {tr.percent:5.1f}%</code>",
-        f"📦 <code>{human_size(tr.current)} / {human_size(tr.total)}</code>",
+        f"📦 <code>{human_size(tr.current_live)} / {human_size(tr.total)}</code>",
         f"⚡ Speed: <code>{human_speed(tr.speed)}</code>  (avg <code>{human_speed(tr.avg_speed)}</code>)",
         f"⏳ ETA: <code>{human_time(tr.eta)}</code>   ⏱ Elapsed: <code>{human_time(tr.elapsed)}</code>",
     ])
@@ -152,7 +160,7 @@ def render_dist(st, name: str, height: int, preset: str, codec: str) -> str:
     labels = {
         "waiting": "⏳ runner start වෙන්න බලාගෙන", "held": "📦 held • idle runner එකක් එනකම්",
         "uploading": "☁️ result upload", "remote_done": "📥 fetching",
-        "failed": "♻️ retry queue", "ready": "✅ done",
+        "failed": "♻️ retry queue", "ready": "✅ done", "local": "🏠 main runner (rescue)",
     }
     lines = [head, f"<code>[{bar(st.percent)}] {st.percent:5.1f}%</code>",
              f"🎞 Video: <code>{human_time(st.out_time)} / {human_time(st.duration)}</code>",

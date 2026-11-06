@@ -28,7 +28,8 @@ from pathlib import Path
 from typing import List, Optional
 
 import config
-from config import PROGRESS_UPDATE_INTERVAL
+import ghassets
+from config import PROGRESS_UPDATE_INTERVAL, PROGRESS_TICK
 from pathlib import Path as _P
 
 logger = logging.getLogger("Dist")
@@ -95,6 +96,7 @@ async def _bootstrap_inner(token: str, st: list) -> tuple:
         logger.info(f"🤝 repo exists: {repo} — නැවත හදන්නේ නෑ")
     root = _P(__file__).resolve().parent
     files = {"worker.py": root / "worker.py", "transcoder.py": root / "transcoder.py",
+             "ghassets.py": root / "ghassets.py",
              ".github/workflows/encode-worker.yml": root / ".github/workflows/encode-worker.yml"}
     for path, src in files.items():
         st[0] = f"push {path} (token එකට 'workflow' scope ඕනේ)"
@@ -181,10 +183,21 @@ class Part:
     attempt: int = 0              # unique lease generation for worker-side de-duplication
     orphan: bool = False          # owner account එක fail → raw part එක තවම upload වෙලා නෑ
     last_try: float = 0.0
+    rescued: int = 0              # main runner එකේ local encode උත්සාහ ගණන
+
+    @property
+    def live_out(self) -> float:
+        """අන්තිම progress report එකෙන් පස්සේ speed එකෙන් extrapolate — bar එක smooth වෙන්න."""
+        if self.ready:
+            return self.duration
+        t = min(self.out_time, self.duration)
+        if self.status in ("running", "uploading") and self.speed > 0:
+            t = min(t + max(0.0, time.monotonic() - self.last_change) * self.speed, self.duration)
+        return t
 
     @property
     def pct(self) -> float:
-        return 100.0 if self.ready else min(self.out_time / self.duration * 100, 99.9) if self.duration else 0.0
+        return 100.0 if self.ready else min(self.live_out / self.duration * 100, 99.9) if self.duration else 0.0
 
 
 class DistState:
@@ -220,7 +233,7 @@ class DistState:
 
     @property
     def out_time(self):
-        return sum(p.duration if p.ready else min(p.out_time, p.duration) for p in self.parts)
+        return sum(p.duration if p.ready else min(p.live_out, p.duration) for p in self.parts)
 
     @property
     def percent(self):
@@ -285,10 +298,19 @@ class GhBackend:
         await self._gh("release", "create", tag, "--prerelease", "--title", f"Temp {tag}", "--notes", "encoder temp")
 
     async def upload(self, tag, paths):
-        await self._gh("release", "upload", tag, *[str(p) for p in paths], "--clobber")
+        """
+        විශාල file → chunks වලට කඩලා (parallel, resume + per-chunk retry) upload කරනවා.
+        `gh release upload` එකේ 'HTTP 408: upload body timed out due to inactivity' අවුල
+        මෙතනින් ඉවරයි — stall වුණ chunk එක විතරයි ආයෙ යන්නේ.
+        """
+        await asyncio.to_thread(ghassets.upload, tag, [str(p) for p in paths], self.repo, self.env)
 
     async def download(self, tag, pattern, dest):
-        await self._gh("release", "download", tag, "-p", pattern, "-D", str(dest), "--clobber")
+        await asyncio.to_thread(ghassets.download_pattern, tag, pattern, str(dest), self.repo, self.env)
+
+    async def fetch(self, tag, name, dest) -> Path:
+        """Chunked / normal asset එකක් අරගෙන local path එක return කරනවා."""
+        return await asyncio.to_thread(ghassets.download, tag, name, str(dest), self.repo, self.env)
 
     async def assets(self, tag) -> dict:
         data = json.loads(await self._gh("release", "view", tag, "--json", "assets") or "{}")
@@ -807,18 +829,39 @@ class DistRun:
                 if self.pool.accts[p.acct].failed:
                     p.orphan = True
 
-            # 2) UPLOAD → Release
+            # 2) UPLOAD → Release (chunked + retries; fail වුණ part එක main runner එකේම encode කරනවා)
             s.phase = "upload"
             groups: dict = {}
             for p, f in zip(s.parts, files):
                 if not p.orphan:
-                    groups.setdefault(p.acct, []).append(f)
+                    groups.setdefault(p.acct, []).append((p, f))
 
-            async def up(ai, fs):
+            upload_fail: List[Part] = []
+
+            async def up(ai, items):
                 await self._ensure_release(ai)
-                await self._g(ai).upload(self.tag, fs)
+                for p, f in items:
+                    try:
+                        await self._g(ai).upload(self.tag, [f])
+                    except Exception as e:                      # noqa: BLE001 — retry පස්සේ බලමු
+                        logger.warning(f"raw part {p.idx} upload failed: {e}")
+                        upload_fail.append(p)
 
-            await asyncio.gather(*[up(ai, fs) for ai, fs in groups.items()])   # account එකකට එහි කොටස් විතරයි
+            await asyncio.gather(*[up(ai, it) for ai, it in groups.items()])   # account එකකට එහි කොටස් විතරයි
+            if upload_fail:                                     # එක වටයක් ආයෙ try (network blip)
+                await asyncio.sleep(5)
+                again: List[Part] = []
+                logger.warning(f"⬆️ {len(upload_fail)} raw part(s) retry කරනවා…")
+
+                async def retry(p: Part):
+                    try:
+                        await self._g(p.acct).upload(self.tag, [self.work / f"raw_part_{p.idx}.mp4"])
+                    except Exception as e:
+                        logger.warning(f"raw part {p.idx} upload retry failed: {e}")
+                        again.append(p)
+
+                await asyncio.gather(*[retry(p) for p in upload_fail])
+                upload_fail = again
 
             # 3) progress board + audio + dispatch
             chat = int(config.DIST_PROGRESS_CHAT) if config.DIST_PROGRESS_CHAT else self.job.chat_id
@@ -840,6 +883,11 @@ class DistRun:
             s.enc_t0 = time.monotonic()
             for p in s.parts:
                 p.last_change = time.monotonic()
+            if upload_fail:                     # යවන්න බැරි වුණ raw parts → main runner එකේම encode
+                logger.warning(f"🏠 {len(upload_fail)} part(s) local rescue (remote upload fail)")
+                for p in upload_fail:
+                    p.orphan = True
+                self.tasks.append(asyncio.create_task(self._local_encode(upload_fail)))
             await self._monitor()
 
             # 5) MERGE
@@ -880,6 +928,57 @@ class DistRun:
         await self._ff("-i", self.src, "-vn", "-sn", "-dn", "-map", "0:a?", *a, out, track=False)
         return out
 
+    # ── 🏠 local rescue: worker එකෙන් එන්නේ නැති / upload වෙන්නේ නැති part එකක්
+    #    main runner එකේම encode කරනවා → upload timeout එකක් නිසා මුළු job එක fail වෙන්නේ නෑ.
+    async def _local_encode(self, parts: List[Part]):
+        if not config.DIST_LOCAL_RESCUE:
+            return
+        from transcoder import build_cmd
+        sem = asyncio.Semaphore(max(1, min(3, (os.cpu_count() or 4) // 2)))
+        o = self.opts
+
+        async def one(p: Part):
+            if p.ready:
+                return
+            raw = self.work / f"raw_part_{p.idx}.mp4"
+            out = self.work / f"encoded_part_{p.idx}.mkv"
+            if not raw.exists() or raw.stat().st_size <= 0:
+                return                              # encode කරන්න දෙයක් නෑ — scheduler එක බලාගනී
+            async with sem:
+                if p.ready:
+                    return
+                p.rescued += 1
+                p.status, p.speed, p.fps = "local", 0.0, 0.0
+                p.last_change = time.monotonic()
+                cmd = build_cmd(str(raw), str(out), target=o["target"], scale=o["scale"],
+                                portrait=o["portrait"], preset=o["preset"], codec=o["codec"],
+                                crf=o["crf"], maxrate_kbps=o["maxrate_kbps"],
+                                audio_mode="none", container="mkv")
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+                    _, err = await proc.communicate()
+                except Exception as e:               # noqa: BLE001
+                    proc, err = None, str(e).encode()
+                ok = (proc is not None and proc.returncode == 0
+                      and out.exists() and out.stat().st_size > 0)
+                if ok:
+                    p.path, p.size = str(out), out.stat().st_size
+                    p.ready, p.status, p.out_time = True, "ready", p.duration
+                    p.speed = p.fps = 0.0
+                    self.stats["local_parts"] += 1
+                    logger.info(f"🏠 part {p.idx} locally encoded (rescue) — {p.size / 1048576:.0f}MB")
+                else:
+                    logger.warning(f"🏠 local rescue part {p.idx} failed: "
+                                   f"{err.decode(errors='ignore')[-300:]}")
+                    if p.rescued >= 2:                # දෙපාරක්ම fail → ආයෙ උත්සාහ නෑ (worker එකක් එනකම්)
+                        p.status = "held"
+                    else:
+                        p.status = "waiting"
+                    p.last_change = p.last_try = time.monotonic()
+
+        await asyncio.gather(*[one(p) for p in parts], return_exceptions=True)
+
     # ── monitor + idle-runner scheduler ──
     def _apply(self, p: Part, txt: str):
         if p.ready:
@@ -918,9 +1017,10 @@ class DistRun:
             # every release used by this job, not only the latest assigned account.
             order = [p.acct] + [x for x in sorted(self.used) if x != p.acct]
             for ai in order:
-                try:
-                    await self._g(ai).download(self.tag, f"encoded_part_{p.idx}.mkv", self.work)
-                    if path.exists() and path.stat().st_size > 0:
+                try:                       # chunked asset එකක් නම් ඒක concat කරලා දෙනවා
+                    got = await self._g(ai).fetch(self.tag, f"encoded_part_{p.idx}.mkv", self.work)
+                    if got and Path(got).exists() and Path(got).stat().st_size > 0:
+                        path = Path(got)
                         break
                 except Exception as e:
                     err = e
@@ -1106,12 +1206,23 @@ class DistRun:
 
             await self._schedule_held()
 
+            # 🏠 Idle runner එකක් නැතිව part එකක් දිගටම held → main runner එකේම encode කරනවා.
+            # (රැඳී ඉන්නවට වඩා job එක ඉවර කරන එක හොඳයි.)
+            if config.DIST_LOCAL_RESCUE:
+                stuck = [p for p in s.parts
+                         if not p.ready and not p.fetching and p.status == "held"
+                         and p.rescued < 2 and now - p.last_change > config.DIST_RESCUE_AFTER]
+                if stuck:
+                    for p in stuck:
+                        p.last_change = now            # ආයෙ එකම ටික rescue නොකරන්න
+                    self.tasks.append(asyncio.create_task(self._local_encode(stuck)))
+
             # Surface fetch errors promptly; held parts deliberately stay in the
             # scheduler queue instead of being encoded by the main bot runner.
             for task in self.tasks:
                 if task.done() and not task.cancelled() and task.exception():
                     raise task.exception()
-            await asyncio.sleep(max(1.0, PROGRESS_UPDATE_INTERVAL))
+            await asyncio.sleep(max(0.7, min(2.0, PROGRESS_TICK * 2)))
 
     # ── merge ──
     async def _merge(self, audio_task):

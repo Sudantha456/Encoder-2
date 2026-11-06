@@ -49,6 +49,11 @@ class Lane:
     got: int = 0                                  # මේ lane එකෙන් download කළ bytes
     bad: int = 0                                  # දිගටම ආපු errors (සාර්ථක chunk එකකින් reset)
     on_flood: Optional[Callable[[int], None]] = None   # (seconds) → userbot pool එකට දැනුම් දෙන්න
+    # ── weighted scheduler (වේගවත් userbot එකට වැඩි chunks) ──
+    rate: float = 0.0                             # EWMA bytes/s (chunk success වලින්)
+    chunks: int = 0                               # සාර්ථක chunks ගණන
+    active: int = 0                               # දැන් in-flight requests
+    quota: int = 4                                # මේ lane එකට එකවර අවසර ඇති requests (rebalancer වෙනස් කරනවා)
 
 
 class FastDownloader:
@@ -222,14 +227,20 @@ class FastDownloader:
                              progress_callback: Optional[Callable] = None, max_retries: int = 8,
                              max_flood_wait: float = 30.0, workers_per_conn: Optional[int] = None) -> str:
         """
-        • Shared chunk queue — හැම lane එකක්ම queue එකෙන් chunk අරන් ඒ ඒ userbot ගේ connections හරහා ගන්නවා.
-        • Lane එකක FloodWait ආවොත්: chunk එක queue එකට ආපහු දානවා (වෙන lanes ගන්නවා), ඒ lane එක විතරක් නතර වෙලා ඉන්නවා.
-          FloodWait > max_flood_wait නම් ඒ lane එක මේ job එකට dead (userbot එක cooldown).
-        • Lane එකක් fail වුණාට අනිත් ඒවා ඉවර කරනවා. ඔක්කොම dead වුණොත් විතරයි error.
+        Userbots කිහිපයක් එකවර (lanes) — **smart, weighted** chunk scheduler:
+
+        • Shared chunk queue. එක chunk එකක් එකවර **එක** තැනකින් විතරයි download වෙන්නේ —
+          in-flight / finished / queue යන තුනෙන් එකක තියෙන chunk එකක් ආයෙ queue එකට දාන්නේ නෑ
+          (පරණ hedge logic එකේ duplicate downloads වුණා → bandwidth නාස්ති).
+        • ඒ ඒ lane එකේ මැනගත්ත throughput (EWMA) අනුව quota එක 2s වලට වරක් අලුත් වෙනවා
+          → වේගවත් userbot එකට වැඩි chunks, මන්දගාමී එකට අඩුව (උපරිම speed).
+        • Hedge (end-game duplicate) දැන් adaptive: chunk එකකට යන සාමාන්‍ය වෙලාව × 2.5 ට වඩා
+          පරණ නම් විතරයි, ඒකත් queue එක හිස් වෙලා නම්. Timeout වුණොත් chunk එක queue එකට ආපහු
+          යනවා → වෙන lane එකක් ඉක්මනින් ගන්නවා.
+        • Lane එකක FloodWait: chunks වෙන lanes ගන්නවා; දිග FloodWait නම් ඒ lane එක dead.
         """
         wpc = workers_per_conn or DL_WORKERS_PER_CONN
         self._cancel_flags[download_id] = False
-        loop = asyncio.get_running_loop()
 
         # 1) pools (පොඩි stagger එකක් — එකවර connect කරද්දී flood වෙන එක අඩු කරන්න)
         async def start_lane(i: int, ln: Lane):
@@ -257,16 +268,29 @@ class FastDownloader:
         has_pwrite = hasattr(os, "pwrite")
         write_lock = asyncio.Lock()
 
+        n_chunks = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
         queue: asyncio.Queue = asyncio.Queue()
-        for off in range(0, total_size, CHUNK_SIZE):
-            queue.put_nowait(off)
-        remaining = [queue.qsize()]
+        queued: set = set()                        # queue එකේ ඉන්න offsets
+        inflight: Dict[int, list] = {}             # off → [started_at, copies]
+        finished: set = set()
         fails: Dict[int, int] = {}
+        remaining = [n_chunks]
         done_ev = asyncio.Event()
-        fatal: asyncio.Future = loop.create_future()
+        fatal: asyncio.Future = asyncio.get_running_loop().create_future()
         fatal.add_done_callback(lambda f: f.cancelled() or f.exception())   # 'never retrieved' warning වළක්වන්න
         downloaded = [0]
         last_update = [0.0]
+        chunk_time = [1.0]                         # EWMA: එක chunk එකකට යන තත්පර
+
+        def push(off: int):
+            """Queue එකට දාන්නේ තවම කිසිම තැනක නැති chunk එකක් විතරයි (duplicate නෑ)."""
+            if off in finished or off in queued or off in inflight:
+                return
+            queued.add(off)
+            queue.put_nowait(off)
+
+        for off in range(0, total_size, CHUNK_SIZE):
+            push(off)
 
         def _fatal(exc: BaseException):
             if not fatal.done():
@@ -295,15 +319,22 @@ class FastDownloader:
             if all(l.dead for l in lanes):
                 _fatal(RuntimeError("සියලුම userbot lanes fail වුණා: " + why))
 
-        finished: set = set()
-        inflight: Dict[int, list] = {}            # off → [පටන් ගත් වෙලාව, එකවර requests ගණන]
+        tasks: list = []
+        per: Dict[str, int] = {}
 
         def pick_hedge() -> Optional[int]:
-            """End-game: queue හිස්, ඒත් chunks ටිකක් slow connections වල හිරවෙලා → නිදහස් workers ඒවා නැවත ඉල්ලනවා."""
+            """Queue හිස් + chunk එකක් දිගටම inflight → වෙන connection එකකින් ආයෙ ඉල්ලනවා."""
             now = time.monotonic()
-            c = [(t0, off) for off, (t0, n) in inflight.items()
-                 if off not in finished and n < HEDGE_MAX and now - t0 >= HEDGE_AFTER]
-            return min(c)[1] if c else None
+            limit = max(5.0, chunk_time[0] * 2.5)
+            best = None
+            for off, (t0, copies) in inflight.items():
+                if off in finished or copies >= HEDGE_MAX:
+                    continue
+                if now - t0 < limit:
+                    continue
+                if best is None or t0 < inflight[best][0]:
+                    best = off
+            return best
 
         async def worker(ln: Lane, widx: int):
             while not done_ev.is_set() and not ln.dead:
@@ -313,41 +344,58 @@ class FastDownloader:
                 if wait > 0:                                   # මේ lane එක FloodWait pause එකක — chunk අල්ලන්නේ නෑ
                     await asyncio.sleep(min(wait, 1.0))
                     continue
+                if ln.active >= ln.quota:                      # weighted gate: slow lane එකට වැඩි requests දෙන්නේ නෑ
+                    await asyncio.sleep(0.02)
+                    continue
                 hedge = False
                 try:
                     off = queue.get_nowait()
+                    queued.discard(off)
                 except asyncio.QueueEmpty:
                     off = pick_hedge()
                     if off is None:
-                        await asyncio.sleep(0.1)
+                        await asyncio.sleep(0.05)
                         continue
                     hedge = True
                 if off in finished:
                     continue
                 rec = inflight.setdefault(off, [time.monotonic(), 0])
                 rec[1] += 1
+                ln.active += 1
+                t_send = time.monotonic()
+                want = min(CHUNK_SIZE, total_size - off)
+                requeue, slow = False, False
                 try:
-                    req = GetFileRequest(location=ln.location, offset=off, limit=CHUNK_SIZE)
-                    r = await asyncio.wait_for(ln.pool.send(req, widx + (1 if hedge else 0)), timeout=CHUNK_TIMEOUT)
+                    req = GetFileRequest(location=ln.location, offset=off, limit=want)
+                    r = await asyncio.wait_for(ln.pool.send(req, widx + (1 if hedge else 0)),
+                                               timeout=CHUNK_TIMEOUT)
                     data = getattr(r, "bytes", None)
                     if data is None:
                         raise RuntimeError(f"Unexpected response: {type(r).__name__}")
                     ln.bad = 0
-                    if off not in finished:                    # පළමුව ඉවර වූ copy එක විතරක් ගණන් වෙනවා
-                        finished.add(off)
+                    if off not in finished:
+                        finished.add(off)                      # පළමුව ඉවර වූ copy එක විතරයි ගණන් වෙන්නේ
                         await write_at(off, data)
                         ln.got += len(data)
+                        ln.chunks += 1
+                        # per-lane throughput (EWMA) → rebalancer මේකෙන් quota හදනවා
+                        dt = max(time.monotonic() - t_send, 0.01)
+                        inst = len(data) / dt
+                        ln.rate = inst if ln.chunks <= 2 else (0.7 * ln.rate + 0.3 * inst)
+                        chunk_time[0] = dt if ln.chunks <= 2 else (0.8 * chunk_time[0] + 0.2 * dt)
                         _prog(len(data))
                         remaining[0] -= 1
                         if remaining[0] <= 0:
                             done_ev.set()
+                    if len(data) < want and off + len(data) < total_size:
+                        raise RuntimeError(f"short read {len(data)}/{want}")
                 except asyncio.CancelledError:
                     if not hedge and off not in finished:
-                        queue.put_nowait(off)
+                        requeue = True
                     raise
                 except FloodWaitError as e:
                     if not hedge and off not in finished:
-                        queue.put_nowait(off)                  # chunk එක වෙන lane එකකට
+                        requeue = True
                     if ln.on_flood:
                         ln.on_flood(e.seconds)
                     if e.seconds > max_flood_wait and any(l is not ln and not l.dead for l in lanes):
@@ -356,16 +404,17 @@ class FastDownloader:
                     ln.flood_until = max(ln.flood_until, time.monotonic() + e.seconds + random.uniform(0.5, 1.5))
                     logger.warning(f"[{ln.name}] FloodWait {e.seconds}s — lane paused, others continue")
                 except Exception as e:
-                    if not hedge and off not in finished:
-                        queue.put_nowait(off)
                     if hedge:
                         continue                               # hedge copy එක fail වුණාට කමක් නෑ (මුල් එක තාම තියෙනවා)
+                    if off not in finished:
+                        requeue = True
                     n = fails[off] = fails.get(off, 0) + 1
                     msg = str(e).lower()
                     if "wait of" in msg:
                         m = re.search(r'wait of (\d+)', msg)
                         ln.flood_until = max(ln.flood_until, time.monotonic() + (int(m.group(1)) if m else 12) + 1)
                         continue
+                    slow = True
                     if n >= max_retries:
                         _fatal(RuntimeError(f"Chunk {off} {n}× fail ({e!r})"))
                         return
@@ -375,18 +424,44 @@ class FastDownloader:
                         return
                     await asyncio.sleep(min(2 ** (n - 1), 8) * BACKOFF_SCALE)
                 finally:
+                    ln.active -= 1
+                    if slow:
+                        ln.rate = ln.rate * 0.7
                     rec[1] -= 1
                     if rec[1] <= 0:
                         inflight.pop(off, None)
+                    if requeue:
+                        push(off)
 
         # workers lanes අතර interleave (A,B,C,A,B,C…) — නැත්නම් මුල් lane එකේ workers ම chunks ඔක්කොම අල්ලගන්නවා
-        per = {ln.name: max(1, len(ln.pool.senders)) * wpc for ln in live}
+        for ln in live:
+            per[ln.name] = max(1, len(ln.pool.senders)) * wpc
         order = [(ln, i) for i in range(max(per.values())) for ln in live if i < per[ln.name]]
         tasks = [asyncio.create_task(worker(ln, i)) for ln, i in order]
+        for ln in live:
+            ln.quota = max(2, len(tasks) // max(len(live), 1))
+
+        async def rebalance():
+            """2s වලට වරක්: මනින ලද speed එකට අනුව lane quota (වේගවත් එකට වැඩි requests)."""
+            while not done_ev.is_set():
+                await asyncio.sleep(2.0)
+                cur = [l for l in lanes if not l.dead]
+                if not cur:
+                    return
+                known = [l.rate for l in cur if l.chunks >= 6 and l.rate > 0]
+                base = (sum(known) / len(known)) if known else 0.0
+                vals = {id(l): (l.rate if (l.chunks >= 6 and l.rate > 0) else base) for l in cur}
+                tot = sum(vals.values())
+                n = len(tasks)
+                for l in cur:
+                    share = (vals[id(l)] / tot) if tot > 0 else (1.0 / len(cur))
+                    l.quota = max(2, min(per.get(l.name, n), max(2, int(round(n * share)))))
+
         done_task = asyncio.create_task(done_ev.wait())
+        bal_task = asyncio.create_task(rebalance())
         try:
             while True:
-                finished, _ = await asyncio.wait({done_task, fatal}, return_when=asyncio.FIRST_COMPLETED, timeout=1.0)
+                done, _ = await asyncio.wait({done_task, fatal}, return_when=asyncio.FIRST_COMPLETED, timeout=1.0)
                 if self.is_cancelled(download_id):
                     raise asyncio.CancelledError("Cancelled")
                 if fatal.done():
@@ -398,16 +473,18 @@ class FastDownloader:
                     break
             if downloaded[0] < total_size:
                 raise RuntimeError(f"Incomplete download {downloaded[0]}/{total_size}")
-            logger.info("lane summary: " + ", ".join(f"{l.name}={l.got / 1048576:.0f}MB" for l in lanes))
+            logger.info("lane summary: " + ", ".join(
+                f"{l.name}={l.got / 1048576:.0f}MB@{l.rate / 1048576:.1f}MB/s(q{l.quota})" for l in lanes))
             return save_path
         except BaseException:
             self.force_delete_file(save_path)
             raise
         finally:
             done_task.cancel()
+            bal_task.cancel()
             for t in tasks:
                 t.cancel()
-            await asyncio.gather(done_task, *tasks, return_exceptions=True)
+            await asyncio.gather(done_task, bal_task, *tasks, return_exceptions=True)
             os.close(fd)
             await asyncio.gather(*[ln.pool.close() for ln in lanes if ln.pool], return_exceptions=True)
 

@@ -15,7 +15,12 @@ SESSION_NAME = os.getenv("SESSION_NAME", "encoder_bot")
 ALLOWED_USERS = [int(x) for x in os.getenv("ALLOWED_USERS", "").split(",") if x.strip()]
 
 # ── 🔁 Progress update interval (තත්පර) — මෙතනින් වෙනස් කරන්න ──
-PROGRESS_UPDATE_INTERVAL = float(os.getenv("PROGRESS_UPDATE_INTERVAL", "3"))
+# PROGRESS_UPDATE_INTERVAL = panel එක render කරන තත්පර ගණන (state කියවලා text හදන rate)
+PROGRESS_UPDATE_INTERVAL = float(os.getenv("PROGRESS_UPDATE_INTERVAL", "2"))
+# Progress bar එක smooth වෙන්න state එක මේ තරම් ඉක්මනින් කියවනවා (Telegram edit යන්නේ
+# PROGRESS_MIN_EDIT_GAP ට වඩා ඉක්මනින් නෑ → FloodWait නෑ, නමුත් හැම වෙනසක්ම පේනවා)
+PROGRESS_TICK = float(os.getenv("PROGRESS_TICK", "0.5"))
+PROGRESS_MIN_EDIT_GAP = float(os.getenv("PROGRESS_MIN_EDIT_GAP", "1.2"))
 
 # ── Paths ─────────────────────────────────────────────────
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
@@ -52,9 +57,11 @@ SIZE_GUARD_RATIO = float(os.getenv("SIZE_GUARD_RATIO", "0.7"))   # 0.7 = source 
 MIN_GUARD_KBPS = 120
 
 # ── 🚀 Speed: connections × workers (වැඩි = වේගවත්, නමුත් FloodWait වැඩි වෙන්න පුළුවන්) ──
-DL_CONNECTIONS = int(os.getenv("DL_CONNECTIONS", "6"))
+# Telegram එකේ speed limit එක connection එකකට වෙන්නේ → connections = ප්‍රධාන lever එක.
+# x6 userbot × x8 connections = 48 parallel requests (≈ 3–5× වේගවත් පරණ 6×4 එකට වඩා).
+DL_CONNECTIONS = int(os.getenv("DL_CONNECTIONS", "8"))
 DL_WORKERS_PER_CONN = int(os.getenv("DL_WORKERS_PER_CONN", "4"))
-UL_CONNECTIONS = int(os.getenv("UL_CONNECTIONS", "6"))
+UL_CONNECTIONS = int(os.getenv("UL_CONNECTIONS", "8"))
 UL_WORKERS_PER_CONN = int(os.getenv("UL_WORKERS_PER_CONN", "4"))
 
 # ── 🌐 Distributed encoding (GitHub Actions workers) ──
@@ -78,15 +85,24 @@ STANDBY_BASE = 100                                                 # standby wor
 DIST_STALE_SECONDS = int(os.getenv("DIST_STALE_SECONDS", "180"))   # runner progress නතර වුණොත් part එක held queue එකට
 DIST_PROGRESS_CHAT = os.getenv("DIST_PROGRESS_CHAT", "")           # හිස් = user ගේ chat එකම (messages පස්සේ delete වෙනවා)
 
+# 🏠 Rescue: worker එකක් part එකක් ඉවර නොකර / raw part එක upload නොවී ඉතුරු වුණොත්
+#    main runner එකේම ඒ කොටස encode කරනවා → job එක fail වෙන්නේ නෑ.
+DIST_LOCAL_RESCUE = os.getenv("DIST_LOCAL_RESCUE", "1") == "1"
+DIST_RESCUE_AFTER = int(os.getenv("DIST_RESCUE_AFTER", "180"))      # part එක held වෙලා මෙච්චර වෙලාවකින් local encode
+
 # ── 📋 Queue ──
 QUEUE_MAX = int(os.getenv("QUEUE_MAX", "20"))      # එකවර queue එකේ තියෙන්න පුළුවන් උපරිම videos
 QUEUE_RES_CHOICES = ["ask", "smart"] + [str(r) for r in RESOLUTIONS]   # auto-queue: "ask" = බොත්තම්, "smart" = source එකට අඩුවෙන් තියෙන හොඳම resolution එක
 
 MAX_UPLOAD_BYTES = 2000 * 1024 * 1024    # bot upload limit ≈ 2GB
 
-# Preview එකට metadata probe කරන bytes (head + tail)
-PROBE_HEAD_CHUNKS = 6      # 6 × 512KB = 3MB
-PROBE_TAIL_CHUNKS = 12     # 12 × 512KB = 6MB
+# ── ⚡ Preview: metadata probe (head + tail chunks, multi-connection, parallel) ──
+PROBE_HEAD_CHUNKS = 6      # 6 × 512KB = 3MB  (faststart mp4 → moov මුල)
+PROBE_TAIL_CHUNKS = 12     # 12 × 512KB = 6MB (moov අගට තියෙන ඒවට)
+PROBE_CONNECTIONS = int(os.getenv("PROBE_CONNECTIONS", "10"))     # probe එකට parallel connections
+PROBE_TIMEOUT = float(os.getenv("PROBE_TIMEOUT", "20"))           # තත්පර — ඉවර නොවුණොත් Telegram attrs වලින්ම preview
+PROBE_CACHE = os.getenv("PROBE_CACHE", "1") == "1"                # එකම video එක ආයෙ එව්වොත් instant (cached metadata)
+PROBE_CACHE_FILE = os.getenv("PROBE_CACHE_FILE", "media_cache.json")
 
 
 # ═════════════════ 👤 Userbot relay (private channel හරහා වේගවත් download/upload) ═════════════════

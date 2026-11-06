@@ -22,14 +22,16 @@ from telethon.errors import MessageNotModifiedError, FloodWaitError, QueryIdInva
 
 import config
 from config import (API_ID, API_HASH, BOT_TOKEN, SESSION_NAME, ALLOWED_USERS,
-                    PROGRESS_UPDATE_INTERVAL, DOWNLOAD_DIR, PRESETS, CODECS,
+                    PROGRESS_UPDATE_INTERVAL, PROGRESS_TICK, PROGRESS_MIN_EDIT_GAP,
+                    PROBE_TIMEOUT, DOWNLOAD_DIR, PRESETS, CODECS,
                     PRESET_INFO, CRF, AUDIO_BITRATE, MAX_UPLOAD_BYTES,
                     WORKER_CHOICES, QUEUE_MAX, QUEUE_RES_CHOICES)
 from fast_downloader import get_downloader, init_download_engine
 from fast_uploader import get_uploader
 from userbots import Relay
 from media import (VideoMeta, telegram_meta, probe_remote, ffprobe, apply_probe,
-                   offered_targets, estimate_size, render_preview, short_side, guard_kbps)
+                   offered_targets, estimate_size, render_preview, short_side, guard_kbps,
+                   is_source_res, cache_get as meta_cache_get, apply_cached as meta_apply_cached)
 from settings_store import SettingsStore
 from transcoder import EncState, transcode
 import dist
@@ -47,7 +49,8 @@ relay = Relay()                         # userbots ↔ private channel
 queue: deque = deque()                  # බලාගෙන ඉන්න jobs (FIFO)
 current_job = [None]                    # දැන් run වෙන job එක
 queue_task: Optional[asyncio.Task] = None
-probe_sem = asyncio.Semaphore(3)        # videos 20ක් එකවර දැම්මොත් probe flood වෙන එක වළක්වන්න
+probe_sem = asyncio.Semaphore(2)        # videos 20ක් එකවර දැම්මොත් probe flood වෙන එක වළක්වන්න
+bg_tasks: set = set()                   # background tasks (GC නොවෙන්න reference තියාගන්න)
 
 
 @dataclass
@@ -84,39 +87,112 @@ def safe_stem(name: str) -> str:
 
 
 class Live:
-    """Message එක throttle කරලා edit කරන helper (FloodWait / same-text safe)."""
+    """
+    Progress message එක edit කරන helper — **smooth** සහ FloodWait-safe.
 
-    def __init__(self, msg, buttons=None):
+    පරණ එකේ අවුල: edit එකක් යන අතරේ (ටිකක් slow) එන updates ඔක්කොම drop වුණා →
+    progress එක "හිර වෙලා" වගේ පේනවා, ඊට පස්සේ එකපාරට පනිනවා.
+    දැන්:
+      • set() කොච්චර වේගයෙන් call කළත් edit එක යන්නේ PROGRESS_MIN_EDIT_GAP (1.2s) ට වඩා ඉක්මනින් නෑ
+      • අතරමැද ඒවා coalesce — හැම වෙලාවෙම edit වෙන්නේ **අලුත්ම state** එක
+      • edit එක යන අතරේ අලුත් state එකක් ආවොත් ඒකට පස්සේ තව edit එකක් (trailing update නැති වෙන්නේ නෑ)
+    """
+
+    def __init__(self, msg, buttons=None, gap: Optional[float] = None):
         self.msg, self.buttons = msg, buttons
-        self._busy, self._last = False, None
+        self.gap = PROGRESS_MIN_EDIT_GAP if gap is None else gap
+        self._latest = None
+        self._shown = None
+        self._shown_buttons = buttons
+        self._force = False
+        self._task: Optional[asyncio.Task] = None
+        self._last_edit = 0.0
+        self._closed = False
+        self._flood_until = 0.0
 
+    # ── public ──
     async def set(self, text: str, force: bool = False):
-        if text == self._last or (self._busy and not force):
+        if self._closed:
             return
-        self._busy = True
-        try:
-            await self.msg.edit(text, buttons=self.buttons)
-            self._last = text
-        except MessageNotModifiedError:
-            self._last = text
-        except FloodWaitError as e:
-            logger.warning(f"edit FloodWait {e.seconds}s — skipped")
-        except Exception as e:
-            logger.warning(f"edit failed: {e}")
-        finally:
-            self._busy = False
+        self._latest = text
+        if force:
+            self._force = True
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._run())
+
+    async def flush(self, timeout: float = 8.0):
+        """අන්තිම state එකත් edit වෙනකම් ඉන්නවා (job එක ඉවර වෙද්දී)."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if self._task is None or self._task.done():
+                if self._latest == self._shown and self.buttons is self._shown_buttons:
+                    return
+            await asyncio.sleep(0.1)
+
+    def close(self):
+        self._closed = True
+        if self._task and not self._task.done():
+            self._task.cancel()
+
+    # ── internals ──
+    def _dirty(self) -> bool:
+        return (self._latest is not None
+                and (self._force or self._latest != self._shown
+                     or self.buttons is not self._shown_buttons))
+
+    async def _run(self):
+        while not self._closed and self._dirty():
+            now = time.monotonic()
+            wait = max(self.gap - (now - self._last_edit), self._flood_until - now)
+            if wait > 0:
+                await asyncio.sleep(min(wait, self.gap))
+                continue
+            text = self._latest
+            self._force = False
+            try:
+                await self.msg.edit(text, buttons=self.buttons)
+            except MessageNotModifiedError:
+                pass
+            except FloodWaitError as e:
+                logger.warning(f"edit FloodWait {e.seconds}s — ටිකක් ඉඳලා ආයෙ")
+                self._flood_until = time.monotonic() + min(e.seconds, 15)
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"edit failed: {e}")
+            self._shown = text
+            self._shown_buttons = self.buttons
+            self._last_edit = time.monotonic()
 
 
 # ───────────────────────── preview / settings panels ─────────────────────────
 def preview_buttons(job: Job):
+    """Video එකේ තියෙන **සියලුම** qualities බොත්තම් විදිහට (ලොකුම එක මුලින්)."""
     cfg = store.get(job.user_id)
-    row = []
+    btns = []
     for t in offered_targets(job.meta):
         est = estimate_size(job.meta, t, cfg["preset"], cfg["codec"])
         label = f"{t}p ≈{human_size_short(est)}" if est else f"{t}p"
-        row.append(Button.inline(label, cb("res", job.id, t)))
-    return [row, [Button.inline("⚙️ Settings", cb("cfg", job.id)),
-                  Button.inline("❌ Cancel", cb("x", job.id))]]
+        if is_source_res(job.meta, t):
+            label = "🎯 " + label                    # source එකේම resolution එක
+        btns.append(Button.inline(label, cb("res", job.id, t)))
+    rows = [btns[i:i + 3] for i in range(0, len(btns), 3)] or [[]]
+    rows.append([Button.inline("⚙️ Settings", cb("cfg", job.id)),
+                 Button.inline("❌ Cancel", cb("x", job.id))])
+    return rows
+
+
+def pick_target(meta: VideoMeta, qres: str) -> int:
+    """Auto-queue: settings එකේ resolution එකට ළඟම එක (source එකට වඩා ලොකු නෑ)."""
+    opts = offered_targets(meta)
+    if qres == "smart" or not opts:
+        return max(opts) if opts else 720
+    try:
+        want = int(qres)
+    except (TypeError, ValueError):
+        return max(opts)
+    return want if want in opts else min(opts, key=lambda t: abs(t - want))
 
 
 async def show_preview(job: Job):
@@ -386,6 +462,8 @@ async def cancel_waiting(job: Job):
     with contextlib.suppress(ValueError):
         queue.remove(job)
     jobs.pop(job.id, None)
+    if job.live:                      # queue එකේ progress edits නවත්තලා "Cancelled" එක ලියනවා
+        job.live.close()
     with contextlib.suppress(Exception):
         await job.status.edit("❌ <b>Cancelled</b>", buttons=None)
     await refresh_positions()
@@ -449,35 +527,88 @@ def is_video(e) -> bool:
     return (m.document.mime_type or "").startswith("video/") or bool(m.video)
 
 
+def _spawn(coro):
+    """Background task එකක් — reference තියාගෙන (GC නොවෙන්න)."""
+    t = asyncio.create_task(coro)
+    bg_tasks.add(t)
+    t.add_done_callback(bg_tasks.discard)
+    return t
+
+
+async def _preview_probe(job: Job) -> bool:
+    """Metadata probe (multi-connection, cached) — preview එක block නොකර background එකේ."""
+    workdir = Path(DOWNLOAD_DIR) / ("probe_" + job.id)
+    workdir.mkdir(parents=True, exist_ok=True)
+    try:
+        async with probe_sem:
+            return await probe_remote(client, job.message, job.meta, str(workdir),
+                                      timeout=PROBE_TIMEOUT)
+    except Exception as e:                      # noqa: BLE001
+        logger.warning(f"probe failed: {e!r}")
+        return False
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+async def _refresh_preview(job: Job, probe: asyncio.Task):
+    """Probe ඉවර වුණාම preview එක (codec/audio/qualities) අලුත් කරනවා."""
+    try:
+        await asyncio.wait_for(asyncio.shield(probe), timeout=PROBE_TIMEOUT + 15)
+    except Exception:                           # noqa: BLE001
+        pass
+    if job.started or jobs.get(job.id) is not job:
+        return
+    try:
+        await show_preview(job)
+    except MessageNotModifiedError:
+        pass
+    except Exception as e:                      # noqa: BLE001
+        logger.debug(f"preview refresh failed: {e!r}")
+
+
 @client.on(events.NewMessage(incoming=True, func=is_video))
 async def on_video(event):
     if not allowed(event.sender_id):
         return
     msg = event.message
-    status = await event.reply("🔎 <b>Analyzing video…</b>")
+    meta = telegram_meta(msg)
+
+    # ⚡ Cache: එකම video එක කලින් ආවා නම් network එකට යන්නේ නෑ (instant)
+    cached = meta_cache_get(msg)
+    if cached:
+        meta_apply_cached(meta, cached)
+
+    cfg = store.get(event.sender_id)
+    ask = cfg["qres"] == "ask"
+    opts = offered_targets(meta)
+    # Telegram attributes වලින් resolution දැනටමත් තියෙනවා → preview එක **පළමු message එකෙන්ම**
+    # (කලින් "Analyzing…" එකක් දාලා edit කළා → extra roundtrip)
+    direct = ask and len(opts) > 1
     job = Job(id=uuid.uuid4().hex[:8], user_id=event.sender_id, chat_id=event.chat_id,
-              message=msg, meta=telegram_meta(msg), status=status)
+              message=msg, meta=meta, status=None)
+    text = render_preview(meta, cfg["preset"], cfg["codec"]) if direct else "🔎 <b>Analyzing video…</b>"
+    job.status = await event.reply(text, buttons=preview_buttons(job) if direct else None)
     jobs[job.id] = job
 
-    workdir = Path(DOWNLOAD_DIR) / ("probe_" + job.id)
-    workdir.mkdir(parents=True, exist_ok=True)
-    try:
-        async with probe_sem:
-            await probe_remote(client, msg, job.meta, str(workdir))
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+    probe = _spawn(_preview_probe(job)) if not cached else None
 
-    qres = store.get(job.user_id)["qres"]
-    if qres != "ask":                       # auto-queue: source එකට වඩා ලොකු resolution නම් ළඟම එක
+    if not ask:                                 # auto-queue: probe එක එනකම් ඉන්නේ නෑ
+        await enqueue(job, pick_target(meta, cfg["qres"]))
+        return
+
+    if not short_side(meta) and probe:          # dimensions නෑ → probe එක ඉවර වෙනකම් ඉන්නවා
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(asyncio.shield(probe), timeout=PROBE_TIMEOUT + 10)
         opts = offered_targets(job.meta)
-        if qres == "smart":                 # source එකට අඩුවෙන් තියෙන හොඳම (ලොකුම) resolution එක
-            target = max(opts)
-        else:
-            want = int(qres)
-            target = want if want in opts else min(opts, key=lambda t: abs(t - want))
-        await enqueue(job, target)
-    else:
-        await show_preview(job)
+
+    if len(opts) <= 1:                          # quality එකක් විතරයි → බොත්තම් නැතුව ඉදිරියට
+        await enqueue(job, opts[0])
+        return
+
+    if not direct:
+        await show_preview(job)                 # ⚡ instant preview (probe නැතුව)
+    if probe is not None:
+        _spawn(_refresh_preview(job, probe))
 
 
 # ───────────────────────── callbacks ─────────────────────────
@@ -580,6 +711,7 @@ async def run_job(job: Job, height: int):
     phase = ["dl"]
     t_start = time.monotonic()
     stats = {}
+    xfer: Optional[asyncio.Task] = None
     dl, ul = get_downloader(), get_uploader()
     ch_ids, ch_out = [], [None, None]       # channel messages (cleanup): bot ගේ ids, [userbot msg, userbot]
 
@@ -597,6 +729,17 @@ async def run_job(job: Job, height: int):
         # 1) DOWNLOAD ─────────────────────────────
         tr = SpeedTracker(total=meta.size)
         await live.set(render_transfer("dl", tr, meta.name), force=True)
+        # smooth progress: state එක PROGRESS_TICK වලට කියවලා render (edit එක Live එකෙන් throttle)
+        view = {"kind": "dl", "tr": tr, "name": meta.name}
+
+        async def transfer_ticker():
+            # job එක ඉවර වෙනකම් ජීවත් වෙනවා (dl → probe → enc → ul; upload වෙද්දීත් smooth)
+            while True:
+                if phase[0] in ("dl", "ul"):
+                    await live.set(render_transfer(view["kind"], view["tr"], view["name"]))
+                await asyncio.sleep(PROGRESS_TICK)
+
+        xfer = asyncio.create_task(transfer_ticker())
 
         async def dl_cb(cur, tot):
             if phase[0] != "dl":
@@ -627,6 +770,7 @@ async def run_job(job: Job, height: int):
                 await live.set("⚠️ Userbot download fail → bot එකෙන් download කරනවා…", force=True)
                 src.unlink(missing_ok=True)
                 tr = SpeedTracker(total=meta.size)
+                view.update(kind="dl", tr=tr, name=meta.name)
                 use_relay = False
                 stats.pop("via", None)
                 await dl.download(client, job.message, str(src), job.id, dl_cb)
@@ -666,7 +810,7 @@ async def run_job(job: Job, height: int):
             async def dist_ticker():
                 while True:
                     await live.set(render_dist(dst_state, meta.name, height, preset, codec))
-                    await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
+                    await asyncio.sleep(PROGRESS_TICK)
 
             dticker = asyncio.create_task(dist_ticker())
             try:
@@ -701,7 +845,7 @@ async def run_job(job: Job, height: int):
             async def enc_ticker():
                 while True:
                     await live.set(render_encode(st, meta.name, height, preset, codec))
-                    await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
+                    await asyncio.sleep(PROGRESS_TICK)
 
             ticker = asyncio.create_task(enc_ticker())
             try:
@@ -726,6 +870,7 @@ async def run_job(job: Job, height: int):
         # 4) UPLOAD ───────────────────────────────
         phase[0] = "ul"
         tr2 = SpeedTracker(total=out_size)
+        view.update(kind="ul", tr=tr2, name=dst.name)
         await live.set(render_transfer("ul", tr2, dst.name), force=True)
 
         async def ul_cb(cur, tot):
@@ -754,6 +899,7 @@ async def run_job(job: Job, height: int):
                 logger.warning(f"relay upload/deliver failed ({e!r}) → bot upload")
                 await live.set("⚠️ Userbot upload fail → bot එකෙන් upload කරනවා…", force=True)
                 tr2 = SpeedTracker(total=out_size)
+                view.update(kind="ul", tr=tr2, name=dst.name)
                 sent = None
         if sent is None:
             sent = await ul.upload_file(client, job.chat_id, str(dst), job.id, ul_cb)
@@ -761,6 +907,11 @@ async def run_job(job: Job, height: int):
             with contextlib.suppress(Exception):
                 await client.edit_message(sent, caption)
         phase[0] = "done"
+        if xfer:
+            xfer.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await xfer
+            xfer = None
 
         saved = (1 - out_size / meta.size) * 100 if meta.size else 0
         live.buttons = None
@@ -792,6 +943,14 @@ async def run_job(job: Job, height: int):
         live.buttons = None
         await live.set(f"⚠️ <b>Failed</b>\n<code>{esc(str(e)[-900:])}</code>", force=True)
     finally:
+        if xfer and not xfer.done():
+            xfer.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await xfer
+        # අන්තිම progress එක (✅ Done / ❌ Cancel) edit වෙනකම් ඉන්නවා → message එක හිර වෙන්නේ නෑ
+        with contextlib.suppress(Exception):
+            await live.flush(timeout=10)
+        live.close()
         if ch_ids or ch_out[0] is not None:
             with contextlib.suppress(Exception):
                 await relay.cleanup(client, ch_ids, ch_out[0], ch_out[1])
