@@ -5,6 +5,7 @@ fast_downloader.py — Telethon MULTI-CONNECTION parallel downloader
 • 1MB chunks, file descriptor එක එක පාරක් open (pwrite)
 • FloodWait → හැම worker එකම pause; fail වුණොත් native download එකට fallback
 """
+import contextlib
 import os
 import time
 import logging
@@ -33,6 +34,10 @@ HEDGE_AFTER = 3.0                                          # end-game: chunk එ
 HEDGE_MAX = 3                                              # එකම chunk එකට උපරිම එකවර requests
 BACKOFF_SCALE = 1.0                                        # retry backoff (tests වලදී අඩු කරන්න)
 SMALL_FILE = 4 * 1024 * 1024                               # මීට කුඩා නම් native
+
+# ── 🚑 Stall protection: bytes එකක්වත් එන්නේ නැතිව හිර වුණොත් හැදෙන්න ඕනේ (100% වගේ පෙන්වා ඉන්න බෑ) ──
+STALL_WARN = float(os.getenv("DL_STALL_WARN", "45"))       # මෙච්චර වෙලාවක් progress නැත්නම් flood clears + retry
+STALL_FAIL = float(os.getenv("DL_STALL_FAIL", "150"))      # මෙච්චර වෙලාවක් නම් download එක abort (fallback)
 
 
 @dataclass
@@ -136,12 +141,14 @@ class FastDownloader:
 
         downloaded = 0
         last_update = [0.0]
+        last_prog = [time.monotonic()]      # stall watchdog
         flood_until = [0.0]
 
         def _prog(n: int):
             nonlocal downloaded
             downloaded += n
             now = time.monotonic()
+            last_prog[0] = now
             if now - last_update[0] >= PROGRESS_UPDATE_INTERVAL or downloaded >= total_size:
                 last_update[0] = now
                 if progress_callback:
@@ -169,6 +176,9 @@ class FastDownloader:
                     data = getattr(res, "bytes", None)
                     if data is None:
                         raise RuntimeError(f"Unexpected response: {type(res).__name__}")
+                    want = min(CHUNK_SIZE, total_size - off)
+                    if not data or (len(data) < want and off + len(data) < total_size):
+                        raise RuntimeError(f"bad chunk ({len(data) or 0}/{want})")
                     await write_at(off, data)
                     _prog(len(data))
                     return
@@ -207,8 +217,25 @@ class FastDownloader:
 
         n_workers = min(len(pool.senders) * DL_WORKERS_PER_CONN, queue.qsize())
         tasks = [asyncio.create_task(worker(i)) for i in range(n_workers)]
+
+        async def guard():
+            """bytes එකක්වත් එන්නේ නැතිව හිර වුණොත් (100% වගේ පෙන්වා ඉන්නේ නැතුව) abort කරනවා."""
+            while True:
+                await asyncio.sleep(5.0)
+                idle = time.monotonic() - last_prog[0]
+                if idle > STALL_WARN:
+                    flood_until[0] = 0.0                     # FloodWait park එක ඉවත්
+                if idle > STALL_FAIL:
+                    raise RuntimeError(f"download stalled {idle:.0f}s "
+                                       f"({downloaded / 1048576:.0f}/{total_size / 1048576:.0f}MB)")
+
+        main = asyncio.create_task(asyncio.gather(*tasks))
+        gtask = asyncio.create_task(guard())
         try:
-            await asyncio.gather(*tasks)
+            await asyncio.wait({main, gtask}, return_when=asyncio.FIRST_COMPLETED)
+            if gtask.done() and not gtask.cancelled() and gtask.exception():
+                raise gtask.exception()
+            await main
             if downloaded < total_size:
                 raise RuntimeError(f"Incomplete download {downloaded}/{total_size}")
             return save_path
@@ -218,6 +245,9 @@ class FastDownloader:
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
         finally:
+            gtask.cancel()
+            with contextlib.suppress(BaseException):
+                await gtask
             os.close(fd)
             await pool.close()
 
@@ -280,6 +310,8 @@ class FastDownloader:
         fatal.add_done_callback(lambda f: f.cancelled() or f.exception())   # 'never retrieved' warning වළක්වන්න
         downloaded = [0]
         last_update = [0.0]
+        last_prog = [time.monotonic()]             # අන්තිම bytes එක ආපු වෙලාව (stall watchdog)
+        warned = [False]
         chunk_time = [1.0]                         # EWMA: එක chunk එකකට යන තත්පර
 
         def push(off: int):
@@ -299,6 +331,8 @@ class FastDownloader:
         def _prog(n: int):
             downloaded[0] += n
             now = time.monotonic()
+            last_prog[0] = now
+            warned[0] = False
             if now - last_update[0] >= PROGRESS_UPDATE_INTERVAL or downloaded[0] >= total_size:
                 last_update[0] = now
                 if progress_callback:
@@ -372,6 +406,11 @@ class FastDownloader:
                     data = getattr(r, "bytes", None)
                     if data is None:
                         raise RuntimeError(f"Unexpected response: {type(r).__name__}")
+                    if not data:
+                        raise RuntimeError("empty chunk")
+                    if len(data) < want and off + len(data) < total_size:
+                        # අඩක් ආපු chunk එකක් — නැවත ඉල්ලන්න (missing bytes = corrupt file)
+                        raise RuntimeError(f"short read {len(data)}/{want}")
                     ln.bad = 0
                     if off not in finished:
                         finished.add(off)                      # පළමුව ඉවර වූ copy එක විතරයි ගණන් වෙන්නේ
@@ -387,8 +426,6 @@ class FastDownloader:
                         remaining[0] -= 1
                         if remaining[0] <= 0:
                             done_ev.set()
-                    if len(data) < want and off + len(data) < total_size:
-                        raise RuntimeError(f"short read {len(data)}/{want}")
                 except asyncio.CancelledError:
                     if not hedge and off not in finished:
                         requeue = True
@@ -398,7 +435,8 @@ class FastDownloader:
                         requeue = True
                     if ln.on_flood:
                         ln.on_flood(e.seconds)
-                    if e.seconds > max_flood_wait and any(l is not ln and not l.dead for l in lanes):
+                    if e.seconds > max_flood_wait:
+                        # දිග FloodWait = මේ lane එකෙන් වැඩක් නෑ. අනිත් ඒවත් dead නම් fatal → fallback.
                         lane_died(ln, f"FloodWait {e.seconds}s (> {max_flood_wait:.0f}s)")
                         return
                     ln.flood_until = max(ln.flood_until, time.monotonic() + e.seconds + random.uniform(0.5, 1.5))
@@ -428,7 +466,7 @@ class FastDownloader:
                     if slow:
                         ln.rate = ln.rate * 0.7
                     rec[1] -= 1
-                    if rec[1] <= 0:
+                    if inflight.get(off) is rec and rec[1] <= 0:   # (stall-reset වුණා නම් අලුත් rec එක ඉතුරු කරනවා)
                         inflight.pop(off, None)
                     if requeue:
                         push(off)
@@ -471,6 +509,23 @@ class FastDownloader:
                         raise t.exception()
                 if done_ev.is_set():
                     break
+
+                # 🚑 Stall watchdog — bytes එකක්වත් එන්නේ නැතිව හිර වුණොත්:
+                idle = time.monotonic() - last_prog[0]
+                if idle > STALL_FAIL:
+                    raise RuntimeError(
+                        f"download stalled {idle:.0f}s ({downloaded[0] / 1048576:.0f}/"
+                        f"{total_size / 1048576:.0f}MB, lanes dead: "
+                        f"{', '.join(l.name for l in lanes if l.dead) or '-'})")
+                if idle > STALL_WARN and not warned[0]:
+                    warned[0] = True
+                    logger.warning(f"⏸ no progress for {idle:.0f}s — flood waits clear කරලා stuck chunks retry")
+                    for l in lanes:
+                        l.flood_until = 0.0
+                        l.bad = 0
+                    for off in [o for o in list(inflight) if o not in finished]:
+                        inflight.pop(off, None)                 # අලුත් copy එකකට ඉඩ දෙන්න
+                        push(off)
             if downloaded[0] < total_size:
                 raise RuntimeError(f"Incomplete download {downloaded[0]}/{total_size}")
             logger.info("lane summary: " + ", ".join(

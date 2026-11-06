@@ -63,6 +63,13 @@ Worker එකට `ghassets.py` copy වෙන්නේ bot start වෙද්ද
 * Probe: head+tail chunks `PROBE_CONNECTIONS` (10) ක් හරහා **parallel** (sequential නෑ) + `PROBE_TIMEOUT` (20s).
 * එකම video එක ආයෙ එව්වොත් `media_cache.json` එකෙන් **network නැතුව**.
 
+### 4½. Stall protection (100% පෙන්වලා හිර වෙන එක)
+* Progress bar/dimension **extrapolate වෙන්නේ තත්පර 3ක් + ඉතුරු ඉඩෙන් 25% දක්වා විතරයි** → බොරු 100% නෑ.
+* තත්පර 6ක් data නැත්නම් `Speed: 0 B/s` + `⚠️ තත්පර N ක් දත්ත එන්නේ නෑ` පෙන්නනවා (පරණ වේගය පෙන්වන්නේ නෑ).
+* `DL_STALL_WARN` (45s): FloodWait parks clear කරලා stuck chunks ආයෙ requeue.
+* `DL_STALL_FAIL` (150s): download abort → userbot path නම් **bot download එකට auto fallback**, bot path නම් native download.
+* අඩක් ආපු (truncated) chunk එකක් accept කරන්නේ නෑ → 0-byte "holes" නෑ.
+
 ### 5. Download speed
 * `UB_DL_CONNECTIONS` default 6 → **8** (Telegram limit එක connection එකකට — connections වැඩි = speed වැඩි).
 * **Duplicate chunks නෑ**: chunk එකක් queue/in-flight/finished — තුනෙන් එකක තියෙනවා නම් ආයෙ ඉල්ලන්නේ නෑ. Hedge එක දැන් adaptive (chunk time × 2.5) + queue හිස් වෙලා නම් විතරයි.
@@ -74,5 +81,6 @@ Worker එකට `ghassets.py` copy වෙන්නේ bot start වෙද්ද
 GH_UPLOAD_CHUNK_MB=24      GH_UPLOAD_PARALLEL=3     GH_UPLOAD_TIMEOUT=300
 PROGRESS_UPDATE_INTERVAL=2 PROGRESS_TICK=0.5         PROGRESS_MIN_EDIT_GAP=1.2
 UB_DL_CONNECTIONS=8        UB_UL_CONNECTIONS=8       PROBE_CONNECTIONS=10
+DL_STALL_WARN=45           DL_STALL_FAIL=150         DL_WORKERS_PER_CONN=4
 DIST_LOCAL_RESCUE=1        DIST_RESCUE_AFTER=180     PROBE_CACHE=1
 ```

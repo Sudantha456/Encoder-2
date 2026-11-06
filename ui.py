@@ -68,8 +68,21 @@ class SpeedTracker:
     def avg_speed(self) -> float:
         return self.current / self.elapsed if self.elapsed > 0 else 0.0
 
+    #: sample එකක් මීට වඩා පරණ නම් transfer එක stall වෙලා (speed 0, extrapolation නෑ)
+    STALE_AFTER = 6.0
+
+    @property
+    def stale_for(self) -> float:
+        return (time.monotonic() - self.samples[-1][0]) if self.samples else 0.0
+
+    @property
+    def stalled(self) -> bool:
+        return self.stale_for > self.STALE_AFTER and self.current < self.total
+
     @property
     def speed(self) -> float:
+        if self.stalled:                      # දත්ත එන්නේ නෑ → 0 B/s (පරණ වේගය පෙන්වන්නේ නෑ)
+            return 0.0
         (t0, c0), (t1, c1) = self.samples[0], self.samples[-1]
         if t1 - t0 < 0.5:
             return self.avg_speed
@@ -82,11 +95,18 @@ class SpeedTracker:
 
     @property
     def current_live(self) -> float:
-        """අන්තිම sample එකෙන් පස්සේ ගත වුණු වෙලාව × speed → bar එක smooth වෙන්න."""
+        """
+        අන්තිම sample එකෙන් පස්සේ ගත වුණු වෙලාව × speed → bar එක smooth වෙන්න.
+        ⚠️ stall වුණොත් extrapolate කරන්නේ නෑ (නැත්නම් 100% වගේ බොරු පෙන්වනවා).
+        """
         c = self.current
-        if self.total and c < self.total and self.speed > 0 and self.samples:
-            c = min(c + (time.monotonic() - self.samples[-1][0]) * self.speed, self.total)
-        return c
+        if not self.total or c >= self.total:
+            return c
+        sp = self.speed
+        if sp <= 0 or self.stalled:
+            return c
+        dt = min(self.stale_for, 3.0)                  # උපරිම තත්පර 3ක් ඉදිරියට විතරයි
+        return min(c + dt * sp, self.total, c + (self.total - c) * 0.25)
 
     @property
     def percent(self) -> float:
@@ -95,14 +115,17 @@ class SpeedTracker:
 
 def render_transfer(kind: str, tr: SpeedTracker, name: str) -> str:
     head = "📥 <b>Downloading</b>" if kind == "dl" else "📤 <b>Uploading</b>"
-    return "\n".join([
+    lines = [
         f"{head}\n<code>{esc(short_name(name))}</code>",
         "",
         f"<code>[{bar(tr.percent)}] {tr.percent:5.1f}%</code>",
         f"📦 <code>{human_size(tr.current_live)} / {human_size(tr.total)}</code>",
         f"⚡ Speed: <code>{human_speed(tr.speed)}</code>  (avg <code>{human_speed(tr.avg_speed)}</code>)",
         f"⏳ ETA: <code>{human_time(tr.eta)}</code>   ⏱ Elapsed: <code>{human_time(tr.elapsed)}</code>",
-    ])
+    ]
+    if tr.stalled:
+        lines.append(f"⚠️ <b>තත්පර {tr.stale_for:.0f} ක් දත්ත එන්නේ නෑ</b> — retry / fallback වෙනවා…")
+    return "\n".join(lines)
 
 
 def render_encode(st, name: str, height: int, preset: str, codec: str) -> str:
