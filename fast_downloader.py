@@ -28,10 +28,9 @@ logger = logging.getLogger("FastDL")
 CHUNK_SIZE = 1024 * 1024                                   # 1MB (Telegram max)
 DL_CONNECTIONS = getattr(_cfg, "DL_CONNECTIONS", 6)
 DL_WORKERS_PER_CONN = getattr(_cfg, "DL_WORKERS_PER_CONN", 4)
-# Multi-userbot relay tuning (all values remain environment configurable).
-CHUNK_TIMEOUT = getattr(_cfg, "UB_DL_CHUNK_TIMEOUT", 35.0)
-HEDGE_AFTER = getattr(_cfg, "UB_DL_HEDGE_AFTER", 0.0)
-HEDGE_MAX = getattr(_cfg, "UB_DL_HEDGE_MAX", 1)
+CHUNK_TIMEOUT = 20.0                                       # chunk එකක් මේ තත්පර ගණනට වැඩි නම් retry (පරණ: 60)
+HEDGE_AFTER = 3.0                                          # end-game: chunk එකක් තත්පර 3කට වඩා inflight නම් තව worker කෙනෙක් ඒක ඉල්ලනවා
+HEDGE_MAX = 3                                              # එකම chunk එකට උපරිම එකවර requests
 BACKOFF_SCALE = 1.0                                        # retry backoff (tests වලදී අඩු කරන්න)
 SMALL_FILE = 4 * 1024 * 1024                               # මීට කුඩා නම් native
 
@@ -220,7 +219,7 @@ class FastDownloader:
 
     # ═════════ Multi-userbot download: chunks lanes අතර බෙදනවා ═════════
     async def download_lanes(self, lanes: List[Lane], total_size: int, save_path: str, download_id: str,
-                             progress_callback: Optional[Callable] = None, max_retries: Optional[int] = None,
+                             progress_callback: Optional[Callable] = None, max_retries: int = 8,
                              max_flood_wait: float = 30.0, workers_per_conn: Optional[int] = None) -> str:
         """
         • Shared chunk queue — හැම lane එකක්ම queue එකෙන් chunk අරන් ඒ ඒ userbot ගේ connections හරහා ගන්නවා.
@@ -228,8 +227,7 @@ class FastDownloader:
           FloodWait > max_flood_wait නම් ඒ lane එක මේ job එකට dead (userbot එක cooldown).
         • Lane එකක් fail වුණාට අනිත් ඒවා ඉවර කරනවා. ඔක්කොම dead වුණොත් විතරයි error.
         """
-        wpc = workers_per_conn or getattr(_cfg, "UB_DL_WORKERS_PER_CONN", DL_WORKERS_PER_CONN)
-        max_retries = max_retries or getattr(_cfg, "UB_DL_MAX_RETRIES", 10)
+        wpc = workers_per_conn or DL_WORKERS_PER_CONN
         self._cancel_flags[download_id] = False
         loop = asyncio.get_running_loop()
 
@@ -297,14 +295,14 @@ class FastDownloader:
             if all(l.dead for l in lanes):
                 _fatal(RuntimeError("සියලුම userbot lanes fail වුණා: " + why))
 
-        completed_offsets: set = set()
+        finished: set = set()
         inflight: Dict[int, list] = {}            # off → [පටන් ගත් වෙලාව, එකවර requests ගණන]
 
         def pick_hedge() -> Optional[int]:
             """End-game: queue හිස්, ඒත් chunks ටිකක් slow connections වල හිරවෙලා → නිදහස් workers ඒවා නැවත ඉල්ලනවා."""
             now = time.monotonic()
             c = [(t0, off) for off, (t0, n) in inflight.items()
-                 if HEDGE_AFTER > 0 and off not in completed_offsets and n < HEDGE_MAX and now - t0 >= HEDGE_AFTER]
+                 if off not in finished and n < HEDGE_MAX and now - t0 >= HEDGE_AFTER]
             return min(c)[1] if c else None
 
         async def worker(ln: Lane, widx: int):
@@ -324,7 +322,7 @@ class FastDownloader:
                         await asyncio.sleep(0.1)
                         continue
                     hedge = True
-                if off in completed_offsets:
+                if off in finished:
                     continue
                 rec = inflight.setdefault(off, [time.monotonic(), 0])
                 rec[1] += 1
@@ -335,8 +333,8 @@ class FastDownloader:
                     if data is None:
                         raise RuntimeError(f"Unexpected response: {type(r).__name__}")
                     ln.bad = 0
-                    if off not in completed_offsets:             # පළමුව ඉවර වූ copy එක විතරක් ගණන් වෙනවා
-                        completed_offsets.add(off)
+                    if off not in finished:                    # පළමුව ඉවර වූ copy එක විතරක් ගණන් වෙනවා
+                        finished.add(off)
                         await write_at(off, data)
                         ln.got += len(data)
                         _prog(len(data))
@@ -344,11 +342,11 @@ class FastDownloader:
                         if remaining[0] <= 0:
                             done_ev.set()
                 except asyncio.CancelledError:
-                    if not hedge and off not in completed_offsets:
+                    if not hedge and off not in finished:
                         queue.put_nowait(off)
                     raise
                 except FloodWaitError as e:
-                    if not hedge and off not in completed_offsets:
+                    if not hedge and off not in finished:
                         queue.put_nowait(off)                  # chunk එක වෙන lane එකකට
                     if ln.on_flood:
                         ln.on_flood(e.seconds)
@@ -358,7 +356,7 @@ class FastDownloader:
                     ln.flood_until = max(ln.flood_until, time.monotonic() + e.seconds + random.uniform(0.5, 1.5))
                     logger.warning(f"[{ln.name}] FloodWait {e.seconds}s — lane paused, others continue")
                 except Exception as e:
-                    if not hedge and off not in completed_offsets:
+                    if not hedge and off not in finished:
                         queue.put_nowait(off)
                     if hedge:
                         continue                               # hedge copy එක fail වුණාට කමක් නෑ (මුල් එක තාම තියෙනවා)
@@ -372,10 +370,8 @@ class FastDownloader:
                         _fatal(RuntimeError(f"Chunk {off} {n}× fail ({e!r})"))
                         return
                     ln.bad += 1
-                    # Do not eject a temporarily slow lane too aggressively; other lanes
-                    # keep progressing while this lane gets a few more transient retries.
-                    if ln.bad >= 8 and any(l is not ln and not l.dead for l in lanes):
-                        lane_died(ln, f"දිගටම errors ({ln.bad}): {e!r}")
+                    if ln.bad >= 5 and any(l is not ln and not l.dead for l in lanes):
+                        lane_died(ln, f"දිගටම errors ({ln.bad}): {e!r}")      # වෙන lanes ඉතුරුයි → මේක අයින්
                         return
                     await asyncio.sleep(min(2 ** (n - 1), 8) * BACKOFF_SCALE)
                 finally:
@@ -383,31 +379,14 @@ class FastDownloader:
                     if rec[1] <= 0:
                         inflight.pop(off, None)
 
-        # Interleave lanes so all four userbots start sharing work fairly.
-        # A global cap prevents accidental oversubscription if env values are raised.
+        # workers lanes අතර interleave (A,B,C,A,B,C…) — නැත්නම් මුල් lane එකේ workers ම chunks ඔක්කොම අල්ලගන්නවා
         per = {ln.name: max(1, len(ln.pool.senders)) * wpc for ln in live}
-        # Give each healthy userbot an equal worker budget first; avoid one lane
-        # consuming most of the shared queue simply because it starts earlier.
-        fair_cap = max(1, max_workers // len(live))
-        per = {name: min(count, fair_cap) for name, count in per.items()}
-        max_workers = getattr(_cfg, "UB_DL_MAX_WORKERS", 32)
-        order = []
-        for i in range(max(per.values())):
-            for ln in live:
-                if i < per[ln.name] and len(order) < max_workers:
-                    order.append((ln, i))
-            if len(order) >= max_workers:
-                break
-        logger.info(
-            "📥 balanced download: %d lanes; per-lane workers=%s; %d workers active; chunk=%dKB; hedging=%s",
-            len(live), ",".join(f"{ln.name}:{per[ln.name]}" for ln in live), len(order), CHUNK_SIZE // 1024, "on" if HEDGE_AFTER > 0 else "off",
-        )
-        started_at = time.monotonic()
+        order = [(ln, i) for i in range(max(per.values())) for ln in live if i < per[ln.name]]
         tasks = [asyncio.create_task(worker(ln, i)) for ln, i in order]
         done_task = asyncio.create_task(done_ev.wait())
         try:
             while True:
-                completed_tasks, _ = await asyncio.wait({done_task, fatal}, return_when=asyncio.FIRST_COMPLETED, timeout=1.0)
+                finished, _ = await asyncio.wait({done_task, fatal}, return_when=asyncio.FIRST_COMPLETED, timeout=1.0)
                 if self.is_cancelled(download_id):
                     raise asyncio.CancelledError("Cancelled")
                 if fatal.done():
@@ -419,11 +398,7 @@ class FastDownloader:
                     break
             if downloaded[0] < total_size:
                 raise RuntimeError(f"Incomplete download {downloaded[0]}/{total_size}")
-            elapsed = max(0.001, time.monotonic() - started_at)
-            avg_mbps = (total_size / 1048576) / elapsed
-            logger.info("lane summary: " + ", ".join(f"{l.name}={l.got / 1048576:.1f}MB" for l in lanes))
-            logger.info("📥 download complete: %.1fMB in %.1fs (average %.2f MiB/s)",
-                        total_size / 1048576, elapsed, avg_mbps)
+            logger.info("lane summary: " + ", ".join(f"{l.name}={l.got / 1048576:.0f}MB" for l in lanes))
             return save_path
         except BaseException:
             self.force_delete_file(save_path)
