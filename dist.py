@@ -48,7 +48,9 @@ def available() -> bool:
 
 # ───────────── 🤝 Helper GitHub accounts ─────────────
 HELPERS: List[tuple] = []          # (token, "owner/repo") — bootstrap සාර්ථක වූ ඒවා
-HELPER_DL: List[bool] = []         # ඒ HELPERS ටිකේ DL_SESSION secret auto-දාලද (parallel)
+HELPER_DL: List[bool] = []         # ඒ HELPERS ටිකේ dl lane (secret + channel pre-flight) වැඩ කරනවාද (parallel)
+HELPER_SESS: List[str] = []        # ඒ HELPERS ටිකේ DL_SESSION (parallel) — main relay sessions නොවනවාද කියලා බලන්න
+HELPERS_SETUP_DONE: bool = False   # bootstrap අවසන් ද (relay session plan එක මේ ඊට පස්සේම ගණන් ගන්නවා)
 HELPER_PROBLEMS: List[str] = []
 PER_ACCT = config.WORKERS_PER_ACCOUNT
 
@@ -67,6 +69,36 @@ async def _helper_gh(token: str, repo: str, *args, check=True) -> str:
     if check and proc.returncode != 0:
         raise DistError(f"gh {' '.join(args[:2])}: {err.decode(errors='ignore')[-200:].strip()}")
     return out.decode(errors="ignore")
+
+
+async def _preflight_dl(session: str, label: str) -> Optional[str]:
+    """Helper dl session එකෙන් channel එක resolve කළ හැකිද කියලා bot start වෙද්දීම check කරනවා.
+
+    resolve_for_user (channel.py) — invite නම් join වෙනවා, id නම් dialogs load කරලා cache කරනවා.
+    error ඇති නම් message එකක් දෙනවා (dl_ok False කරන්න), නැත්නම් None (සාර්ථකයි)."""
+    if not session or not config.CHANNEL_ID:
+        return None
+    try:
+        from channel import parse_channel_ref, resolve_for_user
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+    except Exception as e:
+        logger.info(f"dl pre-flight skipped (import): {e}")
+        return None
+    try:
+        ref = parse_channel_ref(config.CHANNEL_ID)
+    except Exception as e:
+        return f"CHANNEL_ID parse: {e}"
+    client = TelegramClient(StringSession(session), config.API_ID, config.API_HASH, flood_sleep_threshold=0)
+    try:
+        await asyncio.wait_for(client.connect(), timeout=30.0)
+        await asyncio.wait_for(resolve_for_user(client, ref, label), timeout=90.0)
+        return None
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+    finally:
+        with contextlib.suppress(Exception):
+            await client.disconnect()
 
 
 async def _bootstrap_helper(token: str, helper_no: int) -> tuple:
@@ -99,7 +131,7 @@ async def _bootstrap_inner(token: str, st: list, helper_no: int = 0) -> tuple:
     files = {"worker.py": root / "worker.py", "transcoder.py": root / "transcoder.py",
              ".github/workflows/encode-worker.yml": root / ".github/workflows/encode-worker.yml",
              "dl_worker.py": root / "dl_worker.py", "asm_worker.py": root / "asm_worker.py",
-             "fast_conn.py": root / "fast_conn.py",
+             "fast_conn.py": root / "fast_conn.py", "channel.py": root / "channel.py",
              ".github/workflows/dl-worker.yml": root / ".github/workflows/dl-worker.yml",
              ".github/workflows/asm-worker.yml": root / ".github/workflows/asm-worker.yml"}
     for path, src in files.items():
@@ -140,7 +172,20 @@ async def _bootstrap_inner(token: str, st: list, helper_no: int = 0) -> tuple:
             dl_ok = True
         except Exception as e:                   # dl lane off, encode workers නම් සාමාන්‍ය විදිහට වැඩ කරනවා
             HELPER_PROBLEMS.append(f"{repo}: DL_SESSION secret set වුණේ නෑ ({e}) — download lane off")
-    return token, repo, dl_ok
+    if config.CHANNEL_ID:                        # raw CHANNEL_ID (id/@username/invite) — dl_worker channel resolve කරන්න
+        try:
+            await _helper_gh(token, repo, "secret", "set", "CHANNEL_REF", "--repo", repo, "--body", config.CHANNEL_ID)
+        except Exception as e:
+            HELPER_PROBLEMS.append(f"{repo}: CHANNEL_REF secret set වුණේ නෑ ({e}) — helper channel resolve ගැටලු ගත හැක")
+    if dl_ok and config.CHANNEL_ID:              # pre-flight: මෙම account එක channel එක දකින්න පුළුවන්ද (fail-fast → /check එකේ පෙනෙනවා)
+        st[0] = "dl pre-flight (channel resolve)"
+        err = await _preflight_dl(session, f"Helper #{helper_no}")
+        if err:
+            HELPER_PROBLEMS.append(f"Helper #{helper_no} ({repo}): dl lane OFF — {err} "
+                                   "→ මේ account එක channel එකේ member (හෝ admin) නොවේ නම් add කරන්න. "
+                                   "CHANNEL_ID එක invite link එකක් දුන්නොත් auto-join වෙනවා.")
+            dl_ok = False
+    return token, repo, dl_ok, session
 
 
 def dl_sessions_ready() -> int:
@@ -151,6 +196,7 @@ def dl_sessions_ready() -> int:
 async def setup_helpers():
     HELPERS.clear()
     HELPER_DL.clear()
+    HELPER_SESS.clear()
     HELPER_PROBLEMS.clear()
     res = await asyncio.gather(*[_bootstrap_helper(t, i) for i, t in enumerate(config.HELPER_TOKENS, 1)],
                                return_exceptions=True)
@@ -160,10 +206,13 @@ async def setup_helpers():
             HELPER_PROBLEMS.append(f"Token #{i} (…{t[-4:]}): {r}")
             logger.error(HELPER_PROBLEMS[-1])
         else:
-            token, repo, dl_ok = r
-            HELPERS.append((token, repo))          # HELPERS/HELPER_DL aligned (සාර්ථක ඒවා විතරයි)
+            token, repo, dl_ok, session = r
+            HELPERS.append((token, repo))          # HELPERS/HELPER_DL/HELPER_SESS aligned (සාර්ථක ඒවා විතරයි)
             HELPER_DL.append(dl_ok)
+            HELPER_SESS.append(session)
             logger.info(f"🤝 token #{i} ready: {repo}" + (" • dl lane ✅" if dl_ok else " • dl lane off"))
+    global HELPERS_SETUP_DONE
+    HELPERS_SETUP_DONE = True
 
 
 # ───────────── single-runner encode time estimate (auto mode) ─────────────
@@ -1096,6 +1145,7 @@ async def distributed_download(*, client, job, meta, live, workdir: Path, src_pa
         await asyncio.gather(main_task, return_exceptions=True)
 
         # ── 6) settle: helper slices EXACT size verify; missing/mismatch → main Telegram එකෙන් re-fetch ──
+        recovery_notice = False
         for ln in lanes:
             if ln.acct == 0:
                 continue
@@ -1106,6 +1156,12 @@ async def distributed_download(*, client, job, meta, live, workdir: Path, src_pa
                 s, e = slice_of[ln.slice_idx]
                 rp = workdir / f"dl_slice_{ln.slice_idx}"
                 logger.warning(f"🌐 slice {ln.slice_idx}: main runner Telegram එකෙන් re-download [{s},{e})")
+                if not recovery_notice:
+                    recovery_notice = True
+                    with contextlib.suppress(Exception):
+                        await live.set("🧩 <b>Helper lanes failed</b> — main runner එක ඒ ranges ටික re-download කරනවා… "
+                                       "(වැරදි channel/membership නිසා වෙන්න පුළුවන් — <code>/check</code> බලන්න)",
+                                       force=True)
                 try:
                     async def _noop_prog(*_):
                         return None

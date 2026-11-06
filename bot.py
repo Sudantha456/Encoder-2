@@ -212,8 +212,8 @@ async def cmd_check(event):
     m = await event.reply("🔍 <b>Userbots / channel setup බලනවා…</b>")
     await relay.stop()
     relay.userbots = []
+    await init_helpers(notify=False)   # helpers bootstrap + dl pre-flight FIRST
     await relay.setup(client)
-    await init_helpers(notify=False)
     await m.edit(relay.status_text() + "\n\n" + dist.helpers_status())
 
 
@@ -876,8 +876,8 @@ async def main():
     await init_download_engine()
     logger.info(f"🌐 Distributed workers: {'available (on-demand per queue)' if dist.available() else 'unavailable'}")
     me = await client.get_me()
+    await init_helpers()          # helpers bootstrap + dl pre-flight FIRST — relay session plan ඒ එක්කම ගණන් ගන්නවා
     await relay.setup(client)
-    await init_helpers()
     if relay.configured and not relay.enabled:           # setup වැරදි නම් admins ට කෙළින්ම කියනවා
         for uid in ALLOWED_USERS:
             with contextlib.suppress(Exception):

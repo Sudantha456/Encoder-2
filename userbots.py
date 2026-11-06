@@ -63,6 +63,18 @@ class UserBot:
         logger.warning(f"[{self.name}] FloodWait {seconds}s → cooldown {config.UB_FLOOD_COOLDOWN}s")
 
 
+def _plan_main_sessions() -> list:
+    """Main relay එකේ පාවිච්චි කරන sessions plan කරනවා (sessionplan.py — helpers bootstrap ඉවර වුණාට පස්සේම)."""
+    try:
+        import dist as _dist
+        dl, sess = list(_dist.HELPER_DL), list(_dist.HELPER_SESS)
+        done = bool(_dist.HELPERS_SETUP_DONE)
+    except Exception:
+        dl, sess, done = [], [], False
+    from sessionplan import plan_main_sessions
+    return plan_main_sessions(config.USER_STRINGS, config.DIST_DOWNLOAD, config.HELPER_TOKENS, dl, sess, done)
+
+
 class Relay:
     def __init__(self):
         self.userbots: List[UserBot] = []
@@ -117,7 +129,7 @@ class Relay:
             logger.error(e)
             return False
 
-        main_sessions = config.main_user_strings()   # distributed dl දී: sessions බෙදලා — main එකට 0 වැඩේ
+        main_sessions = _plan_main_sessions()   # distributed dl දී: sessions බෙදනවා (dead helper lanes එම sessions main එකේ)
         if len(main_sessions) != len(config.USER_STRINGS):
             logger.info(f"👤 userbot relay: main runner එකට session(s) {len(main_sessions)}/{len(config.USER_STRINGS)} "
                         "(ඉතිරි ඒවා helper dl lanes)")

@@ -37,13 +37,17 @@ Setup වැරදි නම් `ALLOWED_USERS` ට හේතුව සහිත
 ## Session බෙදීම (5 accounts)
 `USER_STRINGS` එකේ 5 sessions: **#1 → main runner** relay, **#2..#5 → helper #1..#4** (DL_SESSION secret එක විදිහට bot එකෙන්ම auto-දෙනවා). එක session එක රනිං යන්ත දෙකක කවදාවත් පාවිච්චි වෙන්නේ නෑ (Telethon "session already in use" වලින් disconnect වෙනවා). 5ට වඩා sessions දුන්නොත් අතිරේක ඒවා main runner එකෙන් ගන්නවා. `DIST_DOWNLOAD=1` + `HELPER_TOKENS` තිබේ නම් විතරයි split වෙන්නේ — නැත්නම් පරණ විදිහටම (සියල්ල main runner එකේ).
 
+**Dead-lane fallback:** helper එකක් bootstrap / dl pre-flight එකෙන් fail වුණොත් ඒකේ session එක **main runner එකට ආපහු ලැබෙනවා** (sessionplan.py — helpers bootstrap ඉවර වුණාට පස්සේ relay ගණන් ගන්නවා). Dead lane එකක් නිසා session එකක් නිකම් තියෙන්නේ නෑ. බෝට් start ordering: **helpers (bootstrap + pre-flight) → relay** — ඒ නිසා /check එකේ "Helper …: dl lane OFF — <හේතුව>" පේනවා නම්, ඒ session එක main relay එකේ on.
+
 ## Helper accounts (auto-setup on bot start)
 හැම helper account එකකටම bot එකෙන්ම (`setup_helpers`):
 - public repo `<login>/encoder-workers` (idempotent — තියෙනවා නම් නැවත හදන්නේ නෑ)
 - worker files + workflows push: `encode-worker.yml` (encode), `dl-worker.yml` (download slices), `asm-worker.yml` (assemble/split)
 - secrets auto: `BOT_TOKEN`, `API_ID`, `API_HASH`, `DL_SESSION`, `CHANNEL_NUM` (job එකකට එකවර)
 
-Helper එකක් connect වෙන්නේ නැත්නම් (token/repo fail) **ඒක drop කරලා** ඉතිරි lanes එක්කම distributed download දිගටම යනවා. Helpers සියල්ල fail නම් — සාමාන්‍ය download (userbot relay / bot) ට fall back වෙනවා. Helper ට DL_SESSION දෙන්න බැරි වුණොත් ඒ helper එකේ **dl lane off** (encode worker විදිහට නම් වැඩ කරනවා). `/settings → Helper accounts` බලන්න (`helpers_status`).
+Helper එකක් connect වෙන්නේ නැත්නම් (token/repo fail) **ඒක drop කරලා** ඉතිරි lanes එක්කම distributed download දිගටම යනවා. Helpers සියල්ල fail නම් — සාමාන්‍ය download (userbot relay / bot) ට fall back වෙනවා. Helper ට DL_SESSION දෙන්න බැරි වුණොත්, හෝ **dl pre-flight** එකේ channel resolve fail වුණොත් (මේ account එක channel එකේ member නෙවෙයි නම් වැඩේ මේකයි) ඒ helper එකේ **dl lane off** + හේතුව `/check` එකේ පේනවා — ඒ session එක main runner එකේ පාවිච්චි වෙනවා (encode worker විදිහට නම් වැඩ කරනවා).
+
+**Pre-flight:** bot start වෙද්දී (helpers bootstrap වෙද්දී) හැම helper dl session එකක් සමඟම channel resolve පරීක්ෂාවක් කරනවා — invite link නම් auto-join වෙනවා. Fail නම් job එක run වෙන වෙලාවට කලින්ම **dl lane OFF** කරලා හේතුව `HELPER_PROBLEMS` වලට දමනවා — `/check` එකේ **Helper #N (…): dl lane OFF — …** විදිහට පේනවා. නිවැරදි කළාට පස්සේ `/check` (queue එක හිස් වෙලාවක) එවන්න — ආයෙමත් test වෙලා, සාර්ථක නම් dl lane on කරලා, session එකs ආයෙ බෙදෙනවා.
 
 ## Integrity — එක byte එකක්වත් miss වෙන්නේ නෑ
 - `dlparts.byte_ranges(size, n, align=1MB)`: ranges gap/overlap නැතිව **[0, size)** සම්පූර්ණ cover කරනවා; `verify_ranges()` double-check; slice කිසිම වෙලාවක range මායිමෙන් පිටතට යන්නේ නෑ (GetFileRequest limit = `min(1MB, slice_remaining)`).
@@ -70,5 +74,6 @@ DIST_ASM_TIMEOUT=1500    # assembler marker බලාගෙන ඉන්න උ�
 ## Notes / caveats
 - Helper repos **public** — slices/parts GitHub එකේ visible වෙනවා (මේ project එකේ encode partsත් එහෙමයි). Private/sensitive content නම් helpers ඔබේ trusted accounts වෙන්න ඕනේ.
 - Helpers file_reference එකකින් නොව, **channel message එක තමන්ගේ userbot එකෙන් කියවලා** පාවිච්චි කරනවා (stale file_reference ගැටලුව නෑ).
+- Helper dl lanes **channel member (හෝ admin)** වෙන්න ඕනේ — admin දැම්ම කියලා ඔබ දන්නා account ටිකම නොවේ, sessions[1..5] වල අයත් channel එකේ ඉන්න ඕනේ. `CHANNEL_ID` invite link එකක් දුන්නොත් pre-flight එකෙන් helpers auto-join වෙනවා — id එකක් නම්, ඒ accounts channel එකට add කරන්න.
 - එක session string එකෙන් clients දෙකක් ධාවනය වෙන්නේ නෑ — split logic implement කරලා තියෙනවා (උඩ බලන්න).
 - Assembler fail/timeout → main runner slices reassemble කරලා (local) පරණ dist-encode path එකෙන් යනවා; upload/size වැරදි නම් job fail — නැවත retry කරන්න පුළුවන්.

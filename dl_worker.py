@@ -41,6 +41,7 @@ CONNECTIONS = max(1, env_int("CONNECTIONS", 12))
 CHAT = os.environ.get("CHAT", "")
 MSG_ID = env_int("MSG_ID")
 CHANNEL_NUM = env_int("CHANNEL_NUM")
+CHANNEL_REF = os.environ.get("CHANNEL_REF", "").strip()   # raw CHANNEL_ID (id/@username/invite)
 SLICE_LEN = max(0, END - START)
 TAG = f"enc-dl-{JOB}"
 NAME = f"dl_slice_{SLICE}"
@@ -92,16 +93,32 @@ def speed_tracker():
 
 
 async def resolve_channel(client):
-    """CHANNEL_NUM (-100...) numeric id → dialog scan එකෙන් entity (userbot member නිසා)."""
+    """Channel entity resolve.
+
+    පළමුව CHANNEL_REF (raw CHANNEL_ID — id / @username / invite link) — channel.py එකේ battle-tested logic
+    (invite link නම් මේ account එක auto-JOIN වෙනවා). නැතිනම් CHANNEL_NUM (numeric id) dialogs scan."""
+    if CHANNEL_REF:
+        from channel import parse_channel_ref, resolve_for_user
+        return await resolve_for_user(client, parse_channel_ref(CHANNEL_REF), f"slice {SLICE}")
     want = CHANNEL_NUM
     if want > 1_000_000_000_000:          # full -100… form → ඇතුළේ channel id එක විතරක්
         want = int(str(want)[4:])
+    n_dialogs, seen, matched = 0, [], None
     async for dialog in client.iter_dialogs(limit=None):
+        n_dialogs += 1
         peer = getattr(dialog, "peer", None)
+        is_chan = getattr(peer, "channel_id", None) is not None
         pid = getattr(peer, "channel_id", None) or getattr(peer, "chat_id", None) or getattr(peer, "user_id", None)
+        if is_chan and pid is not None:
+            seen.append(pid)
         if pid == want or pid == CHANNEL_NUM:
-            return dialog.entity
-    raise RuntimeError(f"channel {CHANNEL_NUM} dialogs එකේ නෑ (userbot member ද?)")
+            matched = dialog.entity
+            break
+    if matched is not None:
+        return matched
+    print(f"[diag] dialogs scanned={n_dialogs} channels seen={len(seen)} first={seen[:12]}", flush=True)
+    raise RuntimeError(f"channel {CHANNEL_NUM} dialogs එකේ නෑ — userbot මේ channel එකේ member නෙවෙයි "
+                       f"(channels seen: {len(seen)})")
 
 
 async def main():
@@ -130,8 +147,8 @@ async def main():
     if not api_id or not api_hash:
         rep.send("failed", 0, 0.0, "API_ID / API_HASH secret නෑ")
         sys.exit(3)
-    if not CHANNEL_NUM:
-        rep.send("failed", 0, 0.0, "CHANNEL_NUM secret නෑ")
+    if not CHANNEL_NUM and not CHANNEL_REF:
+        rep.send("failed", 0, 0.0, "CHANNEL_NUM / CHANNEL_REF secret දෙකම නෑ")
         sys.exit(3)
 
     client = TelegramClient(StringSession(session), api_id, api_hash, flood_sleep_threshold=0)

@@ -60,6 +60,7 @@ jobs:
           sparse-checkout: |
             dl_worker.py
             fast_conn.py
+            channel.py
           sparse-checkout-cone-mode: false
 
       - name: Set up Python 3.11
@@ -87,5 +88,6 @@ jobs:
           API_HASH: ${{ secrets.API_HASH }}
           DL_SESSION: ${{ secrets.DL_SESSION }}      # මේ helper account එකට අදාල Telegram userbot
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          CHANNEL_NUM: ${{ secrets.CHANNEL_NUM }}    # private channel ගේ numeric id (get_dialogs එකෙන් resolve)
+          CHANNEL_NUM: ${{ secrets.CHANNEL_NUM }}    # private channel ගේ numeric id (fallback: dialogs scan)
+          CHANNEL_REF: ${{ secrets.CHANNEL_REF }}    # raw CHANNEL_ID (id/@username/invite) — auto-join supported
         run: python3 -u dl_worker.py

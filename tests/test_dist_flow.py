@@ -2,6 +2,7 @@
 tests/test_dist_flow.py — Distributed download / assembly pipeline tests
 (stdlib unittest + ffmpeg/ffprobe on PATH). Run: python3 -m unittest discover -s tests -v
 """
+import asyncio
 import hashlib
 import json
 import os
@@ -210,3 +211,149 @@ class TestAssemblyE2E(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+class _FakePeer:
+    def __init__(self, kind, pid):
+        self._kind, self._pid = kind, pid
+
+    @property
+    def channel_id(self):
+        return self._pid if self._kind == "channel" else None
+
+    @property
+    def chat_id(self):
+        return self._pid if self._kind == "chat" else None
+
+    @property
+    def user_id(self):
+        return self._pid if self._kind == "user" else None
+
+
+class _FakeDialog:
+    def __init__(self, peer, entity):
+        self.peer, self.entity = peer, entity
+
+
+class _FakeClient:
+    def __init__(self, dialogs):
+        self._dialogs = dialogs
+
+    async def iter_dialogs(self, limit=None):
+        for d in self._dialogs:
+            yield d
+
+
+class TestResolveChannel(unittest.TestCase):
+    def setUp(self):
+        import dl_worker
+        self.dl = dl_worker
+        self._old_ref, self._old_num = dl_worker.CHANNEL_REF, dl_worker.CHANNEL_NUM
+
+    def tearDown(self):
+        self.dl.CHANNEL_REF, self.dl.CHANNEL_NUM = self._old_ref, self._old_num
+
+    def test_fallback_scan_finds_channel(self):
+        self.dl.CHANNEL_REF, self.dl.CHANNEL_NUM = "", 4340204571
+        chan = object()
+        client = _FakeClient([_FakeDialog(_FakePeer("user", 111), "user-x"),
+                              _FakeDialog(_FakePeer("channel", 999000111), "other-chan"),
+                              _FakeDialog(_FakePeer("channel", 4340204571), chan)])
+        got = asyncio.run(self.dl.resolve_channel(client))
+        self.assertIs(got, chan)
+
+    def test_fallback_scan_missing_raises_diagnostic(self):
+        self.dl.CHANNEL_REF, self.dl.CHANNEL_NUM = "", 4340204571
+        client = _FakeClient([_FakeDialog(_FakePeer("user", 111), "user-x"),
+                              _FakeDialog(_FakePeer("channel", 123), "other")])
+        with self.assertRaises(RuntimeError) as cm:
+            asyncio.run(self.dl.resolve_channel(client))
+        self.assertIn("4340204571", str(cm.exception))
+        self.assertIn("channels seen", str(cm.exception))
+
+
+class TestPreflight(unittest.TestCase):
+    def test_preflight_bad_channel_ref(self):
+        import dist
+        import config
+        old = config.CHANNEL_ID
+        config.CHANNEL_ID = "%%%garbage%%%"
+        try:
+            err = asyncio.run(dist._preflight_dl("fake-session", "Helper #1"))
+            try:
+                import telethon  # noqa: F401
+                self.assertTrue(err and "CHANNEL_ID parse" in err)
+            except ImportError:
+                self.assertIsNone(err)   # telethon නැති local env එකේ pre-flight skip වෙනවා (runner එකේ telethon තියෙනවා)
+        finally:
+            config.CHANNEL_ID = old
+
+    def test_preflight_empty_inputs(self):
+        import dist
+        import config
+        old = config.CHANNEL_ID
+        config.CHANNEL_ID = ""
+        try:
+            self.assertIsNone(asyncio.run(dist._preflight_dl("fake-session", "Helper #1")))
+            self.assertIsNone(asyncio.run(dist._preflight_dl("", "Helper #1")))
+        finally:
+            config.CHANNEL_ID = old
+
+class TestSessionPlan(unittest.TestCase):
+    def _plan(self, **kw):
+        from sessionplan import plan_main_sessions
+        return plan_main_sessions(**kw)
+
+    def test_all_dl_ready_split(self):
+        # 5 sessions, 4 healthy helpers holding s2..s5 → main = [s1]
+        got = self._plan(sessions=["s1","s2","s3","s4","s5"], dist_download=True,
+                         helper_tokens=["t1","t2","t3","t4"],
+                         helper_dl=[True, True, True, True],
+                         helper_sess=["s2","s3","s4","s5"], helpers_setup_done=True)
+        self.assertEqual(got, ["s1"])
+
+    def test_failed_bootstrap_session_comes_home(self):
+        # token #3 login 403 → bootstrap fail → s4 free → main = [s1, s4] + extras
+        got = self._plan(sessions=["s1","s2","s3","s4","s5"], dist_download=True,
+                         helper_tokens=["t1","t2","t3","t4"],
+                         helper_dl=[True, True, True],          # successful bootstraps only
+                         helper_sess=["s2","s3","s5"], helpers_setup_done=True)
+        self.assertEqual(got, ["s1","s4"])                        # s5 dl-ok helper ගන්නවා; s4 (t3 fail) main ට එනවා
+
+    def test_dl_dead_helpers_sessions_return_to_main(self):
+        # pre-flight fail ඔක්කොම → කිසිම helper session claim කරේ නෑ → main = 5 sessionsම
+        got = self._plan(sessions=["s1","s2","s3","s4","s5"], dist_download=True,
+                         helper_tokens=["t1","t2","t3","t4"],
+                         helper_dl=[False, False, False],
+                         helper_sess=["s2","s3","s5"], helpers_setup_done=True)
+        self.assertEqual(sorted(got), ["s1","s2","s3","s4","s5"])
+        self.assertEqual(got[0], "s1")
+
+    def test_partial_dl_dead(self):
+        # helper 4 dl dead → s5 main ට; helpers 1,2 → s2,s3
+        got = self._plan(sessions=["s1","s2","s3","s4","s5"], dist_download=True,
+                         helper_tokens=["t1","t2","t3","t4"],
+                         helper_dl=[True, True, False],
+                         helper_sess=["s2","s3","s5"], helpers_setup_done=True)
+        self.assertEqual(got, ["s1","s5","s4"])
+
+    def test_before_bootstrap_safe_default(self):
+        got = self._plan(sessions=["s1","s2","s3","s4","s5"], dist_download=True,
+                         helper_tokens=["t1"], helper_dl=[], helper_sess=[],
+                         helpers_setup_done=False)
+        self.assertEqual(got, ["s1"])
+
+    def test_dist_off_or_no_tokens_all_on_main(self):
+        got = self._plan(sessions=["s1","s2","s3","s4","s5"], dist_download=False,
+                         helper_tokens=["t1"], helper_dl=[], helper_sess=[],
+                         helpers_setup_done=True)
+        self.assertEqual(got, ["s1","s2","s3","s4","s5"])
+        got = self._plan(sessions=["s1","s2","s3","s4","s5"], dist_download=True,
+                         helper_tokens=[], helper_dl=[], helper_sess=[],
+                         helpers_setup_done=True)
+        self.assertEqual(got, ["s1","s2","s3","s4","s5"])
+
+    def test_no_duplicate_sessions(self):
+        got = self._plan(sessions=["s1","s1","s2","s3"], dist_download=True,
+                         helper_tokens=["t1","t2"], helper_dl=[True, False],
+                         helper_sess=["s1x-unused","s2"], helpers_setup_done=True)
+        self.assertEqual(len(got), len(set(got)))

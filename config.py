@@ -122,20 +122,6 @@ def _collect_user_strings() -> list:
 
 USER_STRINGS = _collect_user_strings()
 
-
-def main_user_strings() -> list:
-    """Main runner එකේ relay පාවිච්චි කරන sessions (0-based ගණිතයෙන්).
-
-    Distributed download on + helper tokens තිබේ නම්: 5 user accounts එක බැගින් බෙදෙන්න ඕනේ
-    (0 → main runner, 1..4 → helpers). එකම session එක රනිං යන්ත දෙකක පාවිච්චි කළොත් Telethon
-    "session already running" වලින් disconnect වෙනවා — ඒ නිසා main runner එකට 0 (+ index >4
-    අතිරේක ඒවා) ලැබෙනවා, helper #N එකට sessions[N] ලැබෙනවා.
-    """
-    if DIST_DOWNLOAD and HELPER_TOKENS and len(USER_STRINGS) > 1:
-        return USER_STRINGS[:1] + USER_STRINGS[5:]
-    return list(USER_STRINGS)
-
-
 # Private channel: "-1001234567890" (හොඳම)  |  "@username"  |  "https://t.me/+AbCdEf…" invite link
 CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
 CHANNEL_CLEANUP = os.getenv("CHANNEL_CLEANUP", "1") == "1"      # delivery ඉවර වුණාම channel එකේ messages මකනවා
