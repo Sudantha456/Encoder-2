@@ -33,6 +33,6 @@
     "mode": "res",
     "preset": "ultrafast",
     "qres": "360",
-    "workers": 10
+    "workers": 20
   }
 }
