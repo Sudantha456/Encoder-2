@@ -150,7 +150,20 @@ class AsyncDiskWriter:
         await loop.run_in_executor(self._exec, self._close_sync)
 
 
-async def _send_pool_req(pool: Any, req: Any, hint: int, timeout: float) -> Any:
+async def _send_pool_req(
+    pool: Any,
+    req: Any,
+    hint: int,
+    timeout: float,
+    slot_idx: Optional[int] = None,
+    max_slot_inflight: int = 4,
+) -> Any:
+    if slot_idx is not None:
+        send_pref = getattr(pool, "send_slot_preferred", None)
+        if callable(send_pref):
+            return await send_pref(
+                slot_idx, req, timeout=timeout, max_slot_inflight=max_slot_inflight
+            )
     send_smart = getattr(pool, "send_smart", None)
     if callable(send_smart):
         return await send_smart(req, hint=hint, timeout=timeout)
@@ -164,6 +177,8 @@ async def _fetch_chunk_bytes(
     expected_len: int,
     hint: int,
     timeout: float,
+    slot_idx: Optional[int] = None,
+    max_slot_inflight: int = 4,
 ) -> bytes:
     """
     Fetch an exact [off, off + expected_len) chunk.
@@ -171,7 +186,10 @@ async def _fetch_chunk_bytes(
     if a Telegram storage server ever returns smaller slices (e.g. 512KB).
     """
     req = GetFileRequest(location=location, offset=off, limit=CHUNK_SIZE)
-    res = await _send_pool_req(pool, req, hint=hint, timeout=timeout)
+    res = await _send_pool_req(
+        pool, req, hint=hint, timeout=timeout,
+        slot_idx=slot_idx, max_slot_inflight=max_slot_inflight,
+    )
     data = getattr(res, "bytes", None)
     if data is None:
         raise RuntimeError(f"Unexpected GetFile response: {type(res).__name__}")
@@ -193,7 +211,10 @@ async def _fetch_chunk_bytes(
             limit=aligned_limit,
             precise=True,
         )
-        sub_res = await _send_pool_req(pool, sub_req, hint=hint + 1, timeout=timeout)
+        sub_res = await _send_pool_req(
+            pool, sub_req, hint=hint + 1, timeout=timeout,
+            slot_idx=slot_idx, max_slot_inflight=max_slot_inflight,
+        )
         more = getattr(sub_res, "bytes", None)
         if not more:
             raise RuntimeError(f"Incomplete sub-chunk at offset {sub_off} ({len(buf)}/{expected_len})")
@@ -416,11 +437,21 @@ class FastDownloader:
 
         def _prog(n: int) -> None:
             downloaded[0] += n
-            now = time.monotonic()
-            if now - last_update[0] >= PROGRESS_UPDATE_INTERVAL or downloaded[0] >= total_size:
-                last_update[0] = now
-                if progress_callback:
-                    asyncio.create_task(progress_callback(downloaded[0], total_size))
+
+        async def _progress_loop() -> None:
+            if not progress_callback:
+                return
+            tick_iv = min(1.0, max(0.25, PROGRESS_UPDATE_INTERVAL * 0.5))
+            last_sent = -1
+            while not done_ev.is_set():
+                await asyncio.sleep(tick_iv)
+                cur = downloaded[0]
+                if cur != last_sent:
+                    last_sent = cur
+                    with contextlib.suppress(Exception):
+                        res = progress_callback(cur, total_size)
+                        if inspect.isawaitable(res):
+                            await res
 
         def _check_all_dead(why: str) -> None:
             if pending_lane_starts[0] <= 0 and (not all_lanes or all(l.dead for l in all_lanes)):
@@ -503,7 +534,9 @@ class FastDownloader:
                     logger.warning(f"[{ln.name}] file_reference refresh failed: {e!r}")
                 return False
 
-        async def worker(ln: Lane, widx: int) -> None:
+        async def worker(ln: Lane, widx: int, slot_idx: int = 0, pace_delay: float = 0.0) -> None:
+            if pace_delay > 0 and n_chunks >= 8 and not done_ev.is_set():
+                await asyncio.sleep(pace_delay)
             lane_fail_limit = max(32, ln.connections * wpc * 2)
             while not done_ev.is_set() and not ln.dead:
                 if self.is_cancelled(download_id):
@@ -550,6 +583,8 @@ class FastDownloader:
                         expected_len,
                         hint=widx + (3 if hedge else 0),
                         timeout=CHUNK_TIMEOUT,
+                        slot_idx=None if hedge else slot_idx,
+                        max_slot_inflight=wpc + 1,
                     )
                     dt = max(0.01, time.monotonic() - t_req)
                     ewma_chunk[0] = ewma_chunk[0] * 0.85 + dt * 0.15
@@ -644,16 +679,18 @@ class FastDownloader:
                     if main_cursor[0] >= n_chunks:
                         wake_ev.set()
 
-        def _spawn_workers_for_slot(ln: Lane) -> None:
+        def _spawn_workers_for_slot(ln: Lane, slot_obj: Any = None) -> None:
             if done_ev.is_set() or ln.dead:
                 return
             lid = id(ln)
             cur = lane_worker_counts.get(lid, 0)
             cap = _fair_lane_worker_cap(ln)
             to_spawn = min(wpc, max(0, cap - cur))
+            slot_idx = int(getattr(slot_obj, "idx", cur // wpc) or 0)
             for k in range(to_spawn):
                 idx = cur + k
-                worker_tasks.append(asyncio.create_task(worker(ln, idx)))
+                pace = (k * 0.012) + ((slot_idx % 8) * 0.003)
+                worker_tasks.append(asyncio.create_task(worker(ln, idx, slot_idx=slot_idx, pace_delay=pace)))
             if to_spawn > 0:
                 lane_worker_counts[lid] = cur + to_spawn
 
@@ -671,7 +708,7 @@ class FastDownloader:
                 await self._start_pool_streaming(
                     ln.pool,
                     size=ln.connections,
-                    on_slot_ready=lambda _slot: _spawn_workers_for_slot(ln),
+                    on_slot_ready=lambda slot_obj: _spawn_workers_for_slot(ln, slot_obj),
                 )
                 # Ensure at least 1 worker spawned if pool started with slots
                 if lane_worker_counts.get(id(ln), 0) == 0 and getattr(ln.pool, "senders", None):
@@ -717,6 +754,7 @@ class FastDownloader:
             raise RuntimeError("Userbot lane එකක්වත් ලබා දී නෑ")
 
         done_task = asyncio.create_task(done_ev.wait())
+        prog_task = asyncio.create_task(_progress_loop())
         try:
             while True:
                 await asyncio.wait({done_task, fatal}, return_when=asyncio.FIRST_COMPLETED, timeout=0.5)
@@ -742,6 +780,11 @@ class FastDownloader:
                 raise RuntimeError(f"Incomplete download {downloaded[0]}/{total_size}")
 
             await writer.close()
+            if progress_callback:
+                with contextlib.suppress(Exception):
+                    res = progress_callback(total_size, total_size)
+                    if inspect.isawaitable(res):
+                        await res
             dt_total = max(0.001, time.monotonic() - t_dl_start)
             mb_s = (total_size / 1048576) / dt_total
             logger.info(
@@ -755,13 +798,14 @@ class FastDownloader:
             raise
         finally:
             done_task.cancel()
+            prog_task.cancel()
             for t in startup_tasks:
                 if not t.done():
                     t.cancel()
             for t in worker_tasks:
                 if not t.done():
                     t.cancel()
-            await asyncio.gather(done_task, *startup_tasks, *worker_tasks, return_exceptions=True)
+            await asyncio.gather(done_task, prog_task, *startup_tasks, *worker_tasks, return_exceptions=True)
             await writer.close()
             # Note: managed pools merely release their borrow count & stay warm for the next download!
             await asyncio.gather(*[ln.pool.close() for ln in all_lanes if ln.pool], return_exceptions=True)

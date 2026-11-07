@@ -253,6 +253,27 @@ class Relay:
         self._bg_tasks.add(t)
         t.add_done_callback(self._bg_tasks.discard)
 
+    async def warmup_upload(self) -> None:
+        """Pre-warm persistent Home-DC upload pool on primary ready userbot(s)."""
+        if not self.enabled or not self.ready:
+            return
+        cands = [u for u in self._order() if not u.cooling] or self._order()
+        targets = cands[:2]
+        await asyncio.gather(
+            *[
+                warmup_pool(u.client, None, size=config.UB_UL_CONNECTIONS, use_main=False)
+                for u in targets if u.client
+            ],
+            return_exceptions=True,
+        )
+
+    def trigger_upload_warmup(self) -> None:
+        if not self.enabled or not self.ready:
+            return
+        t = asyncio.create_task(self.warmup_upload())
+        self._bg_tasks.add(t)
+        t.add_done_callback(self._bg_tasks.discard)
+
     async def stop(self):
         for t in list(self._bg_tasks):
             t.cancel()

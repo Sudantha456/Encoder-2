@@ -51,6 +51,8 @@ jobs:
           sudo sysctl -w net.core.wmem_max=16777216 2>/dev/null || true
           sudo sysctl -w net.ipv4.tcp_rmem="4096 262144 16777216" 2>/dev/null || true
           sudo sysctl -w net.ipv4.tcp_wmem="4096 262144 16777216" 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_mem="786432 1048576 1572864" 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_notsent_lowat=524288 2>/dev/null || true
           sudo sysctl -w net.ipv4.tcp_slow_start_after_idle=0 2>/dev/null || true
           sudo sysctl -w net.ipv4.tcp_window_scaling=1 2>/dev/null || true
           sudo sysctl -w net.core.default_qdisc=fq 2>/dev/null || true
@@ -94,9 +96,10 @@ jobs:
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}          # -100xxxxxxxxxx  (හෝ invite link)
           HELPER_TOKENS: ${{ secrets.HELPER_TOKENS }}    # tokenA,tokenB,tokenC,tokenD (classic PAT: repo + workflow)
           UB_DL_CONNECTIONS: ${{ vars.UB_DL_CONNECTIONS || '16' }}
-          UB_TARGET_TOTAL_CONNECTIONS: ${{ vars.UB_TARGET_TOTAL_CONNECTIONS || '80' }}
-          DL_WORKERS_PER_CONN: ${{ vars.DL_WORKERS_PER_CONN || '5' }}
-          UB_UL_CONNECTIONS: ${{ vars.UB_UL_CONNECTIONS || '12' }}
+          UB_TARGET_TOTAL_CONNECTIONS: ${{ vars.UB_TARGET_TOTAL_CONNECTIONS || '64' }}
+          DL_WORKERS_PER_CONN: ${{ vars.DL_WORKERS_PER_CONN || '3' }}
+          UB_UL_CONNECTIONS: ${{ vars.UB_UL_CONNECTIONS || '16' }}
+          UL_WORKERS_PER_CONN: ${{ vars.UL_WORKERS_PER_CONN || '3' }}
           UB_MAX_FLOOD_WAIT: ${{ vars.UB_MAX_FLOOD_WAIT || '30' }}
           PROGRESS_UPDATE_INTERVAL: ${{ vars.PROGRESS_UPDATE_INTERVAL || '3' }}
           QUEUE_MAX: ${{ vars.QUEUE_MAX || '20' }}

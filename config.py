@@ -110,14 +110,15 @@ SIZE_GUARD = os.getenv("SIZE_GUARD", "1") == "1"
 SIZE_GUARD_RATIO = float(os.getenv("SIZE_GUARD_RATIO", "0.7"))   # 0.7 = source bitrate එකෙන් 70% (≈30% කුඩා). අඩු කළොත් තවත් කුඩා
 MIN_GUARD_KBPS = 120
 
-# ── 🚀 Speed: connections × workers (වැඩි = වේගවත්, නමුත් FloodWait වැඩි වෙන්න පුළුවන්) ──
+# ── 🚀 Speed: connections × workers (constant-depth pipelining = ස්ථාවර උපරිම වේගය) ──
 DL_CONNECTIONS = int(os.getenv("DL_CONNECTIONS", "12"))
-DL_WORKERS_PER_CONN = int(os.getenv("DL_WORKERS_PER_CONN", "5"))
+DL_WORKERS_PER_CONN = int(os.getenv("DL_WORKERS_PER_CONN", "3"))
 DL_POOL_IDLE_TTL = int(os.getenv("DL_POOL_IDLE_TTL", "900"))          # warm DC connection pool idle retention (s)
 DL_DISK_THREADS = int(os.getenv("DL_DISK_THREADS", "4"))             # parallel non-blocking pwrite threads
 DL_MAX_PENDING_WRITES = int(os.getenv("DL_MAX_PENDING_WRITES", "64"))
-UL_CONNECTIONS = int(os.getenv("UL_CONNECTIONS", "8"))
-UL_WORKERS_PER_CONN = int(os.getenv("UL_WORKERS_PER_CONN", "4"))
+UL_CONNECTIONS = int(os.getenv("UL_CONNECTIONS", "12"))
+UL_WORKERS_PER_CONN = int(os.getenv("UL_WORKERS_PER_CONN", "3"))
+UL_DISK_THREADS = int(os.getenv("UL_DISK_THREADS", "4"))             # parallel non-blocking pread threads
 
 # ── 🌐 Distributed encoding (GitHub Actions workers) ──
 # Workers ගාන දැන් settings (/settings → 👷 Workers) වලින් — 2…16. මේ default එක විතරයි.
@@ -179,8 +180,8 @@ CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
 CHANNEL_CLEANUP = os.getenv("CHANNEL_CLEANUP", "1") == "1"      # delivery ඉවර වුණාම channel එකේ messages මකනවා
 
 UB_DL_CONNECTIONS = int(os.getenv("UB_DL_CONNECTIONS", "16"))                  # එක userbot එකකට connections
-UB_MAX_CONNECTIONS = int(os.getenv("UB_MAX_CONNECTIONS", "20"))                # auto-scale උපරිම connections / userbot
-UB_TARGET_TOTAL_CONNECTIONS = int(os.getenv("UB_TARGET_TOTAL_CONNECTIONS", "80"))  # මුළු userbots හරහා target connections
-UB_UL_CONNECTIONS = int(os.getenv("UB_UL_CONNECTIONS", str(UL_CONNECTIONS)))
+UB_MAX_CONNECTIONS = int(os.getenv("UB_MAX_CONNECTIONS", "16"))                # auto-scale උපරිම connections / userbot
+UB_TARGET_TOTAL_CONNECTIONS = int(os.getenv("UB_TARGET_TOTAL_CONNECTIONS", "64"))  # මුළු userbots හරහා target connections
+UB_UL_CONNECTIONS = int(os.getenv("UB_UL_CONNECTIONS", "16"))                  # userbot upload connections (home DC)
 UB_MAX_FLOOD_WAIT = int(os.getenv("UB_MAX_FLOOD_WAIT", "30"))   # මීට වැඩි FloodWait එකක් ආවොත් ඒ userbot එක පැත්තකට දාලා තව එකක් use කරනවා
 UB_FLOOD_COOLDOWN = int(os.getenv("UB_FLOOD_COOLDOWN", "60"))   # FloodWait ආපු userbot එක ඊළඟ jobs වලට මෙච්චර වෙලාවක් skip

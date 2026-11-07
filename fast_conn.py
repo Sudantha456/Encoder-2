@@ -31,24 +31,12 @@ logger = logging.getLogger("FastConn")
 # every 128 KB during 1 MB pipelined chunk downloads, allowing OS TCP rmem auto-tuning
 # to open multi-megabyte receive windows across high-RTT links.
 STREAM_READER_LIMIT = 8 * 1024 * 1024
-WRITE_BUF_HIGH = 4 * 1024 * 1024
-WRITE_BUF_LOW = 1 * 1024 * 1024
-TARGET_SOCK_BUF = 8 * 1024 * 1024
+WRITE_BUF_HIGH = 2 * 1024 * 1024
+WRITE_BUF_LOW = 512 * 1024
+NON_LINUX_SOCK_BUF = 2 * 1024 * 1024
+LINUX_NOTSENT_LOWAT = 512 * 1024
 CONNECT_TIMEOUT = 10.0
 INIT_TIMEOUT = 12.0
-
-
-def _detect_linux_rmem_max() -> int:
-    if not sys.platform.startswith("linux"):
-        return TARGET_SOCK_BUF
-    try:
-        with open("/proc/sys/net/core/rmem_max", "r", encoding="utf-8") as f:
-            return int(f.read().strip())
-    except Exception:
-        return 0
-
-
-_LINUX_RMEM_MAX = _detect_linux_rmem_max()
 
 
 def _tune_socket(writer: Optional[asyncio.StreamWriter]) -> None:
@@ -71,14 +59,20 @@ def _tune_socket(writer: Optional[asyncio.StreamWriter]) -> None:
         if opt is not None:
             with contextlib.suppress(Exception):
                 sock.setsockopt(socket.IPPROTO_TCP, opt, val)
-    # Important on Linux: explicitly setting SO_RCVBUF disables tcp_moderate_rcvbuf
-    # auto-tuning and clamps to rmem_max. Only set SO_RCVBUF if rmem_max >= 2 MB
-    # (or non-Linux); otherwise let kernel tcp_rmem auto-tune up to 6+ MB!
-    if _LINUX_RMEM_MAX >= 2 * 1024 * 1024:
-        buf_sz = min(_LINUX_RMEM_MAX, TARGET_SOCK_BUF)
+    if sys.platform.startswith("linux"):
+        # CRITICAL on Linux: never set SO_RCVBUF / SO_SNDBUF manually — doing so sets
+        # SOCK_RCVBUF_LOCK / SOCK_SNDBUF_LOCK, disabling kernel tcp_rmem/tcp_wmem + BBR
+        # dynamic BDP auto-tuning and causing upload bufferbloat spikes & tcp_mem window drops.
+        quickack = getattr(socket, "TCP_QUICKACK", 12)
+        notsent_lowat = getattr(socket, "TCP_NOTSENT_LOWAT", 25)
+        with contextlib.suppress(Exception):
+            sock.setsockopt(socket.IPPROTO_TCP, quickack, 1)
+        with contextlib.suppress(Exception):
+            sock.setsockopt(socket.IPPROTO_TCP, notsent_lowat, LINUX_NOTSENT_LOWAT)
+    else:
         for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
             with contextlib.suppress(Exception):
-                sock.setsockopt(socket.SOL_SOCKET, opt, buf_sz)
+                sock.setsockopt(socket.SOL_SOCKET, opt, NON_LINUX_SOCK_BUF)
 
 
 class FastTcpConnection(ConnectionTcpAbridged):
@@ -159,7 +153,8 @@ def invalidate_auth_cache(client, dc_id: Optional[int]) -> None:
 async def _resolve_dc_endpoints(client, dc_id: int) -> List[Any]:
     """
     එකම DC එකට අයත් සියලුම වලංගු (non-CDN, non-tcpo_only) DcOption endpoints ලබා ගන්නවා.
-    Primary endpoint එක #0 ලෙසත්, media_only=True සහ අනෙකුත් load-balancer IPs ඊළඟටත් තබනවා.
+    වැදගත්: Telegram MTProto වල media_only=True endpoints වෙනම server AuthKey table එකක් භාවිතා කරන නිසා,
+    primary endpoint එකේ media_only flag එකට ගැළපෙන endpoints පමණක් තෝරා ගනී (-404 AuthKey ගැටලු 100% වළක්වයි).
     """
     primary = await client._get_dc(dc_id)
     cls = client.__class__
@@ -169,22 +164,19 @@ async def _resolve_dc_endpoints(client, dc_id: int) -> List[Any]:
         return [primary]
 
     use_ipv6 = bool(getattr(client, "_use_ipv6", False))
+    want_media_only = bool(getattr(primary, "media_only", False))
     candidates = [
         opt for opt in dc_options
         if getattr(opt, "id", None) == dc_id
         and not bool(getattr(opt, "cdn", False))
         and not bool(getattr(opt, "tcpo_only", False))
         and bool(getattr(opt, "ipv6", False)) == use_ipv6
+        and bool(getattr(opt, "media_only", False)) == want_media_only
     ]
     if not candidates:
         return [primary]
 
-    # Prefer port 443 and prioritize media_only endpoints right after primary so
-    # multi-connection pools spread traffic across both dedicated media & general frontends.
-    candidates.sort(key=lambda o: (
-        0 if getattr(o, "port", 443) == 443 else 1,
-        0 if getattr(o, "media_only", False) else 1,
-    ))
+    candidates.sort(key=lambda o: (0 if getattr(o, "port", 443) == 443 else 1))
 
     seen = {(primary.ip_address, primary.port)}
     out = [primary]
@@ -236,6 +228,7 @@ class SenderSlot:
     inflight: int = 0
     ewma_rtt: float = 0.25
     bad: int = 0
+    last_ok: float = 0.0
     reconnecting: bool = False
     dead: bool = False
 
@@ -549,7 +542,14 @@ class SenderPool:
                         self._extras.remove(old)
                 c = self.client
                 same = self.dc_id == c.session.dc_id
-                if reset_auth and not same:
+                # Only refresh cached foreign auth_key if no sibling slot succeeded recently;
+                # prevents a single socket glitch from invalidating a healthy shared auth_key!
+                now = time.monotonic()
+                sibling_ok = any(
+                    s is not slot and not s.dead and s.last_ok > 0 and (now - s.last_ok) < 15.0
+                    for s in self.slots
+                )
+                if reset_auth and not same and not sibling_ok:
                     invalidate_auth_cache(c, self.dc_id)
                     auth_key, new_sender = await self._ensure_foreign_auth()
                     self._auth_key = auth_key
@@ -582,9 +582,11 @@ class SenderPool:
         try:
             coro = self.client(req) if slot.sender is None else slot.sender.send(req)
             res = await (asyncio.wait_for(coro, timeout=timeout) if timeout else coro)
-            dt = max(0.005, time.monotonic() - t0)
+            now = time.monotonic()
+            dt = max(0.005, now - t0)
             slot.ewma_rtt = slot.ewma_rtt * 0.75 + dt * 0.25
             slot.bad = 0
+            slot.last_ok = now
             return res
         except FloodWaitError:
             raise
@@ -610,6 +612,24 @@ class SenderPool:
             raise
         finally:
             slot.inflight = max(0, slot.inflight - 1)
+
+    async def send_slot_preferred(
+        self,
+        preferred_idx: int,
+        req,
+        timeout: Optional[float] = None,
+        max_slot_inflight: int = 4,
+    ):
+        """
+        Keep constant pipeline depth pinned to `slots[preferred_idx]` when healthy;
+        automatically spill over to `pick_slot` if that socket is busy or reconnecting.
+        """
+        if 0 <= preferred_idx < len(self.slots):
+            sl = self.slots[preferred_idx]
+            if sl.is_healthy(self.client) and sl.inflight < max_slot_inflight:
+                return await self.send_on_slot(sl, req, timeout=timeout)
+        slot = self.pick_slot(preferred_idx)
+        return await self.send_on_slot(slot, req, timeout=timeout)
 
     async def send_smart(self, req, hint: int = 0, timeout: Optional[float] = None):
         slot = self.pick_slot(hint)

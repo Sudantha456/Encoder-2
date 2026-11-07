@@ -39,7 +39,7 @@ from config import (API_ID, API_HASH, BOT_TOKEN, SESSION_NAME, ALLOWED_USERS,
                     PIX_FMT_INFO, X265_TOGGLE_INFO)
 from fast_conn import FastTcpConnection
 from fast_downloader import close_download_engine, get_downloader, init_download_engine
-from fast_uploader import get_uploader
+from fast_uploader import close_upload_engine, get_uploader, init_upload_engine
 from userbots import Relay
 from media import (VideoMeta, telegram_meta, probe_remote, ffprobe, apply_probe,
                    offered_targets, estimate_size, estimate_compress_size,
@@ -1113,6 +1113,8 @@ async def run_job(job: Job, height: int):
 
         # 2) REAL PROBE ───────────────────────────
         phase[0] = "probe"
+        if use_relay:
+            relay.trigger_upload_warmup()
         await live.set("🔍 <b>Analyzing downloaded file…</b>", force=True)
         if not apply_probe(meta, await ffprobe(str(src))):
             raise RuntimeError("Valid video stream එකක් හමු වුණේ නෑ.")
@@ -1256,14 +1258,17 @@ async def run_job(job: Job, height: int):
 
         # 4) UPLOAD ───────────────────────────────
         phase[0] = "ul"
+        if use_relay:
+            relay.trigger_upload_warmup()
+        ul_badge = "⚡ UB" if use_relay else ""
         tr2 = SpeedTracker(total=out_size)
-        await live.set(render_transfer("ul", tr2, dst.name), force=True)
+        await live.set(render_transfer("ul", tr2, dst.name, ul_badge), force=True)
 
         async def ul_cb(cur, tot):
             if phase[0] != "ul":
                 return
             tr2.update(cur, tot)
-            await live.set(render_transfer("ul", tr2, dst.name))
+            await live.set(render_transfer("ul", tr2, dst.name, ul_badge))
 
         saved_pct = (1 - out_size / meta.size) * 100 if meta.size else 0
         if is_compress:
@@ -1295,6 +1300,7 @@ async def run_job(job: Job, height: int):
                     raise asyncio.CancelledError()
                 logger.warning(f"relay upload/deliver failed ({e!r}) → bot upload")
                 await live.set("⚠️ Userbot upload fail → bot එකෙන් upload කරනවා…", force=True)
+                ul_badge = ""
                 tr2 = SpeedTracker(total=out_size)
                 sent = None
         if sent is None:
@@ -1347,6 +1353,7 @@ async def main():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     await client.start(bot_token=BOT_TOKEN)
     await init_download_engine()
+    await init_upload_engine()
     logger.info(f"🌐 Distributed workers: {'available (on-demand per queue)' if dist.available() else 'unavailable'}")
     me = await client.get_me()
     await relay.setup(client)
@@ -1362,6 +1369,7 @@ async def main():
     finally:
         await asyncio.to_thread(store.flush, 8.0)
         await relay.stop()
+        await close_upload_engine()
         await close_download_engine()
 
 
