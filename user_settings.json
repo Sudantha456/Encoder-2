@@ -28,7 +28,7 @@
     "c_preset": "fast",
     "c_sao": true,
     "c_workers": 10,
-    "codec": "libx264",
+    "codec": "libx265",
     "dist": "auto",
     "mode": "res",
     "preset": "ultrafast",
