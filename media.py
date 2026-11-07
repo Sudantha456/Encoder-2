@@ -10,7 +10,7 @@ from typing import Optional
 from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeFilename
 
 from config import (RESOLUTIONS, AUDIO_BITRATE, PROBE_HEAD_CHUNKS, PROBE_TAIL_CHUNKS,
-                    SIZE_GUARD, SIZE_GUARD_RATIO, MIN_GUARD_KBPS)
+                    SIZE_GUARD, SIZE_GUARD_RATIO, MIN_GUARD_KBPS, CRF_INFO, PIX_FMT_INFO)
 from ui import human_size, human_size_short, human_time, esc
 
 logger = logging.getLogger("Media")
@@ -211,8 +211,10 @@ def offered_targets(m: VideoMeta):
 
 def target_dims(m: VideoMeta, t: int):
     w, h = m.width, m.height
+    if not w or not h:
+        return 0, 0
     s = min(w, h)
-    if s <= t or not s:
+    if t <= 0 or s <= t or not s:
         return w - w % 2, h - h % 2
     r = t / s
     return int(round(w * r / 2) * 2), int(round(h * r / 2) * 2)
@@ -229,6 +231,22 @@ def guard_kbps(m: VideoMeta, t: int) -> int:
     tw, th = target_dims(m, t)
     ratio = (tw * th) / max(m.width * m.height, 1)
     return max(int(src_v * (ratio ** 0.75) * SIZE_GUARD_RATIO / 1000), MIN_GUARD_KBPS)
+
+
+def compress_guard_kbps(m: VideoMeta, crf: int) -> int:
+    """
+    Size-Reduce (H.265) mode size guard:
+    • CRF 14 / 16 (Ultra / Excellent): pure unconstrained CRF (0).
+    • CRF >= 18: source bitrate එක ඉක්මවා file එක ලොකු වෙන එක වළක්වන මෘදු maxrate සීමාවක්.
+    """
+    if not SIZE_GUARD or crf < 18:
+        return 0
+    dur = m.duration
+    src_v = m.vbitrate or (max(m.size * 8 / dur - (m.abitrate or 128_000), 0) if dur > 0 else 0)
+    if src_v <= 0:
+        return 0
+    cap_ratio = 0.94 if crf <= 18 else (0.86 if crf <= 20 else (0.78 if crf <= 22 else SIZE_GUARD_RATIO))
+    return max(int(src_v * cap_ratio / 1000), MIN_GUARD_KBPS)
 
 
 def estimate_size(m: VideoMeta, t: int, preset: str, codec: str) -> int:
@@ -249,6 +267,43 @@ def estimate_size(m: VideoMeta, t: int, preset: str, codec: str) -> int:
         abps = 0
     elif m.abitrate:
         abps = min(abps, m.abitrate)
+    return int((vbps + abps) * dur / 8 * 1.01)
+
+
+def estimate_compress_size(
+    m: VideoMeta,
+    *,
+    crf: int = 18,
+    preset: str = "fast",
+    pix_fmt: str = "yuv420p",
+    bframes: bool = True,
+) -> int:
+    """Estimate output byte size for Size-Reduce Mode (original resolution H.265)."""
+    dur = m.duration
+    if dur <= 0:
+        return 0
+    abps = 0 if (m.probed and not m.acodec) else (m.abitrate or 160_000)
+    src_v = m.vbitrate or max(m.size * 8 / dur - abps, 0)
+
+    # Every +6 CRF roughly halves bitrate; CRF 20 H.265 ≈ ~52% of typical H.264 source bitrate
+    crf_mult = 2.0 ** ((20 - crf) / 6.0)
+    preset_mult = PRESET_FACTOR.get(preset, 1.0) / PRESET_FACTOR["fast"]
+    chroma_mult = 1.24 if "444" in pix_fmt else (1.12 if "422" in pix_fmt else 1.0)
+    bf_mult = 1.0 if bframes else 1.18
+    src_is_hevc = (m.vcodec or "").lower() in ("hevc", "h265", "av1")
+    base_ratio = (0.82 if src_is_hevc else 0.52) * crf_mult * preset_mult * chroma_mult * bf_mult
+
+    if src_v > 0:
+        vbps = src_v * base_ratio
+    elif m.width and m.height:
+        fps = min(m.fps or 30, 60)
+        vbps = m.width * m.height * fps * BASE_BPP * 0.62 * crf_mult * preset_mult * chroma_mult * bf_mult
+    else:
+        return 0
+
+    g = compress_guard_kbps(m, crf)
+    if g:
+        vbps = min(vbps, g * 1000)
     return int((vbps + abps) * dur / 8 * 1.01)
 
 
@@ -283,4 +338,64 @@ def render_preview(m: VideoMeta, preset: str, codec: str) -> str:
         "━━━━━━━━━━━━━━━━━━━━",
         f"⚙️ Preset: <b>{preset}</b> • Codec: <b>{codec}</b>",
         "👇 <b>Output resolution එක තෝරන්න</b> (size එක ආසන්න ≈ අගයක්)",
+    ])
+
+
+def render_compress_preview(m: VideoMeta, cfg: dict) -> str:
+    unk = "—"
+    codec_txt = CODEC_NAMES.get(m.vcodec, m.vcodec.upper()) if m.vcodec else "unknown (download පසු පෙන්වයි)"
+    if m.vprofile:
+        codec_txt += f" ({m.vprofile})"
+    res_txt = f"{m.width}×{m.height} • {res_label(m)} (වෙනස් නොවේ ✅)" if m.width else unk
+    if m.fps:
+        res_txt += f" • {m.fps:.2f} fps".replace(".00", "")
+    br = f" • 🎚 {m.vbitrate / 1e6:.2f} Mbps" if m.vbitrate else ""
+    if m.acodec:
+        ch = {1: "mono", 2: "stereo"}.get(m.achannels, f"{m.achannels}ch" if m.achannels else "")
+        ab = f" • {m.abitrate // 1000} kbps" if m.abitrate else ""
+        audio = f"{m.acodec}{' • ' + ch if ch else ''}{ab}"
+    else:
+        audio = "none" if m.probed else unk
+    dc = f"DC{m.dc} ({DC_NAMES.get(m.dc, '?')})" if m.dc else unk
+
+    crf = int(cfg.get("c_crf", 18))
+    crf_tier, crf_desc = CRF_INFO.get(crf, ("Custom", ""))
+    pix = cfg.get("c_pix_fmt", "yuv420p")
+    pix_spec, _ = PIX_FMT_INFO.get(pix, ("", ""))
+    preset = cfg.get("c_preset", "fast")
+    est = estimate_compress_size(
+        m, crf=crf, preset=preset, pix_fmt=pix, bframes=bool(cfg.get("c_bframes", True))
+    )
+    if est and m.size:
+        diff_pct = (1.0 - est / m.size) * 100
+        diff_txt = f" ({diff_pct:.0f}% කුඩා)" if diff_pct >= 0 else f" (+{abs(diff_pct):.0f}%)"
+        est_txt = f"≈ {human_size(est)}{diff_txt}"
+    elif est:
+        est_txt = f"≈ {human_size(est)}"
+    else:
+        est_txt = unk
+
+    flags = (
+        f"BF:{'ON' if cfg.get('c_bframes', True) else 'OFF'} • "
+        f"SAO:{'ON' if cfg.get('c_sao', True) else 'OFF'} • "
+        f"LA:{'ON' if cfg.get('c_lookahead', True) else 'OFF'} • "
+        f"AQ:{'ON' if cfg.get('c_aq', True) else 'OFF'}"
+    )
+
+    return "\n".join([
+        f"🎬 <b>{esc(m.name)}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🗜 Mode: <b>Size-Reduce (H.265 • Visually Lossless)</b>",
+        f"🎞 Source Codec: <code>{esc(codec_txt)}</code> ➜ <b>H.265 (HEVC)</b>",
+        f"📐 Resolution: <code>{esc(res_txt)}</code>",
+        f"⏱ Duration: <code>{human_time(m.duration) if m.duration else unk}</code>",
+        f"📦 Original Size: <code>{human_size(m.size)}</code>{br}",
+        f"📉 Est. Output: <b>{est_txt}</b>",
+        f"🔊 Audio: <code>{esc(audio)}</code>",
+        f"🌐 Saved DC: <code>{esc(dc)}</code>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🎯 CRF: <b>{crf} ({crf_tier})</b> — <i>{crf_desc}</i>",
+        f"🎨 Pixel Format: <code>{pix}</code> ({pix_spec})",
+        f"⚙️ Preset: <b>{preset}</b> • 🧬 <code>{flags}</code>",
+        "👇 <b>Encode ආරම්භ කරන්න හෝ CRF ඉක්මනින් තෝරන්න:</b>",
     ])

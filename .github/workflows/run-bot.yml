@@ -29,17 +29,34 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Fast Install FFmpeg
+      - name: Fast Install FFmpeg & Progress Tunnel
         run: |
           curl -fsSL --retry 3 https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
             | tar -xJ --strip-components=1 -C /tmp --wildcards '*/ffmpeg' '*/ffprobe'
           sudo mv /tmp/ffmpeg /tmp/ffprobe /usr/local/bin/
           ffmpeg -hide_banner -encoders | grep -E "libx264|libx265"
+          if curl -fsSL --retry 3 -o /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64; then
+            chmod +x /tmp/cloudflared && sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+          fi
 
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Tune Linux Network Stack (BBR + High-BDP Buffers)
+        run: |
+          sudo modprobe tcp_bbr 2>/dev/null || true
+          sudo sysctl -w net.core.rmem_max=16777216 2>/dev/null || true
+          sudo sysctl -w net.core.wmem_max=16777216 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_rmem="4096 262144 16777216" 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_wmem="4096 262144 16777216" 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_mem="786432 1048576 1572864" 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_notsent_lowat=524288 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_slow_start_after_idle=0 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_window_scaling=1 2>/dev/null || true
+          sudo sysctl -w net.core.default_qdisc=fq 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
 
       - name: Decode & Assemble User Strings
         env:
@@ -78,14 +95,20 @@ jobs:
           USER_STRINGS: ${{ env.USER_STRINGS || secrets.USER_STRINGS }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}          # -100xxxxxxxxxx  (හෝ invite link)
           HELPER_TOKENS: ${{ secrets.HELPER_TOKENS }}    # tokenA,tokenB,tokenC,tokenD (classic PAT: repo + workflow)
-          UB_DL_CONNECTIONS: ${{ vars.UB_DL_CONNECTIONS || '12' }}
-          UB_UL_CONNECTIONS: ${{ vars.UB_UL_CONNECTIONS || '12' }}
+          UB_DL_CONNECTIONS: ${{ vars.UB_DL_CONNECTIONS || '16' }}
+          UB_TARGET_TOTAL_CONNECTIONS: ${{ vars.UB_TARGET_TOTAL_CONNECTIONS || '64' }}
+          DL_WORKERS_PER_CONN: ${{ vars.DL_WORKERS_PER_CONN || '3' }}
+          UB_UL_CONNECTIONS: ${{ vars.UB_UL_CONNECTIONS || '16' }}
+          UL_WORKERS_PER_CONN: ${{ vars.UL_WORKERS_PER_CONN || '3' }}
           UB_MAX_FLOOD_WAIT: ${{ vars.UB_MAX_FLOOD_WAIT || '30' }}
           PROGRESS_UPDATE_INTERVAL: ${{ vars.PROGRESS_UPDATE_INTERVAL || '3' }}
           QUEUE_MAX: ${{ vars.QUEUE_MAX || '20' }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SETTINGS_GH_TOKEN: ${{ secrets.SETTINGS_GH_TOKEN || secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
           DIST_WORKERS: ${{ vars.DIST_WORKERS || '10' }}   # default workers (/settings වලින් වෙනස් කරන්න පුළුවන්: 5-50)
           DOWNLOAD_DIR: ${{ runner.temp }}/downloads
         run: |
+          ulimit -n 65535 2>/dev/null || true
           python3 -u bot.py

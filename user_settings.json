@@ -1,0 +1,38 @@
+{
+  "5132917762": {
+    "c_aq": true,
+    "c_auto": "auto",
+    "c_bframes": true,
+    "c_crf": 24,
+    "c_dist": "on",
+    "c_lookahead": true,
+    "c_pix_fmt": "yuv420p",
+    "c_preset": "veryfast",
+    "c_sao": true,
+    "c_workers": 30,
+    "codec": "libx265",
+    "dist": "on",
+    "mode": "compress",
+    "preset": "veryfast",
+    "qres": "ask",
+    "workers": 30
+  },
+  "5190918746": {
+    "c_aq": true,
+    "c_auto": "ask",
+    "c_bframes": true,
+    "c_crf": 18,
+    "c_dist": "auto",
+    "c_lookahead": true,
+    "c_pix_fmt": "yuv420p",
+    "c_preset": "fast",
+    "c_sao": true,
+    "c_workers": 10,
+    "codec": "libx265",
+    "dist": "auto",
+    "mode": "res",
+    "preset": "ultrafast",
+    "qres": "360",
+    "workers": 20
+  }
+}

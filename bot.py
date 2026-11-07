@@ -17,6 +17,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+try:
+    import uvloop
+    uvloop.install()
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+except ImportError:
+    pass
+
 from telethon import TelegramClient, events, Button
 from telethon.errors import MessageNotModifiedError, FloodWaitError, QueryIdInvalidError
 
@@ -24,14 +34,19 @@ import config
 from config import (API_ID, API_HASH, BOT_TOKEN, SESSION_NAME, ALLOWED_USERS,
                     PROGRESS_UPDATE_INTERVAL, DOWNLOAD_DIR, PRESETS, CODECS,
                     PRESET_INFO, CRF, AUDIO_BITRATE, MAX_UPLOAD_BYTES,
-                    WORKER_CHOICES, QUEUE_MAX, QUEUE_RES_CHOICES)
-from fast_downloader import get_downloader, init_download_engine
-from fast_uploader import get_uploader
+                    WORKER_CHOICES, QUEUE_MAX, QUEUE_RES_CHOICES,
+                    ENCODE_MODES, CRF_CHOICES, CRF_INFO, PIX_FMT_CHOICES,
+                    PIX_FMT_INFO, X265_TOGGLE_INFO)
+from fast_conn import FastTcpConnection
+from fast_downloader import close_download_engine, get_downloader, init_download_engine
+from fast_uploader import close_upload_engine, get_uploader, init_upload_engine
 from userbots import Relay
 from media import (VideoMeta, telegram_meta, probe_remote, ffprobe, apply_probe,
-                   offered_targets, estimate_size, render_preview, short_side, guard_kbps)
+                   offered_targets, estimate_size, estimate_compress_size,
+                   render_preview, render_compress_preview, res_label,
+                   short_side, guard_kbps, compress_guard_kbps)
 from settings_store import SettingsStore
-from transcoder import EncState, transcode
+from transcoder import EncState, build_x265_extra, resolve_x265_pix_fmt, transcode
 import dist
 from ui import (SpeedTracker, render_transfer, render_encode, human_size,
                 human_size_short, human_time, human_speed, esc, render_dist)
@@ -39,7 +54,7 @@ from ui import (SpeedTracker, render_transfer, render_encode, human_size,
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
 logger = logging.getLogger("EncoderBot")
 
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+client = TelegramClient(SESSION_NAME, API_ID, API_HASH, connection=FastTcpConnection)
 client.parse_mode = "html"
 store = SettingsStore()
 pool = dist.WorkerPool()
@@ -62,6 +77,8 @@ class Job:
     started: bool = False
     proc: object = None
     height: int = 0
+    mode: str = "res"
+    job_cfg: Optional[dict] = None
     queued: bool = False
     live: object = None
 
@@ -84,52 +101,253 @@ def safe_stem(name: str) -> str:
 
 
 class Live:
-    """Message එක throttle කරලා edit කරන helper (FloodWait / same-text safe)."""
+    """
+    Per-chat FloodWait-safe message editor.
+    • Spaces edits per chat so Telegram's ~20 edits/min per-chat limit is never exceeded.
+    • Coalesces rapid force=True transitions so final states ('Done!', 'Cancelled') always land cleanly.
+    """
+
+    _chat_next_edit: dict = {}
+    _chat_locks: dict = {}
 
     def __init__(self, msg, buttons=None):
         self.msg, self.buttons = msg, buttons
-        self._busy, self._last = False, None
+        self._busy = False
+        self._last = None
+        self._next_own = 0.0
+        self._seq = 0
+        self._lock = asyncio.Lock()
+
+    @property
+    def _chat_id(self) -> int:
+        return int(getattr(self.msg, "chat_id", 0) or 0)
+
+    def _chat_lock(self) -> asyncio.Lock:
+        cid = self._chat_id
+        lk = Live._chat_locks.get(cid)
+        if lk is None:
+            lk = asyncio.Lock()
+            Live._chat_locks[cid] = lk
+        return lk
 
     async def set(self, text: str, force: bool = False):
-        if text == self._last or (self._busy and not force):
+        if text == self._last:
             return
-        self._busy = True
-        try:
-            await self.msg.edit(text, buttons=self.buttons)
-            self._last = text
-        except MessageNotModifiedError:
-            self._last = text
-        except FloodWaitError as e:
-            logger.warning(f"edit FloodWait {e.seconds}s — skipped")
-        except Exception as e:
-            logger.warning(f"edit failed: {e}")
-        finally:
-            self._busy = False
+        min_iv = max(PROGRESS_UPDATE_INTERVAL, getattr(config, "MIN_EDIT_INTERVAL", 3.8))
+        cid = self._chat_id
+        now = time.monotonic()
+
+        if not force:
+            if self._busy or now < self._next_own or now < Live._chat_next_edit.get(cid, 0.0):
+                return
+            if self._lock.locked() or self._chat_lock().locked():
+                return
+
+        self._seq += 1
+        my_seq = self._seq
+
+        async with self._lock:
+            if my_seq < self._seq or text == self._last:
+                return
+            self._busy = True
+            try:
+                async with self._chat_lock():
+                    if my_seq < self._seq or text == self._last:
+                        return
+                    wait_rem = Live._chat_next_edit.get(cid, 0.0) - time.monotonic()
+                    if wait_rem > 0:
+                        if not force:
+                            return
+                        await asyncio.sleep(min(wait_rem, 5.0))
+                        if my_seq < self._seq or text == self._last:
+                            return
+
+                    await self.msg.edit(text, buttons=self.buttons)
+                    t_done = time.monotonic()
+                    self._last = text
+                    self._next_own = t_done + (1.2 if force else min_iv)
+                    Live._chat_next_edit[cid] = t_done + (1.4 if force else 2.2)
+            except MessageNotModifiedError:
+                self._last = text
+            except FloodWaitError as e:
+                wait_s = max(float(getattr(e, "seconds", 3) or 3), 1.0)
+                Live._chat_next_edit[cid] = time.monotonic() + wait_s + 1.0
+                self._next_own = Live._chat_next_edit[cid]
+                logger.warning(f"edit FloodWait {e.seconds}s — backing off chat {cid}")
+            except Exception as e:
+                logger.warning(f"edit failed: {e}")
+            finally:
+                self._busy = False
 
 
 # ───────────────────────── preview / settings panels ─────────────────────────
+def job_target_badge(job: Job) -> str:
+    if job.mode == "compress" or job.height <= 0:
+        c = (job.job_cfg or {}).get("c_crf", 18)
+        pf = (job.job_cfg or {}).get("c_pix_fmt", "yuv420p")
+        return f"🗜 Size-Reduce (H.265 • CRF {c} • {pf})"
+    return f"{job.height}p"
+
+
 def preview_buttons(job: Job):
     cfg = store.get(job.user_id)
-    row = []
+    if cfg["mode"] == "compress":
+        est = estimate_compress_size(
+            job.meta,
+            crf=cfg["c_crf"],
+            preset=cfg["c_preset"],
+            pix_fmt=cfg["c_pix_fmt"],
+            bframes=cfg["c_bframes"],
+        )
+        est_lbl = f" ≈{human_size_short(est)}" if est else ""
+        start_btn = [Button.inline(
+            f"🚀 H.265 Compress කරන්න (CRF {cfg['c_crf']}{est_lbl})",
+            cb("cmp", job.id, "go"),
+        )]
+        qcrf_btns = [
+            Button.inline(
+                ("✅ " if cfg["c_crf"] == c else "") + f"CRF {c}" + ("⭐" if c == 18 else ""),
+                cb("pcrf", job.id, c),
+            )
+            for c in (16, 18, 20, 22, 24)
+        ]
+        return [
+            start_btn,
+            qcrf_btns,
+            [Button.inline("⚙️ Settings", cb("cfg", job.id)),
+             Button.inline("❌ Cancel", cb("x", job.id))],
+        ]
+
+    btns = []
     for t in offered_targets(job.meta):
         est = estimate_size(job.meta, t, cfg["preset"], cfg["codec"])
         label = f"{t}p ≈{human_size_short(est)}" if est else f"{t}p"
-        row.append(Button.inline(label, cb("res", job.id, t)))
-    return [row, [Button.inline("⚙️ Settings", cb("cfg", job.id)),
-                  Button.inline("❌ Cancel", cb("x", job.id))]]
+        btns.append(Button.inline(label, cb("res", job.id, t)))
+    rows = [btns[i:i + 3] for i in range(0, len(btns), 3)]
+    rows.append([Button.inline("⚙️ Settings", cb("cfg", job.id)),
+                 Button.inline("❌ Cancel", cb("x", job.id))])
+    return rows
 
 
 async def show_preview(job: Job):
     cfg = store.get(job.user_id)
-    await job.status.edit(render_preview(job.meta, cfg["preset"], cfg["codec"]),
-                          buttons=preview_buttons(job))
+    txt = (
+        render_compress_preview(job.meta, cfg)
+        if cfg["mode"] == "compress"
+        else render_preview(job.meta, cfg["preset"], cfg["codec"])
+    )
+    await job.status.edit(txt, buttons=preview_buttons(job))
 
 
-def settings_text(uid: int) -> str:
+def _mode_switch_row(active_mode: str, job_id: str) -> list:
+    return [
+        Button.inline(
+            ("✅ " if active_mode == "res" else "") + "📐 Resolution වෙනස් කිරීම",
+            cb("mod", job_id, "res"),
+        ),
+        Button.inline(
+            ("✅ " if active_mode == "compress" else "") + "🗜 Size-Reduce (H.265)",
+            cb("mod", job_id, "compress"),
+        ),
+    ]
+
+
+def settings_text(uid: int, sub: str = "") -> str:
     s = store.get(uid)
+    if sub == "crf":
+        lines = [
+            "🎯 <b>CRF (Constant Rate Factor) — H.265 Quality vs Size</b>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"දැනට තෝරා ඇත්තේ: <b>CRF {s['c_crf']} ({CRF_INFO[s['c_crf']][0]})</b>",
+            "",
+        ]
+        for c in CRF_CHOICES:
+            tier, desc = CRF_INFO[c]
+            mark = "✅ " if s["c_crf"] == c else "• "
+            lines.append(f"{mark}<b>{c} — {tier}</b>: {desc}")
+        lines += [
+            "",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "💡 <b>Visually Lossless සඳහා නිර්දේශය:</b> <code>CRF 18 – 20</code>",
+            "<i>අඩු CRF අගය = ඉහළම quality • වැඩි CRF අගය = තවත් කුඩා file size</i>",
+        ]
+        return "\n".join(lines)
+
+    if sub == "pix":
+        cur_pf = s["c_pix_fmt"]
+        enc_pf = resolve_x265_pix_fmt(cur_pf)
+        note_16 = (
+            f"\n<i>ℹ️ {cur_pf}: 16-bit precision filter සැකසුමෙන් පසු HEVC උපරිම {enc_pf} ලෙස encode වේ.</i>"
+            if cur_pf != enc_pf else ""
+        )
+        lines = [
+            "🎨 <b>Pixel Format තේරීම (Bit-Depth &amp; Chroma)</b>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"දැනට තෝරා ඇත්තේ: <code>{cur_pf}</code> ({PIX_FMT_INFO[cur_pf][0]}){note_16}",
+            "",
+        ]
+        for pf in PIX_FMT_CHOICES:
+            spec, desc = PIX_FMT_INFO[pf]
+            mark = "✅ " if cur_pf == pf else "• "
+            lines.append(f"{mark}<code>{pf}</code> <b>({spec})</b> — {desc}")
+        lines += [
+            "",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "💡 සාමාන්‍ය phones/TV සියල්ලටම <code>yuv420p</code> හෝ <code>yuv420p10le</code> වඩාත්ම ගැලපේ.",
+        ]
+        return "\n".join(lines)
+
+    if sub == "cpre":
+        lines = [
+            "🎚 <b>Size-Reduce Preset &amp; x265 Options</b>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"🎚 Preset: <b>{s['c_preset']}</b> — <i>{PRESET_INFO[s['c_preset']]}</i>",
+            "",
+            "🧬 <b>x265 Advanced Options:</b>",
+        ]
+        for k, (title, desc) in X265_TOGGLE_INFO.items():
+            st_txt = "ON ✅" if s[k] else "OFF ❌"
+            lines.append(f"• <b>{title} ({st_txt})</b>: {desc}")
+        lines += [
+            "",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "💡 <code>fast</code> / <code>medium</code> / <code>slow</code> preset එකකින් Visually Lossless H.265 හොඳම compression ලැබේ.",
+        ]
+        return "\n".join(lines)
+
+    if s["mode"] == "compress":
+        crf = s["c_crf"]
+        crf_tier, crf_desc = CRF_INFO[crf]
+        pf = s["c_pix_fmt"]
+        pf_spec, pf_desc = PIX_FMT_INFO[pf]
+        return "\n".join([
+            "⚙️ <b>Encoding Settings — 🗜 Size-Reduce Mode</b>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "🔀 Mode: <b>🗜 Quality/Resolution නොවෙනස්ව Size අඩු කිරීම (H.265)</b>",
+            f"🎯 CRF: <b>{crf} ({crf_tier})</b> — <i>{crf_desc}</i>",
+            f"🎨 Pixel Format: <code>{pf}</code> <b>({pf_spec})</b>",
+            f"   <i>{pf_desc}</i>",
+            f"🎚 Preset: <b>{s['c_preset']}</b> — <i>{PRESET_INFO[s['c_preset']]}</i>",
+            (
+                f"🧬 x265: <b>B-Frames {'ON' if s['c_bframes'] else 'OFF'}</b> • "
+                f"<b>SAO {'ON' if s['c_sao'] else 'OFF'}</b> • "
+                f"<b>Lookahead {'ON' if s['c_lookahead'] else 'OFF'}</b> • "
+                f"<b>AQ {'ON' if s['c_aq'] else 'OFF'}</b>"
+            ),
+            f"🌐 Distributed (GitHub workers): <b>{s['c_dist']}</b>"
+            + ("" if dist.available() else "  <i>(මේ environment එකේ නෑ)</i>"),
+            f"👷 Workers: <b>{s['c_workers']}</b>  <i>({min(WORKER_CHOICES)} – {max(WORKER_CHOICES)}, accounts {1 + len(dist.HELPERS)} × {config.WORKERS_PER_ACCOUNT})</i>",
+            f"📋 Auto-queue: <b>{'📋 Ask (Preview + Button)' if s['c_auto'] == 'ask' else '⚡ Auto (කෙළින්ම Queue)'}</b>",
+            f"👤 Userbot relay: <b>{('ON ×' + str(len(relay.ready))) if relay.enabled else 'OFF'}</b>",
+            f"💾 Settings Save: {store.cloud_status_text()}",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "<i>Original resolution එලෙසම තබා H.264 ➜ H.265 Visually Lossless ලෙස size අඩු කරයි.</i>",
+        ])
+
     return "\n".join([
-        "⚙️ <b>Encoding Settings</b>",
+        "⚙️ <b>Encoding Settings — 📐 Resolution Mode</b>",
         "━━━━━━━━━━━━━━━━━━━━",
+        "🔀 Mode: <b>📐 Resolution වෙනස් කිරීම (1080p … 144p)</b>",
         f"🎚 Preset: <b>{s['preset']}</b>",
         f"   <i>{PRESET_INFO[s['preset']]}</i>",
         f"🎞 Codec: <b>{s['codec']}</b>",
@@ -138,15 +356,95 @@ def settings_text(uid: int) -> str:
         f"👷 Workers: <b>{s['workers']}</b>  <i>({min(WORKER_CHOICES)} – {max(WORKER_CHOICES)}, accounts {1 + len(dist.HELPERS)} × {config.WORKERS_PER_ACCOUNT}; download එක යන අතරේත් වෙනස් කරන්න පුළුවන්)</i>",
         f"👤 Userbot relay: <b>{('ON ×' + str(len(relay.ready))) if relay.enabled else 'OFF'}</b>",
         f"📋 Auto-queue: <b>{'ask (බොත්තම්)' if s['qres'] == 'ask' else '🧠 smart' if s['qres'] == 'smart' else s['qres'] + 'p'}</b>",
+        f"💾 Settings Save: {store.cloud_status_text()}",
         "━━━━━━━━━━━━━━━━━━━━",
         "ultrafast → වේගවත්ම  |  veryslow → අඩුම size",
         "H.265 → size අඩුයි, encode වෙන්න වැඩි වෙලාවක් යනවා",
     ])
 
 
-def settings_buttons(uid: int, job_id: str):
+def _short_pf_btn(pf: str, selected: bool) -> str:
+    spec = PIX_FMT_INFO[pf][0].replace("-bit, ", "b ")
+    return ("✅ " if selected else "") + f"{pf} ({spec})"
+
+
+def settings_buttons(uid: int, job_id: str, sub: str = ""):
     s = store.get(uid)
-    rows, row = [], []
+
+    if sub == "crf":
+        btns = [
+            Button.inline(
+                ("✅ " if s["c_crf"] == c else "") + f"{c} • {CRF_INFO[c][0]}" + (" ⭐" if c == 18 else ""),
+                cb("ccrf", job_id, c),
+            )
+            for c in CRF_CHOICES
+        ]
+        rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+        rows.append([Button.inline("🔙 Settings වෙත", cb("cfg", job_id))])
+        return rows
+
+    if sub == "pix":
+        btns = [
+            Button.inline(_short_pf_btn(pf, s["c_pix_fmt"] == pf), cb("cpix", job_id, pf))
+            for pf in PIX_FMT_CHOICES
+        ]
+        rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+        rows.append([Button.inline("🔙 Settings වෙත", cb("cfg", job_id))])
+        return rows
+
+    if sub == "cpre":
+        rows, row = [], []
+        for p in PRESETS:
+            row.append(Button.inline(("✅ " if p == s["c_preset"] else "") + p, cb("cpre", job_id, p)))
+            if len(row) == 3:
+                rows.append(row)
+                row = []
+        rows.append([
+            Button.inline(f"{'✅' if s['c_bframes'] else '❌'} B-Frames: {'ON' if s['c_bframes'] else 'OFF'}", cb("ctog", job_id, "bframes_s")),
+            Button.inline(f"{'✅' if s['c_sao'] else '❌'} SAO: {'ON' if s['c_sao'] else 'OFF'}", cb("ctog", job_id, "sao_s")),
+        ])
+        rows.append([
+            Button.inline(f"{'✅' if s['c_lookahead'] else '❌'} Lookahead: {'ON' if s['c_lookahead'] else 'OFF'}", cb("ctog", job_id, "lookahead_s")),
+            Button.inline(f"{'✅' if s['c_aq'] else '❌'} AQ-Mode: {'ON' if s['c_aq'] else 'OFF'}", cb("ctog", job_id, "aq_s")),
+        ])
+        rows.append([Button.inline("🔙 Settings වෙත", cb("cfg", job_id))])
+        return rows
+
+    if s["mode"] == "compress":
+        rows = [_mode_switch_row("compress", job_id)]
+        rows.append([
+            Button.inline(f"🎯 CRF: {s['c_crf']} ({CRF_INFO[s['c_crf']][0]}) ▸", cb("sub", job_id, "crf")),
+            Button.inline(f"🎨 PixFmt: {s['c_pix_fmt']} ▸", cb("sub", job_id, "pix")),
+        ])
+        rows.append([
+            Button.inline(f"🎚 Preset: {s['c_preset']} ▸", cb("sub", job_id, "cpre")),
+            Button.inline(
+                "📋 Queue: Ask" if s["c_auto"] == "ask" else "⚡ Queue: Auto",
+                cb("caut", job_id, "auto" if s["c_auto"] == "ask" else "ask"),
+            ),
+        ])
+        rows.append([
+            Button.inline(f"{'✅' if s['c_bframes'] else '❌'} B-Frames: {'ON' if s['c_bframes'] else 'OFF'}", cb("ctog", job_id, "bframes")),
+            Button.inline(f"{'✅' if s['c_sao'] else '❌'} SAO: {'ON' if s['c_sao'] else 'OFF'}", cb("ctog", job_id, "sao")),
+        ])
+        rows.append([
+            Button.inline(f"{'✅' if s['c_lookahead'] else '❌'} Lookahead: {'ON' if s['c_lookahead'] else 'OFF'}", cb("ctog", job_id, "lookahead")),
+            Button.inline(f"{'✅' if s['c_aq'] else '❌'} AQ-Mode: {'ON' if s['c_aq'] else 'OFF'}", cb("ctog", job_id, "aq")),
+        ])
+        rows.append([
+            Button.inline(("✅ " if s["c_dist"] == m else "") + f"🌐 {m.title()}", cb("cdst", job_id, m))
+            for m in ("auto", "on", "off")
+        ])
+        wbtns = [
+            Button.inline(("✅ " if s["c_workers"] == n else "") + f"👷{n}", cb("cwrk", job_id, n))
+            for n in WORKER_CHOICES
+        ]
+        rows += [wbtns[i:i + 5] for i in range(0, len(wbtns), 5)]
+        rows.append([Button.inline("🔙 Back" if job_id != "0" else "✖ Close", cb("back", job_id))])
+        return rows
+
+    rows = [_mode_switch_row("res", job_id)]
+    row = []
     for p in PRESETS:
         row.append(Button.inline(("✅ " if p == s["preset"] else "") + p, cb("pre", job_id, p)))
         if len(row) == 3:
@@ -173,11 +471,12 @@ async def cmd_start(event):
         return
     await event.reply(
         "👋 <b>Video Encoder Bot</b>\n\n"
-        "🎬 Video එකක් එවන්න → metadata preview එක පෙනෙයි\n"
-        "📐 Source එකට අඩු resolutions (1080p…144p) තෝරන්න (≈ size පෙන්වනවා) • Settings → 🧠 Smart = auto හොඳම එක\n"
-        "⚡ High-speed download → FFmpeg encode → High-speed upload\n\n"
-        "📋 Videos 20 ක් දක්වා queue කරන්න පුළුවන් — එකින් එක download → encode → upload\n"
-        "⚙️ Preset / Codec / Workers: /settings   •   📋 /queue   •   🧹 /clear\n"
+        "🔀 <b>Modes දෙකක් ඇත (/settings වලින් මාරු කරන්න):</b>\n"
+        "  1️⃣ <b>📐 Resolution Mode</b> — 1080p…144p ලෙස resolution වෙනස් කිරීම\n"
+        "  2️⃣ <b>🗜 Size-Reduce Mode (H.265)</b> — Resolution සහ Quality වෙනස් නොවී Visually Lossless ලෙස size අඩු කිරීම (CRF, Pixel Format, B-Frames/SAO/Lookahead, Workers)\n\n"
+        "⚡ High-speed download → FFmpeg / GitHub Workers encode → High-speed upload\n"
+        "☁️ ඔබගේ සියලුම /settings තේරීම් GitHub JSON හි ස්වයංක්‍රීයව save වේ\n\n"
+        "⚙️ Settings: /settings   •   📋 /queue   •   🧹 /clear\n"
         "🌐 Worker workflows: /workflow   •   🛑 /End_Work (සේරම workers kill)"
     )
 
@@ -263,10 +562,12 @@ async def cmd_workflow(event):
     m = await event.reply("🔍 <b>Worker workflows බලනවා…</b>")
     cur = current_job[0]
     cfg = store.get(event.sender_id)
+    act_wrk = cfg["c_workers"] if cfg["mode"] == "compress" else cfg["workers"]
+    act_dst = cfg["c_dist"] if cfg["mode"] == "compress" else cfg["dist"]
     head = [
         "🌐 <b>Worker Workflows</b>",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"⚙️ Settings workers: <b>{cfg['workers']}</b> • Dist mode: <b>{esc(str(cfg['dist']))}</b> • Capacity: <b>{dist.capacity()}</b>",
+        f"⚙️ Mode: <b>{'🗜 Size-Reduce' if cfg['mode'] == 'compress' else '📐 Resolution'}</b> • Workers: <b>{act_wrk}</b> • Dist: <b>{esc(str(act_dst))}</b> • Capacity: <b>{dist.capacity()}</b>",
         f"📋 Queue: {'▶️ ' + esc(cur.meta.name[:30]) + ' + ' if cur else ''}<b>{len(queue)}</b> waiting",
         f"🧠 Pool: <b>{'ACTIVE' if pool.active else 'idle'}</b>{' • 🛑 halted (/End_Work)' if pool.halted else ''}",
     ]
@@ -352,9 +653,9 @@ def queue_text() -> str:
     rows = []
     cur = current_job[0]
     if cur:
-        rows.append(f"▶️ <b>Running</b>: <code>{esc(cur.meta.name[:40])}</code> → {cur.height}p")
+        rows.append(f"▶️ <b>Running</b>: <code>{esc(cur.meta.name[:40])}</code> → {esc(job_target_badge(cur))}")
     for i, j in enumerate(queue, 1):
-        rows.append(f"{i}. <code>{esc(j.meta.name[:40])}</code> → {j.height}p")
+        rows.append(f"{i}. <code>{esc(j.meta.name[:40])}</code> → {esc(job_target_badge(j))}")
     if not rows:
         return "📭 Queue හිස්."
     return f"📋 <b>Queue</b> ({len(queue) + (1 if cur else 0)}/{QUEUE_MAX})\n━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(rows)
@@ -391,21 +692,46 @@ async def cancel_waiting(job: Job):
     await refresh_positions()
 
 
+_refresh_pos_task: Optional[asyncio.Task] = None
+_refresh_pos_dirty: bool = False
+
+
+async def _refresh_positions_inner():
+    global _refresh_pos_dirty
+    while _refresh_pos_dirty:
+        await asyncio.sleep(0.8)
+        _refresh_pos_dirty = False
+        snap = list(queue)
+        total = len(snap)
+        for i, j in enumerate(snap, 1):
+            if j.live and not j.cancelled and j in queue:
+                await j.live.set(
+                    f"⏳ <b>Queued #{i}</b> / {total}\n"
+                    f"<code>{esc(j.meta.name[:50])}</code> → {esc(job_target_badge(j))}\n"
+                    "ඉස්සරහ jobs ඉවර වුණාම ස්වයංක්‍රීයව පටන් ගන්නවා.",
+                    force=True,
+                )
+
+
 async def refresh_positions():
-    for i, j in enumerate(list(queue), 1):
-        if j.live:
-            await j.live.set(f"⏳ <b>Queued #{i}</b> / {len(queue)}\n<code>{esc(j.meta.name[:50])}</code> → {j.height}p\n"
-                             "ඉස්සරහ jobs ඉවර වුණාම ස්වයංක්‍රීයව පටන් ගන්නවා.", force=True)
+    """Coalesce burst queue changes so batch-forwarding 10+ videos doesn't fire O(N²) edits."""
+    global _refresh_pos_task, _refresh_pos_dirty
+    _refresh_pos_dirty = True
+    if _refresh_pos_task is None or _refresh_pos_task.done():
+        _refresh_pos_task = asyncio.create_task(_refresh_positions_inner())
 
 
-async def enqueue(job: Job, height: int) -> bool:
+async def enqueue(job: Job, height: int, *, mode: str = "res") -> bool:
     global queue_task
     if pending_count() >= QUEUE_MAX:
         with contextlib.suppress(Exception):
             await job.status.edit(f"🚫 Queue පිරිලා ({QUEUE_MAX}/{QUEUE_MAX}). ටිකක් ඉඳලා ආයෙ එවන්න.", buttons=None)
         jobs.pop(job.id, None)
         return False
-    job.height, job.queued, job.started = height, True, True
+    job.height = 0 if mode == "compress" else height
+    job.mode = mode
+    job.job_cfg = store.get(job.user_id)
+    job.queued, job.started = True, True
     job.live = Live(job.status, [[Button.inline("❌ Cancel", cb("x", job.id))]])
     queue.append(job)
     await refresh_positions()
@@ -458,6 +784,8 @@ async def on_video(event):
     job = Job(id=uuid.uuid4().hex[:8], user_id=event.sender_id, chat_id=event.chat_id,
               message=msg, meta=telegram_meta(msg), status=status)
     jobs[job.id] = job
+    if relay.enabled:
+        relay.trigger_warmup(job.meta.dc)
 
     workdir = Path(DOWNLOAD_DIR) / ("probe_" + job.id)
     workdir.mkdir(parents=True, exist_ok=True)
@@ -467,17 +795,24 @@ async def on_video(event):
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
-    qres = store.get(job.user_id)["qres"]
-    if qres != "ask":                       # auto-queue: source එකට වඩා ලොකු resolution නම් ළඟම එක
-        opts = offered_targets(job.meta)
-        if qres == "smart":                 # source එකට අඩුවෙන් තියෙන හොඳම (ලොකුම) resolution එක
-            target = max(opts)
+    ucfg = store.get(job.user_id)
+    if ucfg["mode"] == "compress":
+        if ucfg["c_auto"] == "auto":
+            await enqueue(job, 0, mode="compress")
         else:
-            want = int(qres)
-            target = want if want in opts else min(opts, key=lambda t: abs(t - want))
-        await enqueue(job, target)
+            await show_preview(job)
     else:
-        await show_preview(job)
+        qres = ucfg["qres"]
+        if qres != "ask":                       # auto-queue: source එකට වඩා ලොකු resolution නම් ළඟම එක
+            opts = offered_targets(job.meta)
+            if qres == "smart":                 # source එකට අඩුවෙන් තියෙන හොඳම (ලොකුම) resolution එක
+                target = max(opts)
+            else:
+                want = int(qres)
+                target = want if want in opts else min(opts, key=lambda t: abs(t - want))
+            await enqueue(job, target, mode="res")
+        else:
+            await show_preview(job)
 
 
 # ───────────────────────── callbacks ─────────────────────────
@@ -512,7 +847,26 @@ async def on_callback(event):
             await safe_answer(event, "Already in queue…")
             return
         await safe_answer(event, "Queued ✔")      # කලින්ම answer — enqueue එක slow වුණත් query expire වෙන්නේ නෑ
-        await enqueue(job, int(arg))              # queue පිරිලා නම් enqueue එකම status message එක edit කරනවා
+        await enqueue(job, int(arg), mode="res")  # queue පිරිලා නම් enqueue එකම status message එක edit කරනවා
+
+    elif action == "cmp":
+        if job.started:
+            await safe_answer(event, "Already in queue…")
+            return
+        await safe_answer(event, "Queued (Size-Reduce H.265) ✔")
+        await enqueue(job, 0, mode="compress")
+
+    elif action == "pcrf":
+        if job.started:
+            await safe_answer(event, "Already in queue…")
+            return
+        c_val = int(arg)
+        if c_val not in CRF_CHOICES:
+            return
+        store.set(uid, c_crf=c_val)
+        await safe_answer(event, f"CRF {c_val} ({CRF_INFO[c_val][0]}) ✔")
+        with contextlib.suppress(MessageNotModifiedError):
+            await show_preview(job)
 
     elif action == "x":
         if job.queued and job in queue:          # තාම පටන් අරන් නෑ → queue එකෙන් අයින්
@@ -532,8 +886,82 @@ async def on_callback(event):
                 await job.status.edit("❌ <b>Cancelled</b>", buttons=None)
 
     elif action == "cfg":
-        await safe_answer(event, )
-        await event.edit(settings_text(uid), buttons=settings_buttons(uid, job_id))
+        await safe_answer(event)
+        with contextlib.suppress(MessageNotModifiedError):
+            await event.edit(settings_text(uid), buttons=settings_buttons(uid, job_id))
+
+    elif action == "sub":
+        if arg not in ("crf", "pix", "cpre"):
+            return
+        await safe_answer(event)
+        with contextlib.suppress(MessageNotModifiedError):
+            await event.edit(settings_text(uid, sub=arg), buttons=settings_buttons(uid, job_id, sub=arg))
+
+    elif action == "mod":
+        if arg not in ENCODE_MODES:
+            return
+        store.set(uid, mode=arg)
+        lbl = "🗜 Size-Reduce (H.265)" if arg == "compress" else "📐 Resolution Mode"
+        await safe_answer(event, f"{lbl} ✔")
+        with contextlib.suppress(MessageNotModifiedError):
+            await event.edit(settings_text(uid), buttons=settings_buttons(uid, job_id))
+
+    elif action == "ccrf":
+        c_val = int(arg)
+        if c_val not in CRF_CHOICES:
+            return
+        store.set(uid, c_crf=c_val)
+        await safe_answer(event, f"CRF {c_val} ({CRF_INFO[c_val][0]}) ✔")
+        with contextlib.suppress(MessageNotModifiedError):
+            await event.edit(settings_text(uid, sub="crf"), buttons=settings_buttons(uid, job_id, sub="crf"))
+
+    elif action == "cpix":
+        if arg not in PIX_FMT_CHOICES:
+            return
+        store.set(uid, c_pix_fmt=arg)
+        await safe_answer(event, f"{arg} ✔")
+        with contextlib.suppress(MessageNotModifiedError):
+            await event.edit(settings_text(uid, sub="pix"), buttons=settings_buttons(uid, job_id, sub="pix"))
+
+    elif action == "cpre":
+        if arg not in PRESETS:
+            return
+        store.set(uid, c_preset=arg)
+        await safe_answer(event, f"Preset: {arg} ✔")
+        with contextlib.suppress(MessageNotModifiedError):
+            await event.edit(settings_text(uid, sub="cpre"), buttons=settings_buttons(uid, job_id, sub="cpre"))
+
+    elif action == "ctog":
+        in_sub = arg.endswith("_s")
+        base_arg = arg[:-2] if in_sub else arg
+        tmap = {"bframes": "c_bframes", "sao": "c_sao", "lookahead": "c_lookahead", "aq": "c_aq"}
+        if base_arg not in tmap:
+            return
+        k = tmap[base_arg]
+        cur_s = store.get(uid)
+        new_val = not bool(cur_s.get(k, True))
+        store.set(uid, **{k: new_val})
+        title = X265_TOGGLE_INFO[k][0]
+        await safe_answer(event, f"{title}: {'ON' if new_val else 'OFF'} ✔")
+        sub_name = "cpre" if in_sub else ""
+        with contextlib.suppress(MessageNotModifiedError):
+            await event.edit(settings_text(uid, sub=sub_name), buttons=settings_buttons(uid, job_id, sub=sub_name))
+
+    elif action in ("caut", "cdst", "cwrk"):
+        key = {"caut": "c_auto", "cdst": "c_dist", "cwrk": "c_workers"}[action]
+        if action == "cwrk":
+            if int(arg) not in WORKER_CHOICES:
+                return
+            arg = int(arg)
+        store.set(uid, **{key: arg})
+        await safe_answer(event, f"{arg} ✔")
+        if action == "cwrk" and pool.active and dist.available():
+            async def _grow_c():
+                with contextlib.suppress(Exception):
+                    await pool.ensure(min(arg, dist.capacity()))
+            asyncio.create_task(_grow_c())
+        with contextlib.suppress(MessageNotModifiedError):
+            await event.edit(settings_text(uid), buttons=settings_buttons(uid, job_id))
 
     elif action in ("pre", "cod", "dst", "wrk", "qres"):
         key = {"pre": "preset", "cod": "codec", "dst": "dist", "wrk": "workers", "qres": "qres"}[action]
@@ -553,7 +981,7 @@ async def on_callback(event):
             await event.edit(settings_text(uid), buttons=settings_buttons(uid, job_id))
 
     elif action == "back":
-        await safe_answer(event, )
+        await safe_answer(event)
         if job and not job.started:
             await show_preview(job)
         else:
@@ -567,15 +995,44 @@ async def run_job(job: Job, height: int):
     live = job.live or Live(job.status, cancel_btn)
     live.buttons = cancel_btn
     meta = job.meta
-    cfg = store.get(job.user_id)
-    preset, codec = cfg["preset"], cfg["codec"]
-    est_size = estimate_size(meta, height, preset, codec)
+    jcfg = job.job_cfg or store.get(job.user_id)
+    live_cfg = store.get(job.user_id)
+    is_compress = job.mode == "compress" or height <= 0
+
+    if is_compress:
+        preset = jcfg["c_preset"]
+        codec = "libx265"
+        crf_val = jcfg["c_crf"]
+        pix_fmt = jcfg["c_pix_fmt"]
+        x265_extra = build_x265_extra(
+            bframes=jcfg["c_bframes"],
+            sao=jcfg["c_sao"],
+            lookahead=jcfg["c_lookahead"],
+            aq=jcfg["c_aq"],
+        )
+        dist_mode = live_cfg["c_dist"]
+        est_size = estimate_compress_size(
+            meta, crf=crf_val, preset=preset, pix_fmt=pix_fmt, bframes=jcfg["c_bframes"]
+        )
+    else:
+        preset = jcfg["preset"]
+        codec = jcfg["codec"]
+        crf_val = CRF[codec]
+        pix_fmt = "yuv420p"
+        x265_extra = ""
+        dist_mode = live_cfg["dist"]
+        est_size = estimate_size(meta, height, preset, codec)
 
     workdir = Path(DOWNLOAD_DIR) / job.id
     workdir.mkdir(parents=True, exist_ok=True)
     stem = safe_stem(meta.name)
     ext = os.path.splitext(meta.name)[1] or ".mp4"
-    src, dst = workdir / f"in_{stem}{ext}", workdir / f"{stem}_{height}p.mp4"
+    src = workdir / f"in_{stem}{ext}"
+    dst = (
+        workdir / f"{stem}_H265_CRF{crf_val}.mp4"
+        if is_compress
+        else workdir / f"{stem}_{height}p.mp4"
+    )
 
     phase = ["dl"]
     t_start = time.monotonic()
@@ -588,36 +1045,53 @@ async def run_job(job: Job, height: int):
             raise asyncio.CancelledError()
 
         # 0) Workers ඉක්මන් start: download එක යන අතරේම runners ready කරන්න ─
-        if dist.should_distribute(meta, height, preset, codec, cfg["dist"]):
+        if dist.should_distribute(meta, 0 if is_compress else height, preset, codec, dist_mode, pix_fmt=pix_fmt):
             async def _prestart():
                 with contextlib.suppress(Exception):
-                    await pool.ensure(min(store.get(job.user_id)["workers"], dist.capacity()))
+                    cur_c = store.get(job.user_id)
+                    w_n = cur_c["c_workers"] if is_compress else cur_c["workers"]
+                    await pool.ensure(min(w_n, dist.capacity()))
             prestart = asyncio.create_task(_prestart())
 
         # 1) DOWNLOAD ─────────────────────────────
+        use_relay, ch_in = relay.enabled and bool(relay.ready), None
+        dl_badge = f"⚡ {len(relay.ready)}×UB" if use_relay else ""
         tr = SpeedTracker(total=meta.size)
-        await live.set(render_transfer("dl", tr, meta.name), force=True)
 
         async def dl_cb(cur, tot):
             if phase[0] != "dl":
                 return
             tr.update(cur, tot)
-            await live.set(render_transfer("dl", tr, meta.name))
+            await live.set(render_transfer("dl", tr, meta.name, dl_badge))
 
-        use_relay, ch_in = relay.enabled and bool(relay.ready), None
-        if use_relay:                                      # user ගේ video එක → private channel (userbots එතනින් ගන්නවා)
+        if use_relay:                                      # user ගේ video එක → private channel + parallel DC pool warmup
             try:
                 await live.set("📨 <b>Channel එකට forward කරනවා…</b>", force=True)
-                ch_in = await relay.forward_in(client, job.message)
-                ch_ids.append(ch_in)
+                fwd_task = asyncio.create_task(relay.forward_in(client, job.message))
+                warm_task = asyncio.create_task(relay.warmup(meta.dc))
+                try:
+                    ch_in = await fwd_task
+                    ch_ids.append(ch_in)
+                finally:
+                    if not warm_task.done():
+                        # Keep warmup running in background if not finished yet; download_lanes attaches seamlessly
+                        relay._bg_tasks.add(warm_task)
+                        warm_task.add_done_callback(relay._bg_tasks.discard)
+                    else:
+                        with contextlib.suppress(Exception):
+                            warm_task.result()
             except Exception as e:
                 logger.warning(f"relay forward failed ({e!r}) → bot download")
                 use_relay = False
-            await live.set(render_transfer("dl", tr, meta.name), force=True)
+                dl_badge = ""
+
+        tr.reset()
+        await live.set(render_transfer("dl", tr, meta.name, dl_badge), force=True)
+
         if use_relay:
             try:
                 await relay.download(dl, ch_in, str(src), job.id, dl_cb)
-                stats["via"] = [u.name for u in relay.ready]
+                stats["via"] = relay.last_used_lanes or [u.name for u in relay.ready]
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -626,9 +1100,10 @@ async def run_job(job: Job, height: int):
                 logger.warning(f"relay download failed ({e!r}) → bot download")
                 await live.set("⚠️ Userbot download fail → bot එකෙන් download කරනවා…", force=True)
                 src.unlink(missing_ok=True)
-                tr = SpeedTracker(total=meta.size)
                 use_relay = False
+                dl_badge = ""
                 stats.pop("via", None)
+                tr.reset()
                 await dl.download(client, job.message, str(src), job.id, dl_cb)
         else:
             await dl.download(client, job.message, str(src), job.id, dl_cb)
@@ -638,35 +1113,87 @@ async def run_job(job: Job, height: int):
 
         # 2) REAL PROBE ───────────────────────────
         phase[0] = "probe"
+        if use_relay:
+            relay.trigger_upload_warmup()
         await live.set("🔍 <b>Analyzing downloaded file…</b>", force=True)
         if not apply_probe(meta, await ffprobe(str(src))):
             raise RuntimeError("Valid video stream එකක් හමු වුණේ නෑ.")
 
         # 3) ENCODE ───────────────────────────────
         phase[0] = "enc"
-        # Audio: source එකේ bitrate එකට වඩා වැඩි කරන්නේ නෑ; AAC & අඩු නම් copy
-        ab = AUDIO_BITRATE.get(height, 96)
         src_ab = meta.abitrate // 1000
-        ac = meta.acodec == "aac" and 0 < src_ab <= ab
-        if src_ab and not ac:
-            ab = min(ab, src_ab)
-        enc_opts = dict(
-            target=height, scale=short_side(meta) > height, portrait=meta.height > meta.width,
-            preset=preset, codec=codec, crf=CRF[codec], maxrate_kbps=guard_kbps(meta, height),
-            abitrate=ab, audio_mode="copy" if ac else "aac",
-        )
+        if is_compress:
+            # Recompute estimate after real probe
+            est_size = estimate_compress_size(
+                meta, crf=crf_val, preset=preset, pix_fmt=pix_fmt, bframes=jcfg["c_bframes"]
+            )
+            if not meta.acodec:
+                audio_mode, ab = "none", 0
+            elif meta.acodec in ("aac", "mp3", "ac3", "eac3"):
+                # Original audio quality 100% රැකගැනීමට lossless stream copy
+                audio_mode, ab = "copy", src_ab or 192
+            else:
+                audio_mode, ab = "aac", min(max(src_ab or 192, 160), 256)
+
+            enc_opts = dict(
+                target=0,
+                scale=False,
+                portrait=meta.height > meta.width,
+                preset=preset,
+                codec="libx265",
+                crf=crf_val,
+                maxrate_kbps=compress_guard_kbps(meta, crf_val),
+                abitrate=ab,
+                audio_mode=audio_mode,
+                pix_fmt=pix_fmt,
+                x265_extra=x265_extra,
+            )
+            t_label = f"🗜 {meta.width}×{meta.height} (Original)" if meta.width else "🗜 Size-Reduce"
+            extra_lbl = f"CRF {crf_val} • {pix_fmt}"
+        else:
+            est_size = estimate_size(meta, height, preset, codec)
+            # Audio: source එකේ bitrate එකට වඩා වැඩි කරන්නේ නෑ; AAC & අඩු නම් copy
+            ab = AUDIO_BITRATE.get(height, 96)
+            ac = meta.acodec == "aac" and 0 < src_ab <= ab
+            if src_ab and not ac:
+                ab = min(ab, src_ab)
+            audio_mode = "none" if (meta.probed and not meta.acodec) else ("copy" if ac else "aac")
+            enc_opts = dict(
+                target=height,
+                scale=short_side(meta) > height,
+                portrait=meta.height > meta.width,
+                preset=preset,
+                codec=codec,
+                crf=crf_val,
+                maxrate_kbps=guard_kbps(meta, height),
+                abitrate=ab,
+                audio_mode=audio_mode,
+                pix_fmt="yuv420p",
+                x265_extra="",
+            )
+            t_label = f"{height}p"
+            extra_lbl = ""
         encoded = False
 
         # 3a) Distributed (GitHub Actions workers) ─
         cfg = store.get(job.user_id)         # download අතරේ settings (workers…) වෙනස් කළා නම් අලුත් එක
-        n_workers = min(cfg["workers"], dist.capacity())       # accounts වලින් දෙන්න පුළුවන් උපරිමය
-        if dist.should_distribute(meta, height, preset, codec, cfg["dist"]):
+        cur_wrk = cfg["c_workers"] if is_compress else cfg["workers"]
+        cur_dst = cfg["c_dist"] if is_compress else cfg["dist"]
+        n_workers = min(cur_wrk, dist.capacity())       # accounts වලින් දෙන්න පුළුවන් උපරිමය
+        if dist.should_distribute(meta, 0 if is_compress else height, preset, codec, cur_dst, pix_fmt=pix_fmt):
             dst_state = dist.DistState(meta.duration, meta.fps, n_workers)
+
+            tick_iv = max(PROGRESS_UPDATE_INTERVAL, getattr(config, "MIN_EDIT_INTERVAL", 3.8))
 
             async def dist_ticker():
                 while True:
-                    await live.set(render_dist(dst_state, meta.name, height, preset, codec))
-                    await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
+                    await live.set(
+                        render_dist(
+                            dst_state, meta.name, height, preset, codec,
+                            target_label=t_label, extra_info=extra_lbl,
+                        )
+                    )
+                    await asyncio.sleep(tick_iv)
 
             dticker = asyncio.create_task(dist_ticker())
             try:
@@ -676,7 +1203,7 @@ async def run_job(job: Job, height: int):
                 dstats = await run.run()
                 stats["enc_time"], stats["enc_speed"] = dst_state.elapsed, meta.duration / max(dst_state.elapsed, 1)
                 stats["workers"] = dstats["workers"]
-                stats["local_parts"] = dstats["local_parts"]
+                stats["local_parts"] = dstats.get("local_parts", 0)
                 stats["reassigned_parts"] = dstats.get("reassigned_parts", 0)
                 encoded = True
             except asyncio.CancelledError:
@@ -700,16 +1227,22 @@ async def run_job(job: Job, height: int):
 
             async def enc_ticker():
                 while True:
-                    await live.set(render_encode(st, meta.name, height, preset, codec))
+                    await live.set(
+                        render_encode(
+                            st, meta.name, height, preset, codec,
+                            target_label=t_label, extra_info=extra_lbl,
+                        )
+                    )
                     await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
 
             ticker = asyncio.create_task(enc_ticker())
             try:
                 await transcode(
                     str(src), str(dst), st, job,
-                    target=height, scale=enc_opts["scale"], portrait=enc_opts["portrait"],
-                    preset=preset, codec=codec, crf=CRF[codec], abitrate=ab,
+                    target=enc_opts["target"], scale=enc_opts["scale"], portrait=enc_opts["portrait"],
+                    preset=preset, codec=codec, crf=crf_val, abitrate=ab,
                     maxrate_kbps=enc_opts["maxrate_kbps"], audio_mode=enc_opts["audio_mode"],
+                    pix_fmt=enc_opts["pix_fmt"], x265_extra=enc_opts["x265_extra"],
                 )
             finally:
                 ticker.cancel()
@@ -725,18 +1258,32 @@ async def run_job(job: Job, height: int):
 
         # 4) UPLOAD ───────────────────────────────
         phase[0] = "ul"
+        if use_relay:
+            relay.trigger_upload_warmup()
+        ul_badge = "⚡ UB" if use_relay else ""
         tr2 = SpeedTracker(total=out_size)
-        await live.set(render_transfer("ul", tr2, dst.name), force=True)
+        await live.set(render_transfer("ul", tr2, dst.name, ul_badge), force=True)
 
         async def ul_cb(cur, tot):
             if phase[0] != "ul":
                 return
             tr2.update(cur, tot)
-            await live.set(render_transfer("ul", tr2, dst.name))
+            await live.set(render_transfer("ul", tr2, dst.name, ul_badge))
 
-        caption = (f"🎬 <b>{esc(stem)}</b>\n"
-                   f"📐 {height}p • 🎞 {codec} • ⚙️ {preset}\n"
-                   f"📦 {human_size(out_size)} (original {human_size(meta.size)})")
+        saved_pct = (1 - out_size / meta.size) * 100 if meta.size else 0
+        if is_compress:
+            res_txt = f"{meta.width}×{meta.height} ({res_label(meta)})" if meta.width else "Original Res"
+            caption = (
+                f"🎬 <b>{esc(stem)}</b>\n"
+                f"🗜 {res_txt} • 🎞 H.265 CRF {crf_val} ({CRF_INFO[crf_val][0]}) • 🎨 {pix_fmt} • ⚙️ {preset}\n"
+                f"📦 {human_size(out_size)} (original {human_size(meta.size)} • {'−' if saved_pct >= 0 else '+'}{abs(saved_pct):.0f}%)"
+            )
+        else:
+            caption = (
+                f"🎬 <b>{esc(stem)}</b>\n"
+                f"📐 {height}p • 🎞 {codec} • ⚙️ {preset}\n"
+                f"📦 {human_size(out_size)} (original {human_size(meta.size)})"
+            )
         sent = None
         if use_relay:
             try:
@@ -753,6 +1300,7 @@ async def run_job(job: Job, height: int):
                     raise asyncio.CancelledError()
                 logger.warning(f"relay upload/deliver failed ({e!r}) → bot upload")
                 await live.set("⚠️ Userbot upload fail → bot එකෙන් upload කරනවා…", force=True)
+                ul_badge = ""
                 tr2 = SpeedTracker(total=out_size)
                 sent = None
         if sent is None:
@@ -805,6 +1353,7 @@ async def main():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     await client.start(bot_token=BOT_TOKEN)
     await init_download_engine()
+    await init_upload_engine()
     logger.info(f"🌐 Distributed workers: {'available (on-demand per queue)' if dist.available() else 'unavailable'}")
     me = await client.get_me()
     await relay.setup(client)
@@ -818,7 +1367,10 @@ async def main():
     try:
         await client.run_until_disconnected()
     finally:
+        await asyncio.to_thread(store.flush, 8.0)
         await relay.stop()
+        await close_upload_engine()
+        await close_download_engine()
 
 
 if __name__ == "__main__":

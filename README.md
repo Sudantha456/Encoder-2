@@ -22,10 +22,28 @@ CHANNEL_ID=-1001234567890                 # secret CHANNEL_ID
 Bot start වෙද්දී self-test එකක් run වෙනවා (userbot connect → channel resolve → permissions → bot↔userbot round-trip).
 Setup වැරදි නම් `ALLOWED_USERS` ට හේතුව සහිත message එකක් යනවා, bot එක **පරණ විදිහටම** (bot එකෙන් download/upload) වැඩ කරනවා. හදලා `/check` එවන්න.
 
+## ⚡ Turbo Download Engine
+- **Persistent Warm Pools & AuthKey Cache:** හැම userbot එකකටම DC අනුව warm Abridged-TCP connections (`FastTcpConnection` + 8MB buffers + `TCP_NODELAY` + `uvloop`) jobs අතරේත් සූදානම්ව තබා ගනී — cold handshake / `ExportAuthorization` ප්‍රමාදය ඉවත් කරයි.
+- **Multi-IP & `media_only` DC Routing:** එකම DC එකේ dedicated `media_only` සහ සාමාන්‍ය load-balancer IPs සියල්ල හරහා connections ස්වයංක්‍රීයව බෙදා හරිනවා.
+- **Streaming Swarm + Async `pwrite` Disk Engine:** පළමු userbot socket එක ready වූ සැණින් download ආරම්භ වන අතර, multi-thread `pwrite` disk pool එක නිසා network I/O කිසිවිටෙක block නොවේ.
+- Speed tuning variables (optional): `UB_DL_CONNECTIONS=16`, `UB_TARGET_TOTAL_CONNECTIONS=80`, `DL_WORKERS_PER_CONN=5`.
+
 ## Flood protection
 - Download: userbot එකකට ඒකේම connections; එක userbot එකකට FloodWait ආවොත් ඒ lane එක විතරක් pause — chunks අනිත් userbots ගන්නවා. `UB_MAX_FLOOD_WAIT` (30s) ඉක්මවුවොත් ඒ userbot එක cooldown (`UB_FLOOD_COOLDOWN` 60s).
 - Upload: flood අඩුම / cooldown නැති userbot එක; flood වුණොත් ඊළඟ userbot එකෙන් auto retry.
 - Userbot path fail වුණොත් (forward / download / upload) job එක fail වෙන්නේ නෑ — bot එකෙන්ම කරනවා.
 
+## 🔀 Encoding Modes (`/settings` වලින් මාරු කළ හැක)
+
+1. **📐 Resolution Mode (`res`)** — 1080p, 720p, 540p, 480p, 360p, 240p, 144p ලෙස resolution වෙනස් කිරීම (`H.264` හෝ `H.265`, Preset, Workers `5..50`, Smart Auto-Queue).
+2. **🗜 Size-Reduce / Visually Lossless Mode (`compress`)** — Original resolution සහ visual quality වෙනස් නොවී **H.264 ➜ H.265 (`libx265`)** ලෙස file size එක පමණක් විශාල වශයෙන් අඩු කිරීම:
+   - **🎯 CRF තේරීම (`14` Ultra … `32` Extreme):** සිංහල කෙටි විස්තර සහිතව (`CRF 18–20` Visually Lossless නිර්දේශය).
+   - **🎨 Pixel Format තේරීම (`yuv420p` … `yuv444p16le`):** 8-bit / 10-bit / 12-bit / 16-bit සහ 4:2:0 / 4:2:2 / 4:4:4 formats සිංහල විස්තර සහිතව.
+   - **🧬 x265 ON/OFF Toggles:** `B-Frames`, `SAO`, `Lookahead`, `AQ-Mode` කෙළින්ම ON/OFF කළ හැක.
+   - **🎚 Preset & 👷 Distributed Workers (`5..50`):** Resolution Mode එකේ මෙන්ම single runner සහ GitHub Actions multi-worker distributed encoding දෙකම සහය දක්වයි.
+
+## ☁️ GitHub JSON Persistent Settings (`user_settings.json`)
+- `/settings` හි Resolution Mode සහ Size-Reduce Mode දෙකටම අදාළ සියලුම user selections `user_settings.json` ගොනුවේ වෙන වෙනම තැන්පත් වන අතර GitHub REST API හරහා repo එකේ `user_settings.json` වෙත ස්වයංක්‍රීයව sync වේ — bot එක restart වුණත් settings කිසිවක් reset නොවේ.
+
 ## Workers
-`/settings → 👷 Workers`: 2, 4, 6, 8, 10, 12, 14, 16.
+`/settings → 👷 Workers`: 5, 10, 15, 20, 25, 30, 35, 40, 45, 50.
