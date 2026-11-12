@@ -31,6 +31,7 @@ from typing import Callable, Dict, List, Optional
 
 import config
 from config import PROGRESS_UPDATE_INTERVAL
+from ffenv import ffmpeg_env
 from pathlib import Path as _P
 
 logger = logging.getLogger("Dist")
@@ -952,7 +953,8 @@ class TgBoard:
 async def keyframes(path: str) -> List[float]:
     proc = await asyncio.create_subprocess_exec(
         "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time,flags",
-        "-of", "csv=p=0", path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        "-of", "csv=p=0", path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        env=ffmpeg_env())
     out, _ = await proc.communicate()
     res = []
     for line in out.decode(errors="ignore").splitlines():
@@ -1006,7 +1008,7 @@ class DistRun:
         proc = await asyncio.create_subprocess_exec(
             *cmd, *args,
             stdout=asyncio.subprocess.PIPE if on_progress else asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE)
+            stderr=asyncio.subprocess.PIPE, env=ffmpeg_env())
         if track:                       # split/merge → Cancel button එකෙන් kill වෙන්න; audio (සමාන්තරව) වෙනම handle කරනවා
             self.job.proc = proc
         async def stderr_tail():

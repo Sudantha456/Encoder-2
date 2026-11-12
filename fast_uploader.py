@@ -35,6 +35,7 @@ from telethon.tl.types import (
 )
 
 import config as _cfg
+from ffenv import ffmpeg_env
 from config import PROGRESS_UPDATE_INTERVAL, UL_CONNECTIONS, UL_WORKERS_PER_CONN
 from fast_conn import SenderPool, acquire_pool
 
@@ -183,6 +184,7 @@ class FastUploader:
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=ffmpeg_env(),
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20.0)
             info = json.loads(stdout.decode("utf-8", errors="replace"))
@@ -215,6 +217,7 @@ class FastUploader:
                     *cmd,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
+                    env=ffmpeg_env(),
                 )
                 await asyncio.wait_for(proc.wait(), timeout=15.0)
                 if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 100:

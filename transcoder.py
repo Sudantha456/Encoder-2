@@ -8,6 +8,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, Set
 
+from ffenv import ffmpeg_env
+
 logger = logging.getLogger("Transcoder")
 
 _X265_PIX_FMTS_CACHE: Optional[Set[str]] = None
@@ -25,6 +27,7 @@ def get_x265_supported_pix_fmts() -> Set[str]:
             capture_output=True,
             text=True,
             timeout=10,
+            env=ffmpeg_env(),
         )
         for line in (r.stdout or "").splitlines():
             if "Supported pixel formats:" in line:
@@ -192,7 +195,7 @@ async def verify_output(path: str, job):
         "ffmpeg", "-hide_banner", "-v", "error", "-nostdin", "-xerror",
         "-err_detect", "explode", "-i", path, "-map", "0:v:0", "-map", "0:a?",
         "-f", "null", "-", stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE, env=ffmpeg_env(),
     )
     job.proc = proc
     try:
@@ -221,7 +224,8 @@ async def transcode(src: str, dst: str, state: EncState, job, **opts):
     """job.proc / job.cancelled භාවිතා කරනවා (cancel කිරීමට)."""
     cmd = build_cmd(src, dst, **opts)
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        env=ffmpeg_env()
     )
     job.proc = proc
     err_tail = deque(maxlen=12)

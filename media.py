@@ -13,6 +13,8 @@ from config import (RESOLUTIONS, AUDIO_BITRATE, PROBE_HEAD_CHUNKS, PROBE_TAIL_CH
                     SIZE_GUARD, SIZE_GUARD_RATIO, MIN_GUARD_KBPS, CRF_INFO, PIX_FMT_INFO)
 from ui import human_size, human_size_short, human_time, esc
 
+from ffenv import ffmpeg_env
+
 logger = logging.getLogger("Media")
 
 DC_NAMES = {1: "Miami", 2: "Amsterdam", 3: "Miami", 4: "Amsterdam", 5: "Singapore"}
@@ -63,6 +65,7 @@ async def ffprobe(path: str, timeout: float = 30.0) -> dict:
         "ffprobe", "-v", "error", "-print_format", "json",
         "-show_format", "-show_streams", path,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        env=ffmpeg_env(),
     )
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout)
