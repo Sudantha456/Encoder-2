@@ -11,7 +11,8 @@ from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeFilename
 
 from config import (RESOLUTIONS, AUDIO_BITRATE, PROBE_HEAD_CHUNKS, PROBE_TAIL_CHUNKS,
                     SIZE_GUARD, SIZE_GUARD_RATIO, MIN_GUARD_KBPS, CRF_INFO, PIX_FMT_INFO)
-from ui import human_size, human_size_short, human_time, esc
+from ui import human_size, human_time, esc
+from widgets import preview_card
 
 logger = logging.getLogger("Media")
 
@@ -308,56 +309,48 @@ def estimate_compress_size(
 
 
 # ───────────────────────── preview card ─────────────────────────
-def render_preview(m: VideoMeta, preset: str, codec: str) -> str:
+def _source_rows(m: VideoMeta) -> list:
+    """Common source-metadata rows (HTML, mobile-safe one fact per line)."""
     unk = "—"
-    codec_txt = CODEC_NAMES.get(m.vcodec, m.vcodec.upper()) if m.vcodec else "unknown (download පසු පෙන්වයි)"
+    codec_txt = CODEC_NAMES.get(m.vcodec, m.vcodec.upper()) if m.vcodec else "probe වෙනකන් නොදනී"
     if m.vprofile:
         codec_txt += f" ({m.vprofile})"
-    res_txt = f"{m.width}×{m.height} • {res_label(m)}" if m.width else unk
+    res_txt = f"{m.width}×{m.height} · {res_label(m)}" if m.width else unk
     if m.fps:
-        res_txt += f" • {m.fps:.2f} fps".replace(".00", "")
-    br = f" • 🎚 {m.vbitrate / 1e6:.2f} Mbps" if m.vbitrate else ""
+        res_txt += f" · {m.fps:.2f} fps".replace(".00", "")
+    br = f" · 🎚 <code>{m.vbitrate / 1e6:.2f} Mbps</code>" if m.vbitrate else ""
     if m.acodec:
         ch = {1: "mono", 2: "stereo"}.get(m.achannels, f"{m.achannels}ch" if m.achannels else "")
-        ab = f" • {m.abitrate // 1000} kbps" if m.abitrate else ""
-        audio = f"{m.acodec}{' • ' + ch if ch else ''}{ab}"
+        ab = f" · {m.abitrate // 1000} kbps" if m.abitrate else ""
+        audio = f"{m.acodec}{' · ' + ch if ch else ''}{ab}"
     else:
         audio = "none" if m.probed else unk
     dc = f"DC{m.dc} ({DC_NAMES.get(m.dc, '?')})" if m.dc else unk
 
-    return "\n".join([
-        f"🎬 <b>{esc(m.name)}</b>",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"🎞 Codec: <code>{esc(codec_txt)}</code>",
-        f"📐 Resolution: <code>{esc(res_txt)}</code>",
-        f"⏱ Duration: <code>{human_time(m.duration) if m.duration else unk}</code>",
-        f"📦 Size: <code>{human_size(m.size)}</code>{br}",
-        f"🔊 Audio: <code>{esc(audio)}</code>",
-        f"📁 Container: <code>{esc(m.container or unk)}</code>",
-        f"🌐 Saved DC: <code>{esc(dc)}</code>",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"⚙️ Preset: <b>{preset}</b> • Codec: <b>{codec}</b>",
-        "👇 <b>Output resolution එක තෝරන්න</b> (size එක ආසන්න ≈ අගයක්)",
-    ])
+    rows = [f"🎞 Codec <code>{esc(codec_txt)}</code>",
+            f"📐 Resolution <code>{esc(res_txt)}</code>",
+            f"⏱ Duration <code>{human_time(m.duration) if m.duration else unk}</code>",
+            f"📦 Size <code>{human_size(m.size) if m.size else unk}</code>{br}",
+            f"🔊 Audio <code>{esc(audio)}</code>"]
+    if m.container:
+        rows.append(f"📁 Container <code>{esc(m.container)}</code>")
+    rows.append(f"🌐 Saved DC <code>{esc(dc)}</code>")
+    return rows
+
+
+def render_preview(m: VideoMeta, preset: str, codec: str) -> str:
+    return preview_card(
+        title_text="VIDEO PREVIEW",
+        filename=m.name,
+        sections=[
+            ("🎞", "Source", _source_rows(m)),
+            ("⚙️", "Encode", [f"🎚 Preset <code>{esc(preset)}</code> · 🎞 Codec <code>{esc(codec)}</code>"]),
+        ],
+        footer="👇 <b>Output resolution තෝරන්න</b> — size එක ආසන්න ≈ අගයක්",
+    )
 
 
 def render_compress_preview(m: VideoMeta, cfg: dict) -> str:
-    unk = "—"
-    codec_txt = CODEC_NAMES.get(m.vcodec, m.vcodec.upper()) if m.vcodec else "unknown (download පසු පෙන්වයි)"
-    if m.vprofile:
-        codec_txt += f" ({m.vprofile})"
-    res_txt = f"{m.width}×{m.height} • {res_label(m)} (වෙනස් නොවේ ✅)" if m.width else unk
-    if m.fps:
-        res_txt += f" • {m.fps:.2f} fps".replace(".00", "")
-    br = f" • 🎚 {m.vbitrate / 1e6:.2f} Mbps" if m.vbitrate else ""
-    if m.acodec:
-        ch = {1: "mono", 2: "stereo"}.get(m.achannels, f"{m.achannels}ch" if m.achannels else "")
-        ab = f" • {m.abitrate // 1000} kbps" if m.abitrate else ""
-        audio = f"{m.acodec}{' • ' + ch if ch else ''}{ab}"
-    else:
-        audio = "none" if m.probed else unk
-    dc = f"DC{m.dc} ({DC_NAMES.get(m.dc, '?')})" if m.dc else unk
-
     crf = int(cfg.get("c_crf", 18))
     crf_tier, crf_desc = CRF_INFO.get(crf, ("Custom", ""))
     pix = cfg.get("c_pix_fmt", "yuv420p")
@@ -368,34 +361,30 @@ def render_compress_preview(m: VideoMeta, cfg: dict) -> str:
     )
     if est and m.size:
         diff_pct = (1.0 - est / m.size) * 100
-        diff_txt = f" ({diff_pct:.0f}% කුඩා)" if diff_pct >= 0 else f" (+{abs(diff_pct):.0f}%)"
+        diff_txt = f" · {'−' if diff_pct >= 0 else '+'}{abs(diff_pct):.0f}%" if diff_pct >= 0 else f" · +{abs(diff_pct):.0f}%"
         est_txt = f"≈ {human_size(est)}{diff_txt}"
     elif est:
         est_txt = f"≈ {human_size(est)}"
     else:
-        est_txt = unk
+        est_txt = "—"
 
-    flags = (
-        f"BF:{'ON' if cfg.get('c_bframes', True) else 'OFF'} • "
-        f"SAO:{'ON' if cfg.get('c_sao', True) else 'OFF'} • "
-        f"LA:{'ON' if cfg.get('c_lookahead', True) else 'OFF'} • "
-        f"AQ:{'ON' if cfg.get('c_aq', True) else 'OFF'}"
+    bf = "ON" if cfg.get("c_bframes", True) else "OFF"
+    sao = "ON" if cfg.get("c_sao", True) else "OFF"
+    la = "ON" if cfg.get("c_lookahead", True) else "OFF"
+    aq = "ON" if cfg.get("c_aq", True) else "OFF"
+
+    return preview_card(
+        title_text="VIDEO PREVIEW",
+        filename=m.name,
+        hint="size-reduce",
+        sections=[
+            ("🎞", "Source", _source_rows(m)),
+            ("🗜", "Size-Reduce · H.265", [
+                f"🎯 CRF <b>{crf} ({esc(crf_tier)})</b> · <i>{esc(crf_desc)}</i>",
+                f"🎨 Pixel <code>{esc(pix)}</code> ({esc(pix_spec)})",
+                f"⚙️ Preset <code>{esc(preset)}</code> · 🧬 <code>BF:{bf} · SAO:{sao} · LA:{la} · AQ:{aq}</code>",
+                f"📉 Est. output <b>{esc(est_txt)}</b>",
+            ]),
+        ],
+        footer="👇 <b>Encode ආරම්භ කරන්න හෝ CRF ඉක්මනින් තෝරන්න:</b> · quality වෙනසක් නෑ",
     )
-
-    return "\n".join([
-        f"🎬 <b>{esc(m.name)}</b>",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"🗜 Mode: <b>Size-Reduce (H.265 • Visually Lossless)</b>",
-        f"🎞 Source Codec: <code>{esc(codec_txt)}</code> ➜ <b>H.265 (HEVC)</b>",
-        f"📐 Resolution: <code>{esc(res_txt)}</code>",
-        f"⏱ Duration: <code>{human_time(m.duration) if m.duration else unk}</code>",
-        f"📦 Original Size: <code>{human_size(m.size)}</code>{br}",
-        f"📉 Est. Output: <b>{est_txt}</b>",
-        f"🔊 Audio: <code>{esc(audio)}</code>",
-        f"🌐 Saved DC: <code>{esc(dc)}</code>",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"🎯 CRF: <b>{crf} ({crf_tier})</b> — <i>{crf_desc}</i>",
-        f"🎨 Pixel Format: <code>{pix}</code> ({pix_spec})",
-        f"⚙️ Preset: <b>{preset}</b> • 🧬 <code>{flags}</code>",
-        "👇 <b>Encode ආරම්භ කරන්න හෝ CRF ඉක්මනින් තෝරන්න:</b>",
-    ])

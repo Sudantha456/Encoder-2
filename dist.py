@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 import config
+from widgets import Doc, esc, note
 from config import PROGRESS_UPDATE_INTERVAL
 from pathlib import Path as _P
 
@@ -1507,10 +1508,29 @@ class DistRun:
         s.merge_out = s.duration
 
 
+def helpers_rows() -> dict:
+    """Structured helper-account health for the HTML widgets."""
+    return {
+        "ok": [str(r) for _, r in HELPERS],
+        "problems": [str(p) for p in HELPER_PROBLEMS],
+        "total": len(HELPERS),
+        "configured": len(config.HELPER_TOKENS),
+        "capacity": capacity(),
+        "has_tokens": bool(config.HELPER_TOKENS),
+    }
+
+
 def helpers_status() -> str:
-    lines = [f"🤝 <b>Helper accounts: {len(HELPERS)}/{len(config.HELPER_TOKENS)}</b> • workers capacity <b>{capacity()}</b>"]
-    lines += [f"• ✅ {r}" for _, r in HELPERS]
-    lines += [f"• ❌ {p}" for p in HELPER_PROBLEMS]
-    if not config.HELPER_TOKENS:
-        lines.append("HELPER_TOKENS set කරලා නෑ.")
-    return "\n".join(lines)
+    """Premium helper/runners card (used by /check and start-up notices)."""
+    h = helpers_rows()
+    d = Doc()
+    d.head("🤝", "RUNNER POOL", f"{h['total']}/{h['configured']} accounts")
+    d.quote([f"👷 Workers capacity <b>{h['capacity']}</b> · 🧩 "
+             f"{len(HELPERS)} × {config.WORKERS_PER_ACCOUNT} per account"])
+    for repo in h["ok"]:
+        d.add(f"✅ <code>{esc(repo)}</code>")
+    for problem in h["problems"]:
+        d.add(f"❌ <code>{esc(problem[:130])}</code>")
+    if not h["has_tokens"]:
+        d.add(note("HELPER_TOKENS set කරලා නෑ — distributed encoding unavailable."))
+    return d.build()

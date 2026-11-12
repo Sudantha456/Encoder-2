@@ -48,8 +48,12 @@ from media import (VideoMeta, telegram_meta, probe_remote, ffprobe, apply_probe,
 from settings_store import SettingsStore
 from transcoder import EncState, build_x265_extra, resolve_x265_pix_fmt, transcode
 import dist
-from ui import (SpeedTracker, render_transfer, render_encode, human_size,
-                human_size_short, human_time, human_speed, esc, render_dist)
+from ui import SpeedTracker
+from widgets import (Doc, cancelled_card, chips, clip, done_card, endwork_progress,
+                     endwork_result, esc, event_card, failed_card, health_card,
+                     home_card, human_age, human_size, human_size_short, human_time,
+                     note, queue_card, queued_card, render_dist, render_encode,
+                     render_transfer, speed_txt, toast_card, to_plain, workflow_account)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
 logger = logging.getLogger("EncoderBot")
@@ -93,6 +97,27 @@ def allowed(uid: int) -> bool:
 
 def cb(*parts) -> bytes:
     return ":".join(str(p) for p in parts).encode()
+
+
+async def reply_card(event, text: str, buttons=None):
+    """Reply with an HTML widget; degrade to plain text if entities are rejected."""
+    try:
+        return await event.reply(text, buttons=buttons)
+    except Exception as e:
+        logger.warning(f"widget reply failed ({e!r}) → plain fallback")
+        return await event.reply(to_plain(text), buttons=buttons, parse_mode=None)
+
+
+async def edit_card(msg, text: str, buttons=None):
+    """Edit a widget message; never raise on parse/entity problems."""
+    try:
+        await msg.edit(text, buttons=buttons)
+    except MessageNotModifiedError:
+        pass
+    except Exception as e:
+        logger.warning(f"widget edit failed ({e!r}) → plain fallback")
+        with contextlib.suppress(Exception):
+            await msg.edit(to_plain(text), buttons=buttons, parse_mode=None)
 
 
 def safe_stem(name: str) -> str:
@@ -176,6 +201,11 @@ class Live:
                 logger.warning(f"edit FloodWait {e.seconds}s — backing off chat {cid}")
             except Exception as e:
                 logger.warning(f"edit failed: {e}")
+                # Never leave the user without progress: if the client/server rejected
+                # the entities, push a parse-free version of the same widget.
+                if any(k in str(e).lower() for k in ("parse", "entit", "bad request", "unsupported")):
+                    with contextlib.suppress(Exception):
+                        await self.msg.edit(to_plain(text), buttons=self.buttons, parse_mode=None)
             finally:
                 self._busy = False
 
@@ -252,115 +282,123 @@ def _mode_switch_row(active_mode: str, job_id: str) -> list:
     ]
 
 
+def _crf_panel(s: dict) -> str:
+    cur = int(s["c_crf"])
+    tier, desc = CRF_INFO[cur]
+    d = Doc()
+    d.head("🎯", "CRF TUNING", "quality vs size")
+    d.quote([f"දැනට <b>CRF {cur} ({esc(tier)})</b>", f"<i>{esc(desc)}</i>"])
+    rows = []
+    for c in CRF_CHOICES:
+        t, dd = CRF_INFO[c]
+        rows.append(f"{'✅' if c == cur else '•'} <b>{c} — {esc(t)}</b>: {esc(dd)}")
+    d.sec("🎚", "CRF Choices")
+    d.quote(rows, expandable=True)
+    d.add("💡 <b>Visually Lossless:</b> <code>CRF 18 – 20</code>")
+    d.add(note("අඩු CRF = ඉහළම quality · වැඩි CRF = තවත් කුඩා file size"))
+    return d.build()
+
+
+def _pix_panel(s: dict) -> str:
+    cur = s["c_pix_fmt"]
+    spec, desc = PIX_FMT_INFO[cur]
+    enc_pf = resolve_x265_pix_fmt(cur)
+    d = Doc()
+    d.head("🎨", "PIXEL FORMAT", "bit-depth · chroma")
+    top = [f"දැනට <code>{esc(cur)}</code> <b>({esc(spec)})</b>", f"<i>{esc(desc)}</i>"]
+    if cur != enc_pf:
+        top.append(f"ℹ️ HEVC උපරිම <code>{esc(enc_pf)}</code> ලෙස encode වේ")
+    d.quote(top)
+    rows = []
+    for pf in PIX_FMT_CHOICES:
+        pf_spec, pf_desc = PIX_FMT_INFO[pf]
+        rows.append(f"{'✅' if pf == cur else '•'} <code>{esc(pf)}</code> "
+                    f"<b>({esc(pf_spec)})</b>: {esc(pf_desc)}")
+    d.sec("🧪", "Choices")
+    d.quote(rows, expandable=True)
+    d.add(note("සාමාන්‍ය phones/TV සියල්ලටම yuv420p හෝ yuv420p10le වඩාත්ම ගැලපේ."))
+    return d.build()
+
+
+def _cpre_panel(s: dict) -> str:
+    d = Doc()
+    d.head("🎚", "PRESET & x265", "advanced")
+    d.quote([f"🎚 Preset <b>{esc(s['c_preset'])}</b>", f"<i>{esc(PRESET_INFO[s['c_preset']])}</i>"])
+    d.sec("🧬", "x265 toggles")
+    for k, (t, desc) in X265_TOGGLE_INFO.items():
+        d.add(f"{'✅' if s[k] else '❌'} <b>{esc(t)}</b> — <i>{esc(desc)}</i>")
+    d.add(note("fast / medium / slow preset එකකින් Visually Lossless H.265 හොඳම compression ලැබේ."))
+    return d.build()
+
+
+def _pipeline_rows(s: dict, *, compress: bool) -> list:
+    dist_key = "c_dist" if compress else "dist"
+    wrk_key = "c_workers" if compress else "workers"
+    auto = s.get("c_auto") if compress else s.get("qres")
+    auto_lbl = (("auto" if auto == "auto" else "ask (button)") if compress else _queue_lbl(auto))
+    rows = [
+        f"🌐 Distributed <b>{esc(str(s[dist_key]))}</b> · 👷 Workers <b>{s[wrk_key]}</b> "
+        f"<i>({min(WORKER_CHOICES)}–{max(WORKER_CHOICES)})</i>",
+        f"👤 Relay <b>{_relay_short()}</b> · 📋 Auto-queue <b>{auto_lbl}</b>"
+        + ("" if dist.available() else " · <i>dist n/a</i>"),
+    ]
+    return rows
+
+
 def settings_text(uid: int, sub: str = "") -> str:
     s = store.get(uid)
+
     if sub == "crf":
-        lines = [
-            "🎯 <b>CRF (Constant Rate Factor) — H.265 Quality vs Size</b>",
-            "━━━━━━━━━━━━━━━━━━━━",
-            f"දැනට තෝරා ඇත්තේ: <b>CRF {s['c_crf']} ({CRF_INFO[s['c_crf']][0]})</b>",
-            "",
-        ]
-        for c in CRF_CHOICES:
-            tier, desc = CRF_INFO[c]
-            mark = "✅ " if s["c_crf"] == c else "• "
-            lines.append(f"{mark}<b>{c} — {tier}</b>: {desc}")
-        lines += [
-            "",
-            "━━━━━━━━━━━━━━━━━━━━",
-            "💡 <b>Visually Lossless සඳහා නිර්දේශය:</b> <code>CRF 18 – 20</code>",
-            "<i>අඩු CRF අගය = ඉහළම quality • වැඩි CRF අගය = තවත් කුඩා file size</i>",
-        ]
-        return "\n".join(lines)
-
+        return _crf_panel(s)
     if sub == "pix":
-        cur_pf = s["c_pix_fmt"]
-        enc_pf = resolve_x265_pix_fmt(cur_pf)
-        note_16 = (
-            f"\n<i>ℹ️ {cur_pf}: 16-bit precision filter සැකසුමෙන් පසු HEVC උපරිම {enc_pf} ලෙස encode වේ.</i>"
-            if cur_pf != enc_pf else ""
-        )
-        lines = [
-            "🎨 <b>Pixel Format තේරීම (Bit-Depth &amp; Chroma)</b>",
-            "━━━━━━━━━━━━━━━━━━━━",
-            f"දැනට තෝරා ඇත්තේ: <code>{cur_pf}</code> ({PIX_FMT_INFO[cur_pf][0]}){note_16}",
-            "",
-        ]
-        for pf in PIX_FMT_CHOICES:
-            spec, desc = PIX_FMT_INFO[pf]
-            mark = "✅ " if cur_pf == pf else "• "
-            lines.append(f"{mark}<code>{pf}</code> <b>({spec})</b> — {desc}")
-        lines += [
-            "",
-            "━━━━━━━━━━━━━━━━━━━━",
-            "💡 සාමාන්‍ය phones/TV සියල්ලටම <code>yuv420p</code> හෝ <code>yuv420p10le</code> වඩාත්ම ගැලපේ.",
-        ]
-        return "\n".join(lines)
-
+        return _pix_panel(s)
     if sub == "cpre":
-        lines = [
-            "🎚 <b>Size-Reduce Preset &amp; x265 Options</b>",
-            "━━━━━━━━━━━━━━━━━━━━",
-            f"🎚 Preset: <b>{s['c_preset']}</b> — <i>{PRESET_INFO[s['c_preset']]}</i>",
-            "",
-            "🧬 <b>x265 Advanced Options:</b>",
-        ]
-        for k, (title, desc) in X265_TOGGLE_INFO.items():
-            st_txt = "ON ✅" if s[k] else "OFF ❌"
-            lines.append(f"• <b>{title} ({st_txt})</b>: {desc}")
-        lines += [
-            "",
-            "━━━━━━━━━━━━━━━━━━━━",
-            "💡 <code>fast</code> / <code>medium</code> / <code>slow</code> preset එකකින් Visually Lossless H.265 හොඳම compression ලැබේ.",
-        ]
-        return "\n".join(lines)
+        return _cpre_panel(s)
 
     if s["mode"] == "compress":
-        crf = s["c_crf"]
+        crf = int(s["c_crf"])
         crf_tier, crf_desc = CRF_INFO[crf]
         pf = s["c_pix_fmt"]
         pf_spec, pf_desc = PIX_FMT_INFO[pf]
-        return "\n".join([
-            "⚙️ <b>Encoding Settings — 🗜 Size-Reduce Mode</b>",
-            "━━━━━━━━━━━━━━━━━━━━",
-            "🔀 Mode: <b>🗜 Quality/Resolution නොවෙනස්ව Size අඩු කිරීම (H.265)</b>",
-            f"🎯 CRF: <b>{crf} ({crf_tier})</b> — <i>{crf_desc}</i>",
-            f"🎨 Pixel Format: <code>{pf}</code> <b>({pf_spec})</b>",
-            f"   <i>{pf_desc}</i>",
-            f"🎚 Preset: <b>{s['c_preset']}</b> — <i>{PRESET_INFO[s['c_preset']]}</i>",
-            (
-                f"🧬 x265: <b>B-Frames {'ON' if s['c_bframes'] else 'OFF'}</b> • "
-                f"<b>SAO {'ON' if s['c_sao'] else 'OFF'}</b> • "
-                f"<b>Lookahead {'ON' if s['c_lookahead'] else 'OFF'}</b> • "
-                f"<b>AQ {'ON' if s['c_aq'] else 'OFF'}</b>"
-            ),
-            f"🌐 Distributed (GitHub workers): <b>{s['c_dist']}</b>"
-            + ("" if dist.available() else "  <i>(මේ environment එකේ නෑ)</i>"),
-            f"👷 Workers: <b>{s['c_workers']}</b>  <i>({min(WORKER_CHOICES)} – {max(WORKER_CHOICES)}, accounts {1 + len(dist.HELPERS)} × {config.WORKERS_PER_ACCOUNT})</i>",
-            f"📋 Auto-queue: <b>{'📋 Ask (Preview + Button)' if s['c_auto'] == 'ask' else '⚡ Auto (කෙළින්ම Queue)'}</b>",
-            f"👤 Userbot relay: <b>{('ON ×' + str(len(relay.ready))) if relay.enabled else 'OFF'}</b>",
-            f"💾 Settings Save: {store.cloud_status_text()}",
-            "━━━━━━━━━━━━━━━━━━━━",
-            "<i>Original resolution එලෙසම තබා H.264 ➜ H.265 Visually Lossless ලෙස size අඩු කරයි.</i>",
+        d = Doc()
+        d.head("⚙️", "ENCODE SETTINGS", "🗜 size-reduce · live")
+        d.quote([
+            "🗜 <b>Size-Reduce (H.265)</b> · visually lossless",
+            chips(f"CRF {crf}", pf, s["c_preset"], f"{s['c_workers']}w"),
+            f"🌐 dist <code>{esc(str(s['c_dist']))}</code> · 📋 queue "
+            f"<code>{'auto' if s['c_auto'] == 'auto' else 'ask'}</code>",
         ])
+        d.sec("🎯", "Quality")
+        d.add(f"🎯 CRF <b>{crf} ({esc(crf_tier)})</b> — <i>{esc(crf_desc)}</i>")
+        d.add(f"🎨 Pixel <code>{esc(pf)}</code> <b>({esc(pf_spec)})</b> — <i>{esc(pf_desc)}</i>")
+        d.add(f"🎚 Preset <code>{esc(s['c_preset'])}</code> — <i>{esc(PRESET_INFO[s['c_preset']])}</i>")
+        d.sec("🧬", "x265")
+        d.add("🧬 <code>B-Frames:%s · SAO:%s · LA:%s · AQ:%s</code>" % (
+            "ON" if s["c_bframes"] else "OFF", "ON" if s["c_sao"] else "OFF",
+            "ON" if s["c_lookahead"] else "OFF", "ON" if s["c_aq"] else "OFF"))
+        d.sec("🚀", "Pipeline")
+        d.extend(_pipeline_rows(s, compress=True))
+        d.add(_cloud_line())
+        d.add(note("Original resolution එලෙසම තබා H.264 ➜ H.265 ලෙස size අඩු කරයි."))
+        return d.build(tail=note("මාරු කරන්න mode / preset / CRF buttons භාවිත කරන්න."))
 
-    return "\n".join([
-        "⚙️ <b>Encoding Settings — 📐 Resolution Mode</b>",
-        "━━━━━━━━━━━━━━━━━━━━",
-        "🔀 Mode: <b>📐 Resolution වෙනස් කිරීම (1080p … 144p)</b>",
-        f"🎚 Preset: <b>{s['preset']}</b>",
-        f"   <i>{PRESET_INFO[s['preset']]}</i>",
-        f"🎞 Codec: <b>{s['codec']}</b>",
-        f"🌐 Distributed (GitHub workers): <b>{s['dist']}</b>"
-        + ("" if dist.available() else "  <i>(මේ environment එකේ නෑ)</i>"),
-        f"👷 Workers: <b>{s['workers']}</b>  <i>({min(WORKER_CHOICES)} – {max(WORKER_CHOICES)}, accounts {1 + len(dist.HELPERS)} × {config.WORKERS_PER_ACCOUNT}; download එක යන අතරේත් වෙනස් කරන්න පුළුවන්)</i>",
-        f"👤 Userbot relay: <b>{('ON ×' + str(len(relay.ready))) if relay.enabled else 'OFF'}</b>",
-        f"📋 Auto-queue: <b>{'ask (බොත්තම්)' if s['qres'] == 'ask' else '🧠 smart' if s['qres'] == 'smart' else s['qres'] + 'p'}</b>",
-        f"💾 Settings Save: {store.cloud_status_text()}",
-        "━━━━━━━━━━━━━━━━━━━━",
-        "ultrafast → වේගවත්ම  |  veryslow → අඩුම size",
-        "H.265 → size අඩුයි, encode වෙන්න වැඩි වෙලාවක් යනවා",
+    d = Doc()
+    d.head("⚙️", "ENCODE SETTINGS", "📐 resolution · live")
+    d.quote([
+        "📐 <b>Resolution Mode</b> · 1080p → 144p",
+        chips(s["preset"], _codec_short(s["codec"]), f"{s['workers']}w"),
+        f"🌐 dist <code>{esc(str(s['dist']))}</code> · 📋 queue <code>{esc(_queue_lbl(s['qres']))}</code>",
     ])
+    d.sec("🎛", "Encoder")
+    d.add(f"🎚 Preset <code>{esc(s['preset'])}</code> — <i>{esc(PRESET_INFO[s['preset']])}</i>")
+    d.add(f"🎞 Codec <code>{esc(s['codec'])}</code> — <i>{esc(CODECS.get(s['codec'], ''))}</i>")
+    d.sec("🚀", "Pipeline")
+    d.extend(_pipeline_rows(s, compress=False))
+    d.add(_cloud_line())
+    d.sec("📝", "Notes")
+    d.add(note("ultrafast → වේගවත්ම · veryslow → අඩුම size"))
+    d.add(note("H.265 → size අඩුයි, encode වෙන්න වැඩි වෙලාවක් යනවා"))
+    return d.build(tail=note("Download එක යන අතරේත් workers වෙනස් කරන්න පුළුවන්."))
 
 
 def _short_pf_btn(pf: str, selected: bool) -> str:
@@ -465,27 +503,53 @@ def settings_buttons(uid: int, job_id: str, sub: str = ""):
 
 
 # ───────────────────────── commands ─────────────────────────
+def _relay_short() -> str:
+    return f"ON ×{len(relay.ready)}" if relay.enabled else "OFF"
+
+
+def _codec_short(codec: str) -> str:
+    return {"libx264": "H.264", "libx265": "H.265"}.get(str(codec), str(codec))
+
+
+def _queue_lbl(q) -> str:
+    q = str(q)
+    return "ask (buttons)" if q == "ask" else ("smart" if q == "smart" else f"{q}p")
+
+
 @client.on(events.NewMessage(pattern=r"^/(start|help)", incoming=True))
 async def cmd_start(event):
     if not allowed(event.sender_id):
         return
-    await event.reply(
-        "👋 <b>Video Encoder Bot</b>\n\n"
-        "🔀 <b>Modes දෙකක් ඇත (/settings වලින් මාරු කරන්න):</b>\n"
-        "  1️⃣ <b>📐 Resolution Mode</b> — 1080p…144p ලෙස resolution වෙනස් කිරීම\n"
-        "  2️⃣ <b>🗜 Size-Reduce Mode (H.265)</b> — Resolution සහ Quality වෙනස් නොවී Visually Lossless ලෙස size අඩු කිරීම (CRF, Pixel Format, B-Frames/SAO/Lookahead, Workers)\n\n"
-        "⚡ High-speed download → FFmpeg / GitHub Workers encode → High-speed upload\n"
-        "☁️ ඔබගේ සියලුම /settings තේරීම් GitHub JSON හි ස්වයංක්‍රීයව save වේ\n\n"
-        "⚙️ Settings: /settings   •   📋 /queue   •   🧹 /clear\n"
-        "🌐 Worker workflows: /workflow   •   🛑 /End_Work (සේරම workers kill)"
-    )
+    await reply_card(event, home_card(
+        name="VIDEO ENCODER",
+        subtitle="premium HTML UI",
+        headline=[
+            "⚡ Turbo download → encode → auto upload",
+            f"👤 Relay <b>{_relay_short()}</b> · 🌐 Runners <b>{dist.capacity()}</b>",
+            f"🗂 Accounts <b>{1 + len(dist.HELPERS)}</b> · ☁️ Settings auto-save",
+        ],
+        modes=[
+            ("📐 <b>Resolution Mode</b>", "1080p → 144p"),
+            ("🗜 <b>Size-Reduce Mode</b>", "H.265 lossless"),
+        ],
+        commands=[
+            ("⚙️ /settings", "mode · preset · CRF"),
+            ("📋 /queue", "run + waiting"),
+            ("🩺 /check", "setup health"),
+            ("🌐 /workflow", "Actions runs"),
+            ("🧹 /clear", "queue ඉවත් කිරීම"),
+            ("🛑 /End_Work", "workers kill"),
+        ],
+        tip="Video එකක් එවන්න — preview එකෙන් තෝරන්න.",
+        footer=note("HTML widgets · mobile + desktop · safe fallbacks"),
+    ))
 
 
 @client.on(events.NewMessage(pattern=r"^/settings", incoming=True))
 async def cmd_settings(event):
     if not allowed(event.sender_id):
         return
-    await event.reply(settings_text(event.sender_id), buttons=settings_buttons(event.sender_id, "0"))
+    await reply_card(event, settings_text(event.sender_id), buttons=settings_buttons(event.sender_id, "0"))
 
 
 async def init_helpers(notify: bool = True):
@@ -500,20 +564,58 @@ async def init_helpers(notify: bool = True):
                 await client.send_message(uid, dist.helpers_status())
 
 
+def _cloud_line() -> str:
+    """`💾 Settings save: …` without the duplicated cloud emoji."""
+    txt = store.cloud_status_text()
+    for emoji in ("💾", "☁️"):
+        if txt.startswith(emoji):
+            txt = txt[len(emoji):].lstrip()
+            break
+    return f"💾 Settings save: {txt}"
+
+
+def check_text() -> str:
+    """Premium health card: userbot lanes + helper accounts + runner pool."""
+    st = relay.status_rows()
+    h = dist.helpers_rows()
+    helper_rows = [f"✅ <code>{esc(r)}</code>" for r in h["ok"]]
+    helper_rows += [f"❌ <code>{esc(p[:110])}</code>" for p in h["problems"]]
+    helper_summary = f"🤝 Helpers <b>{h['total']}/{h['configured']}</b> · 👷 capacity <b>{h['capacity']}</b>"
+    if dist.available():
+        extra = [f"🌐 Distributed <b>ON</b> · 👷 <b>{h['capacity']}</b> workers",
+                 f"🗂 Accounts <b>{1 + h['total']}</b> · 🧩 {config.WORKERS_PER_ACCOUNT} workers / account"]
+    else:
+        extra = ["🌐 <b>Distributed OFF</b>",
+                 "👷 Single runner mode — GitHub CLI / token / repo නෑ"]
+    return health_card(
+        relay_on=bool(st["on"]), relay_summary=st["summary"], relay_rows=st["rows"],
+        helper_rows=helper_rows, helper_summary=helper_summary, extra=extra,
+        footer=note("Setup වැරදි නම් fallback: bot එකෙන්ම download/upload — jobs fail වෙන්නේ නෑ."),
+    )
+
+
 @client.on(events.NewMessage(pattern=r"^/check", incoming=True))
 async def cmd_check(event):
     """Userbots + private channel setup එක ආයෙ පරීක්ෂා කරනවා (job එකක් run වෙන්නේ නැති වෙලාවක)."""
     if not allowed(event.sender_id):
         return
     if pending_count():
-        await event.reply(relay.status_text() + "\n\n<i>Jobs run වෙනවා — re-check කරන්නේ queue එක හිස් වුණාම.</i>")
+        await reply_card(event, event_card(
+            icon="⚠️", title_text="CHECK PAUSED",
+            lines=[f"Jobs <b>{pending_count()}</b> ක් run / queue වෙනවා",
+                   "Setup re-scan එකක් run කරන්නේ නෑ — jobs ට බලපෑමක් නෑ"],
+            hint="Queue එක හිස් වුණාම /check කරන්න.",
+        ))
         return
-    m = await event.reply("🔍 <b>Userbots / channel setup බලනවා…</b>")
+    m = await reply_card(event, event_card(
+        icon="🔍", title_text="SYSTEM CHECK",
+        lines=["Userbots · channel · runner pool පරීක්ෂා කරනවා…"],
+    ))
     await relay.stop()
     relay.userbots = []
     await relay.setup(client)
     await init_helpers(notify=False)
-    await m.edit(relay.status_text() + "\n\n" + dist.helpers_status())
+    await edit_card(m, check_text())
 
 
 # ───────────────────────── 🌐 /workflow  &  🛑 /End_Work ─────────────────────────
@@ -527,9 +629,7 @@ def _age(iso: str) -> str:
         sec = max(0, int((datetime.now(timezone.utc) - t).total_seconds()))
     except Exception:
         return "?"
-    h, rem = divmod(sec, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h}h {m:02d}m" if h else (f"{m}m {s:02d}s" if m else f"{s}s")
+    return human_age(sec)
 
 
 def _parts_str(idx: list) -> str:
@@ -557,53 +657,68 @@ async def cmd_workflow(event):
     if not allowed(event.sender_id):
         return
     if not dist.available():
-        await event.reply("🌐 <b>Distributed workers unavailable</b>\n<i>gh CLI / GH_TOKEN / GITHUB_REPOSITORY නෑ.</i>")
+        await reply_card(event, toast_card(
+            icon="🌐", title_text="WORKERS UNAVAILABLE",
+            lines=["<code>gh</code> CLI · <code>GH_TOKEN</code> · <code>GITHUB_REPOSITORY</code> නෑ"],
+            hint="Jobs single-runner mode එකෙන් run වෙයි — /check එකෙන් තහවුරු කරන්න.",
+        ))
         return
-    m = await event.reply("🔍 <b>Worker workflows බලනවා…</b>")
+    m = await reply_card(event, event_card(
+        icon="🔍", title_text="WORKER WORKFLOWS",
+        lines=["GitHub Actions runs + worker parts බලනවා…"],
+    ))
     cur = current_job[0]
     cfg = store.get(event.sender_id)
     act_wrk = cfg["c_workers"] if cfg["mode"] == "compress" else cfg["workers"]
     act_dst = cfg["c_dist"] if cfg["mode"] == "compress" else cfg["dist"]
-    head = [
-        "🌐 <b>Worker Workflows</b>",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"⚙️ Mode: <b>{'🗜 Size-Reduce' if cfg['mode'] == 'compress' else '📐 Resolution'}</b> • Workers: <b>{act_wrk}</b> • Dist: <b>{esc(str(act_dst))}</b> • Capacity: <b>{dist.capacity()}</b>",
-        f"📋 Queue: {'▶️ ' + esc(cur.meta.name[:30]) + ' + ' if cur else ''}<b>{len(queue)}</b> waiting",
-        f"🧠 Pool: <b>{'ACTIVE' if pool.active else 'idle'}</b>{' • 🛑 halted (/End_Work)' if pool.halted else ''}",
-    ]
     try:
         info = await pool.overview()
     except Exception as e:
-        await m.edit("\n".join(head) + f"\n\n❌ GitHub query fail: <code>{esc(str(e)[:150])}</code>")
+        await edit_card(m, failed_card(name="pool overview", error=str(e)[:180],
+                                       hint="GitHub token / network අවුලක්. /End_Work එකෙන් workers kill කරන්න පුළුවන්."))
         return
+
     total_runs = total_workers = 0
-    body = []
-    for a in info:
+    d = Doc()
+    d.head("🌐", "WORKER WORKFLOWS", "live")
+    d.quote([
+        f"⚙️ Mode <b>{'🗜 Size-Reduce' if cfg['mode'] == 'compress' else '📐 Resolution'}</b> · "
+        f"👷 <b>{act_wrk}</b> · 🌐 dist <b>{esc(str(act_dst))}</b>",
+        f"🧠 Pool <b>{'ACTIVE' if pool.active else 'idle'}</b>"
+        + (" · 🛑 halted (/End_Work)" if pool.halted else "") + f" · 🧮 capacity <b>{dist.capacity()}</b>",
+        f"📋 Queue <b>{len(queue)}</b> waiting" + (f" · ▶️ <code>{esc(clip(cur.meta.name, 24))}</code>" if cur else ""),
+    ])
+    for pos, a in enumerate(info):
         runs = a["runs"]
         total_runs += len(runs)
-        sess = f"session <code>{a['session']}</code>" if a["session"] else "session -"
-        flag = " • ❌ dispatch failed" if a["failed"] else ""
-        body.append(f"\n{_acct_label(a['idx'])} — <code>{esc(a['repo'])}</code>")
-        body.append(f"   {sess} • dispatched <b>{len(a['dispatched'])}</b> [{_parts_str(a['dispatched'])}]{flag}")
+        rows = []
+        sess = f"<code>{esc(a['session'])}</code>" if a["session"] else "<i>no session</i>"
+        rows.append(f"🔑 {sess} · dispatched <b>{len(a['dispatched'])}</b> [{_parts_str(a['dispatched'])}]")
         if a["error"]:
-            body.append(f"   ⚠️ {esc(a['error'])}")
-            continue
-        if not runs:
-            body.append("   💤 Active workflow runs නෑ")
+            rows.append(f"❌ <code>{esc(clip(a['error'], 110))}</code>")
+        elif a["failed"]:
+            rows.append("⚠️ dispatch failed — token / permission බලන්න")
+        elif not runs:
+            rows.append(note("Active workflow runs නෑ — pool idle"))
         for r in runs[:6]:
             jobs = r.get("jobs", [])
             run_n = sum(1 for j in jobs if j.get("status") == "in_progress")
             que_n = sum(1 for j in jobs if j.get("status") in ("queued", "waiting", "pending", "requested"))
             total_workers += run_n
             idx = [int(x) for j in jobs for x in re.findall(r"\((\d+)\)", j.get("name", ""))]
-            body.append(f"   {_STATUS_ICON.get(r['status'], '•')} run <code>#{r['databaseId']}</code> • {r['status']} • {_age(r.get('createdAt'))}"
-                        f"\n      👷 running <b>{run_n}</b> • queued <b>{que_n}</b> • parts [{_parts_str(idx)}]")
+            rows.append(
+                f"{_STATUS_ICON.get(r['status'], '•')} <code>#{r['databaseId']}</code> "
+                f"<b>{esc(str(r['status']).replace('_', ' '))}</b> · {_age(r.get('createdAt'))}\n"
+                f"    👷 run <b>{run_n}</b> · ⏳ queue <b>{que_n}</b> · 🧩 [{_parts_str(idx)}]"
+            )
         if len(runs) > 6:
-            body.append(f"   … තව runs {len(runs) - 6} ක්")
-    summary = f"\n━━━━━━━━━━━━━━━━━━━━\n📊 Active runs: <b>{total_runs}</b> • Running workers: <b>{total_workers}</b>"
-    tail = "\n🛑 සේරම kill කරන්න: /End_Work" if total_runs else ""
-    text = "\n".join(head + body) + summary + tail
-    await m.edit(text[:4000])
+            rows.append(note(f"… තව runs {len(runs) - 6} ක්"))
+        if pos:
+            d.gap()
+        d.extend(workflow_account(label=_acct_label(a["idx"]), repo=a["repo"], rows=rows))
+    d.add(f"📊 Active runs <b>{total_runs}</b> · 👷 Running workers <b>{total_workers}</b>")
+    d.add(note("🛑 සේරම kill කරන්න: /End_Work"))
+    await edit_card(m, d.build())
 
 
 @client.on(events.NewMessage(pattern=r"(?i)^/end_?work(@\w+)?(\s|$)", incoming=True))
@@ -612,59 +727,64 @@ async def cmd_end_work(event):
     if not allowed(event.sender_id):
         return
     if not dist.available():
-        await event.reply("🌐 <b>Distributed workers unavailable</b> — kill කරන්න දෙයක් නෑ.")
+        await reply_card(event, toast_card(
+            icon="🌐", title_text="WORKERS UNAVAILABLE",
+            lines=["Kill කරන්න distributed workers නෑ"],
+            hint="Jobs single-runner mode එකෙන් run වෙනවා.",
+        ))
         return
     if end_work_lock.locked():
-        await event.reply("⏳ <i>/End_Work දැනටමත් run වෙනවා…</i>")
+        await reply_card(event, event_card(
+            icon="⏳", title_text="END WORK RUNNING",
+            lines=["දැනටමත් kill request යවනවා…"],
+            hint="තත්පර කීපයක් ඉඳලා /workflow බලන්න.",
+        ))
         return
     async with end_work_lock:
-        m = await event.reply("🛑 <b>End Work</b> — workers kill කරනවා…")
+        m = await reply_card(event, event_card(
+            icon="🛑", title_text="END WORK",
+            lines=["Main + helper accounts වල workers kill කරනවා…"],
+        ))
         live = Live(m)
         busy = pending_count() > 0
 
         async def prog(rnd, total, force, counts):
-            rows = "\n".join(f"   {_acct_label(i)}: <b>{n}</b> run" for i, n in counts.items() if n)
-            await live.set(f"🛑 <b>Kill request {rnd}/{total}</b>{' (force)' if force else ''}\n{rows}", force=True)
+            pairs = [(_acct_label(i), n) for i, n in counts.items() if n]
+            await live.set(endwork_progress(round_no=rnd, total=total, counts=pairs), force=True)
 
         try:
             res = await pool.kill_all(rounds=5, on_progress=prog)
         except Exception as e:
             logger.exception("end_work failed")
-            await m.edit(f"❌ <b>End Work fail</b>: <code>{esc(str(e)[:200])}</code>")
+            await edit_card(m, failed_card(name="End Work", error=str(e)[:180],
+                                           hint="GitHub token permissions (actions: write) බලන්න."))
             return
         if pending_count() == 0:
             pool.halted = False            # job එකක් නැත්නම් ඊළඟ queue එකට workers ආයෙ allow
         left = sum(len(v) for v in res["left"].values())
-        lines = ["🛑 <b>End Work</b>", "━━━━━━━━━━━━━━━━━━━━"]
-        for i, repo in res["accts"]:
-            n, rem = res["cancelled"].get(i, 0), len(res["left"].get(i, []))
-            lines.append(f"{_acct_label(i)} <code>{esc(repo)}</code>\n   🔪 killed <b>{n}</b>" + (f" • ⚠️ තව <b>{rem}</b> ඉතුරුයි" if rem else " • ✅ clean"))
-        lines.append("━━━━━━━━━━━━━━━━━━━━")
-        if left:
-            lines.append(f"⚠️ Kill requests {res['rounds']} ක් යැව්වත් runs <b>{left}</b> ඉතුරුයි — තත්පර කීපයකින් /workflow බලන්න, නැත්නම් ආයෙ /End_Work.")
-        else:
-            lines.append(f"✅ සේරම worker workflows kill වුණා (kill requests: {res['rounds']})")
-        if busy:
-            lines.append("<i>දැනට run වෙන distributed job එක worker pool එක නවත්වපු නිසා main runner එකට fallback නොවී stop/fail වෙයි.</i>")
-        await m.edit("\n".join(lines))
+        accounts = [{
+            "label": _acct_label(i),
+            "repo": repo,
+            "killed": res["cancelled"].get(i, 0),
+            "left": len(res["left"].get(i, [])),
+        } for i, repo in res["accts"]]
+        await edit_card(m, endwork_result(accounts=accounts, left_total=left,
+                                          rounds=res["rounds"], busy=busy))
 
 
 def queue_text() -> str:
-    rows = []
     cur = current_job[0]
+    running = None
     if cur:
-        rows.append(f"▶️ <b>Running</b>: <code>{esc(cur.meta.name[:40])}</code> → {esc(job_target_badge(cur))}")
-    for i, j in enumerate(queue, 1):
-        rows.append(f"{i}. <code>{esc(j.meta.name[:40])}</code> → {esc(job_target_badge(j))}")
-    if not rows:
-        return "📭 Queue හිස්."
-    return f"📋 <b>Queue</b> ({len(queue) + (1 if cur else 0)}/{QUEUE_MAX})\n━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(rows)
+        running = {"name": cur.meta.name, "badge": job_target_badge(cur)}
+    items = [{"name": j.meta.name, "badge": job_target_badge(j)} for j in queue]
+    return queue_card(running=running, items=items, cap=QUEUE_MAX)
 
 
 @client.on(events.NewMessage(pattern=r"^/queue", incoming=True))
 async def cmd_queue(event):
     if allowed(event.sender_id):
-        await event.reply(queue_text())
+        await reply_card(event, queue_text())
 
 
 @client.on(events.NewMessage(pattern=r"^/clear", incoming=True))
@@ -674,7 +794,12 @@ async def cmd_clear(event):
     mine = [j for j in queue if j.user_id == event.sender_id]
     for j in mine:
         await cancel_waiting(j)
-    await event.reply(f"🧹 Queue එකෙන් {len(mine)} ක් ඉවත් කළා. (දැන් run වෙන එක නවත්තන්න ඒකේ ❌ Cancel)")
+    await reply_card(event, toast_card(
+        icon="🧹", title_text="QUEUE CLEARED",
+        lines=[f"Queue එකෙන් <b>{len(mine)}</b> ක් ඉවත් කළා",
+               f"📋 ඉතුරු queue <b>{len(queue)}</b> · ▶️ running <b>{1 if current_job[0] else 0}</b>"],
+        hint="Running job එක නවත්තන්න ඒකේ ❌ Cancel ඔබන්න.",
+    ))
 
 
 # ───────────────────────── queue ─────────────────────────
@@ -688,7 +813,8 @@ async def cancel_waiting(job: Job):
         queue.remove(job)
     jobs.pop(job.id, None)
     with contextlib.suppress(Exception):
-        await job.status.edit("❌ <b>Cancelled</b>", buttons=None)
+        await job.status.edit(cancelled_card(name=getattr(job.meta, "name", ""),
+                                             note_text="Queue එකෙන් ඉවත් කළා"), buttons=None)
     await refresh_positions()
 
 
@@ -705,12 +831,14 @@ async def _refresh_positions_inner():
         total = len(snap)
         for i, j in enumerate(snap, 1):
             if j.live and not j.cancelled and j in queue:
-                await j.live.set(
-                    f"⏳ <b>Queued #{i}</b> / {total}\n"
-                    f"<code>{esc(j.meta.name[:50])}</code> → {esc(job_target_badge(j))}\n"
-                    "ඉස්සරහ jobs ඉවර වුණාම ස්වයංක්‍රීයව පටන් ගන්නවා.",
-                    force=True,
-                )
+                ahead = [(k, snap[k - 1].meta.name, job_target_badge(snap[k - 1]))
+                         for k in range(1, i)]
+                with contextlib.suppress(Exception):
+                    await j.live.set(
+                        queued_card(index=i, total=total, name=j.meta.name,
+                                    badge=job_target_badge(j), ahead=ahead),
+                        force=True,
+                    )
 
 
 async def refresh_positions():
@@ -725,7 +853,12 @@ async def enqueue(job: Job, height: int, *, mode: str = "res") -> bool:
     global queue_task
     if pending_count() >= QUEUE_MAX:
         with contextlib.suppress(Exception):
-            await job.status.edit(f"🚫 Queue පිරිලා ({QUEUE_MAX}/{QUEUE_MAX}). ටිකක් ඉඳලා ආයෙ එවන්න.", buttons=None)
+            await job.status.edit(toast_card(
+            icon="🚫", title_text="QUEUE FULL",
+            lines=[f"Queue එකේ <b>{QUEUE_MAX}/{QUEUE_MAX}</b> jobs ඉන්නවා",
+                   "ටිකක් ඉඳලා video එක ආයෙ එවන්න"],
+            hint="Queue එක හිස් කරන්න /clear · ඉවර වෙනකන් /queue බලන්න.",
+        ), buttons=None)
         jobs.pop(job.id, None)
         return False
     job.height = 0 if mode == "compress" else height
@@ -780,7 +913,11 @@ async def on_video(event):
     if not allowed(event.sender_id):
         return
     msg = event.message
-    status = await event.reply("🔎 <b>Analyzing video…</b>")
+    status = await reply_card(event, event_card(
+        icon="🔎", title_text="ANALYZING",
+        lines=["Metadata + endpoint probe කරනවා…"],
+        hint="Video එකේ codec, resolution, audio තොරතුරු ලබා ගන්නවා.",
+    ))
     job = Job(id=uuid.uuid4().hex[:8], user_id=event.sender_id, chat_id=event.chat_id,
               message=msg, meta=telegram_meta(msg), status=status)
     jobs[job.id] = job
@@ -883,19 +1020,21 @@ async def on_callback(event):
         if not job.started:
             jobs.pop(job.id, None)
             with contextlib.suppress(Exception):
-                await job.status.edit("❌ <b>Cancelled</b>", buttons=None)
+                await job.status.edit(cancelled_card(
+                    name=getattr(job.meta, "name", ""),
+                    note_text="Preview එකෙන් cancel කළා — encode එකක් ආරම්භ වුණේ නෑ"), buttons=None)
 
     elif action == "cfg":
         await safe_answer(event)
         with contextlib.suppress(MessageNotModifiedError):
-            await event.edit(settings_text(uid), buttons=settings_buttons(uid, job_id))
+            await edit_card(event, settings_text(uid), buttons=settings_buttons(uid, job_id))
 
     elif action == "sub":
         if arg not in ("crf", "pix", "cpre"):
             return
         await safe_answer(event)
         with contextlib.suppress(MessageNotModifiedError):
-            await event.edit(settings_text(uid, sub=arg), buttons=settings_buttons(uid, job_id, sub=arg))
+            await edit_card(event, settings_text(uid, sub=arg), buttons=settings_buttons(uid, job_id, sub=arg))
 
     elif action == "mod":
         if arg not in ENCODE_MODES:
@@ -904,7 +1043,7 @@ async def on_callback(event):
         lbl = "🗜 Size-Reduce (H.265)" if arg == "compress" else "📐 Resolution Mode"
         await safe_answer(event, f"{lbl} ✔")
         with contextlib.suppress(MessageNotModifiedError):
-            await event.edit(settings_text(uid), buttons=settings_buttons(uid, job_id))
+            await edit_card(event, settings_text(uid), buttons=settings_buttons(uid, job_id))
 
     elif action == "ccrf":
         c_val = int(arg)
@@ -913,7 +1052,7 @@ async def on_callback(event):
         store.set(uid, c_crf=c_val)
         await safe_answer(event, f"CRF {c_val} ({CRF_INFO[c_val][0]}) ✔")
         with contextlib.suppress(MessageNotModifiedError):
-            await event.edit(settings_text(uid, sub="crf"), buttons=settings_buttons(uid, job_id, sub="crf"))
+            await edit_card(event, settings_text(uid, sub="crf"), buttons=settings_buttons(uid, job_id, sub="crf"))
 
     elif action == "cpix":
         if arg not in PIX_FMT_CHOICES:
@@ -921,7 +1060,7 @@ async def on_callback(event):
         store.set(uid, c_pix_fmt=arg)
         await safe_answer(event, f"{arg} ✔")
         with contextlib.suppress(MessageNotModifiedError):
-            await event.edit(settings_text(uid, sub="pix"), buttons=settings_buttons(uid, job_id, sub="pix"))
+            await edit_card(event, settings_text(uid, sub="pix"), buttons=settings_buttons(uid, job_id, sub="pix"))
 
     elif action == "cpre":
         if arg not in PRESETS:
@@ -929,7 +1068,7 @@ async def on_callback(event):
         store.set(uid, c_preset=arg)
         await safe_answer(event, f"Preset: {arg} ✔")
         with contextlib.suppress(MessageNotModifiedError):
-            await event.edit(settings_text(uid, sub="cpre"), buttons=settings_buttons(uid, job_id, sub="cpre"))
+            await edit_card(event, settings_text(uid, sub="cpre"), buttons=settings_buttons(uid, job_id, sub="cpre"))
 
     elif action == "ctog":
         in_sub = arg.endswith("_s")
@@ -945,7 +1084,7 @@ async def on_callback(event):
         await safe_answer(event, f"{title}: {'ON' if new_val else 'OFF'} ✔")
         sub_name = "cpre" if in_sub else ""
         with contextlib.suppress(MessageNotModifiedError):
-            await event.edit(settings_text(uid, sub=sub_name), buttons=settings_buttons(uid, job_id, sub=sub_name))
+            await edit_card(event, settings_text(uid, sub=sub_name), buttons=settings_buttons(uid, job_id, sub=sub_name))
 
     elif action in ("caut", "cdst", "cwrk"):
         key = {"caut": "c_auto", "cdst": "c_dist", "cwrk": "c_workers"}[action]
@@ -961,7 +1100,7 @@ async def on_callback(event):
                     await pool.ensure(min(arg, dist.capacity()))
             asyncio.create_task(_grow_c())
         with contextlib.suppress(MessageNotModifiedError):
-            await event.edit(settings_text(uid), buttons=settings_buttons(uid, job_id))
+            await edit_card(event, settings_text(uid), buttons=settings_buttons(uid, job_id))
 
     elif action in ("pre", "cod", "dst", "wrk", "qres"):
         key = {"pre": "preset", "cod": "codec", "dst": "dist", "wrk": "workers", "qres": "qres"}[action]
@@ -978,7 +1117,7 @@ async def on_callback(event):
                     await pool.ensure(min(arg, dist.capacity()))
             asyncio.create_task(_grow())
         with contextlib.suppress(MessageNotModifiedError):
-            await event.edit(settings_text(uid), buttons=settings_buttons(uid, job_id))
+            await edit_card(event, settings_text(uid), buttons=settings_buttons(uid, job_id))
 
     elif action == "back":
         await safe_answer(event)
@@ -1066,7 +1205,12 @@ async def run_job(job: Job, height: int):
 
         if use_relay:                                      # user ගේ video එක → private channel + parallel DC pool warmup
             try:
-                await live.set("📨 <b>Channel එකට forward කරනවා…</b>", force=True)
+                await live.set(event_card(
+                    icon="📨", title_text="RELAY",
+                    lines=["Video එක private channel එකට forward කරනවා…",
+                           f"👤 Lanes <b>{len(relay.ready)}</b> · ⚡ warm pools සූදානම් කරනවා"],
+                    hint="Userbots එකවර download කරන නිසා speed වැඩියි.",
+                ), force=True)
                 fwd_task = asyncio.create_task(relay.forward_in(client, job.message))
                 warm_task = asyncio.create_task(relay.warmup(meta.dc))
                 try:
@@ -1098,7 +1242,11 @@ async def run_job(job: Job, height: int):
                 if job.cancelled:
                     raise asyncio.CancelledError()
                 logger.warning(f"relay download failed ({e!r}) → bot download")
-                await live.set("⚠️ Userbot download fail → bot එකෙන් download කරනවා…", force=True)
+                await live.set(event_card(
+                    icon="⚠️", title_text="RELAY FALLBACK",
+                    lines=["Userbot download fail — <b>bot</b> එකෙන් download කරනවා",
+                           "Job එක fail වෙන්නේ නෑ"],
+                ), force=True)
                 src.unlink(missing_ok=True)
                 use_relay = False
                 dl_badge = ""
@@ -1115,7 +1263,11 @@ async def run_job(job: Job, height: int):
         phase[0] = "probe"
         if use_relay:
             relay.trigger_upload_warmup()
-        await live.set("🔍 <b>Analyzing downloaded file…</b>", force=True)
+        await live.set(event_card(
+            icon="🔍", title_text="PROBING FILE",
+            lines=[f"📄 <code>{esc(clip(meta.name, 40))}</code>",
+                   "Real resolution · fps · audio stream තහවුරු කරනවා…"],
+        ), force=True)
         if not apply_probe(meta, await ffprobe(str(src))):
             raise RuntimeError("Valid video stream එකක් හමු වුණේ නෑ.")
 
@@ -1210,11 +1362,10 @@ async def run_job(job: Job, height: int):
                 raise
             except Exception as e:
                 logger.exception(f"Distributed encode failed (local fallback disabled): {e!r}")
-                await live.set(
-                    f"❌ <b>Distributed encode failed</b> ({esc(str(e)[:160])})\n"
-                    "Worker pool එකෙන් part එකක් complete කරන්න නොහැකි වුණා. Main runner fallback disabled.",
-                    force=True,
-                )
+                await live.set(failed_card(
+                    name=meta.name, error=str(e),
+                    hint="Worker pool එකෙන් part එකක් complete කරන්න බැරි වුණා · main-runner fallback disabled. /workflow එකෙන් runners බලන්න.",
+                ), force=True)
                 raise
             finally:
                 dticker.cancel()
@@ -1291,7 +1442,11 @@ async def run_job(job: Job, height: int):
                 ch_out[0], ch_out[1] = ch_msg, ub
                 stats["ul_via"] = ub.name
                 stats["ul_avg"], stats["ul_time"] = tr2.avg_speed, tr2.elapsed
-                await live.set("📨 <b>User ගේ chat එකට යවනවා…</b>", force=True)
+                await live.set(event_card(
+                    icon="📨", title_text="DELIVERING",
+                    lines=["Encoded video එක chat එකට යවනවා…",
+                           "Re-upload නෑ — channel message එකම forward වේ"],
+                ), force=True)
                 sent = await relay.deliver(client, job.chat_id, ch_msg.id, caption)  # main bot → user (re-upload නෑ)
             except asyncio.CancelledError:
                 raise
@@ -1299,7 +1454,11 @@ async def run_job(job: Job, height: int):
                 if job.cancelled:
                     raise asyncio.CancelledError()
                 logger.warning(f"relay upload/deliver failed ({e!r}) → bot upload")
-                await live.set("⚠️ Userbot upload fail → bot එකෙන් upload කරනවා…", force=True)
+                await live.set(event_card(
+                    icon="⚠️", title_text="RELAY FALLBACK",
+                    lines=["Userbot upload fail — <b>bot</b> එකෙන් upload කරනවා",
+                           "Job එක fail වෙන්නේ නෑ"],
+                ), force=True)
                 ul_badge = ""
                 tr2 = SpeedTracker(total=out_size)
                 sent = None
@@ -1311,34 +1470,44 @@ async def run_job(job: Job, height: int):
         phase[0] = "done"
 
         saved = (1 - out_size / meta.size) * 100 if meta.size else 0
+        via = stats.get("via") or []
+        stat_rows = [
+            ("DL", f"{human_size_short(stats.get('dl_avg', 0))}/s",
+             human_time(stats.get("dl_time", 0)), f"x{len(via)}" if via else ""),
+            ("ENC", speed_txt(stats.get("enc_speed", 0)),
+             human_time(stats.get("enc_time", 0)),
+             f"x{stats['workers']}" if "workers" in stats else ""),
+            ("UP", f"{human_size_short(stats.get('ul_avg', 0))}/s",
+             human_time(stats.get("ul_time", 0)), stats.get("ul_via", "")),
+            ("TOTAL", "", human_time(time.monotonic() - t_start), ""),
+        ]
+        extras = []
+        if "workers" in stats:
+            extras.append(f"👷 workers <b>{stats['workers']}</b>")
+        if stats.get("reassigned_parts"):
+            extras.append(f"♻️ reassigned <b>{stats['reassigned_parts']}</b>")
+        if stats.get("local_parts"):
+            extras.append(f"🏠 local parts <b>{stats['local_parts']}</b>")
+        if est_size:
+            extras.append(f"🎯 est <code>≈{human_size_short(est_size)}</code>")
         live.buttons = None
-        await live.set("\n".join([
-            "✅ <b>Done!</b>",
-            f"<code>{esc(dst.name)}</code>",
-            "━━━━━━━━━━━━━━━━━━━━",
-            f"📦 <code>{human_size(meta.size)}</code> → <code>{human_size(out_size)}</code> "
-            f"({'−' if saved >= 0 else '+'}{abs(saved):.0f}%)"
-            + (f"  •  est ≈{human_size(est_size)}" if est_size else ""),
-            f"📥 DL{' 👤×' + str(len(stats['via'])) if stats.get('via') else ''}: "
-            f"<code>{human_speed(stats['dl_avg'])}</code> • <code>{human_time(stats['dl_time'])}</code>",
-            f"🎬 Encode{' 🌐×' + str(stats['workers']) if 'workers' in stats else ''}: "
-            f"<code>{stats['enc_speed']:.2f}x</code> • <code>{human_time(stats['enc_time'])}</code>"
-            + (f"  (♻️ reassigned: {stats['reassigned_parts']})" if stats.get("reassigned_parts") else "")
-            + (f"  (🏠 local parts: {stats['local_parts']})" if stats.get("local_parts") else ""),
-            f"📤 UL{' 👤' + stats['ul_via'] if stats.get('ul_via') else ''}: "
-            f"<code>{human_speed(stats['ul_avg'])}</code> • <code>{human_time(stats['ul_time'])}</code>",
-            f"⏱ Total: <code>{human_time(time.monotonic() - t_start)}</code>",
-        ]), force=True)
+        await live.set(done_card(
+            name=dst.name,
+            before=human_size(meta.size), after=human_size(out_size),
+            saved_pct=saved if meta.size else None,
+            stats=stat_rows, extras=extras,
+            footer=note("Video එක upload වුණා · /queue ඊළඟ job එක බලන්න."),
+        ), force=True)
 
     except asyncio.CancelledError:
         phase[0] = "stop"
         live.buttons = None
-        await live.set("❌ <b>Cancelled</b>", force=True)
+        await live.set(cancelled_card(name=meta.name), force=True)
     except Exception as e:
         phase[0] = "stop"
         logger.exception("job failed")
         live.buttons = None
-        await live.set(f"⚠️ <b>Failed</b>\n<code>{esc(str(e)[-900:])}</code>", force=True)
+        await live.set(failed_card(name=meta.name, error=str(e)[-700:]), force=True)
     finally:
         if ch_ids or ch_out[0] is not None:
             with contextlib.suppress(Exception):

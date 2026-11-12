@@ -47,3 +47,37 @@ Setup වැරදි නම් `ALLOWED_USERS` ට හේතුව සහිත
 
 ## Workers
 `/settings → 👷 Workers`: 5, 10, 15, 20, 25, 30, 35, 40, 45, 50.
+
+## 🎨 Premium HTML Widgets (`widgets.py`)
+
+Telegram **HTML parse mode** එකෙන් හදපු එකම widget language එකක් — commands වලටත්, live job updates වලටත්.
+
+| Where | Widget |
+|---|---|
+| `/start`, `/help` | hero card + modes + collapsible command list |
+| `/settings` (+ CRF / Pixel / Preset panels) | metric cards, `blockquote expandable` choice lists, live status chips |
+| `/check` | health card: relay lanes, helper accounts, runner pool |
+| `/workflow` | per-account cards, run status board (status icons + age + parts) |
+| `/queue` | running card + numbered waiting list |
+| `/clear` | toast card |
+| `/End_Work` | kill progress meter → per-account result report |
+| job updates | analyzing · queued (#pos) · relay forward · download · probing · encode · distributed board · upload · delivering · done · failed · cancelled |
+
+**Design rules**
+
+- **Mobile first:** normal text is kept ~34 cells wide; wide/columnar data only lives inside `<pre>` and those blocks are ≤ 32 cells so nothing scrolls sideways on Android/iOS.
+- **Desktop friendly:** native `<blockquote>` cards + collapsible panels render the same on Desktop/Web; no custom emoji ids, no colours (Telegram has none), only real HTML entities.
+- **Premium look:** bold titles, `<code>` values, monospace gauges (`[██████░░░░░]  52.3%`), aligned stat grids (`DL/ENC/UP/TOTAL`), status pills (🟢/⏸/🔴).
+- **Zero-error guarantee** (`widgets.sanitize()` → `truncate_html()` → `Doc.build()`):
+  - only Telegram-supported tags are emitted; unknown tags are dropped, mis-nesting repaired, stray `&`/`<` escaped
+  - every message is ≤ 3800 UTF-16 units (4096 hard limit), truncated at tag boundaries — never inside a tag, entity or surrogate pair
+  - user content (file names, ffmpeg/GitHub errors) is always escaped → markup injection impossible
+  - renderers tolerate `None`/missing fields, 0s, negative/NaN-ish values and 0…50 workers with all part states
+  - `bot.reply_card()` / `bot.edit_card()` / `Live.set()` degrade to parse-free plain text if a client ever rejects the entities, so progress messages never go missing
+- **Action-runner safe:** the distributed board reads `DistState`/`Part` defensively; GitHub failures render as a widget error card instead of raising, and `/workflow` + `/End_Work` keep working with 1…N helper accounts.
+
+**Verify (no network / no Telegram login needed):**
+
+```bash
+python3 tests/test_widgets.py     # 2000+ checks incl. Telethon's real HTML parser
+```

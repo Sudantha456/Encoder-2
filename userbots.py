@@ -30,6 +30,7 @@ from telethon.sessions import StringSession
 from telethon.tl.types import InputDocumentFileLocation
 
 import config
+from widgets import Doc, esc, note
 from channel import (
     SetupError,
     check_bot_perms,
@@ -486,22 +487,50 @@ class Relay:
         raise RuntimeError(f"සියලුම userbots වලින් upload fail: {last!r}")
 
     # ───────────────────────── status ─────────────────────────
-    def status_text(self) -> str:
+    def status_rows(self) -> dict:
+        """
+        Structured relay health for the HTML widgets (no text formatting here).
+        Returns dict(on, summary, rows, problems) — tolerant of half-configured states.
+        """
         if not self.configured:
-            return ("👤 <b>Userbot relay: OFF</b>\n<code>USER_STRINGS</code> සහ <code>CHANNEL_ID</code> set කරලා නෑ — "
-                    "bot එකෙන්ම download/upload වෙනවා.")
+            return {
+                "on": False,
+                "summary": "disabled",
+                "rows": [
+                    "⚠️ <code>USER_STRINGS</code> / <code>CHANNEL_ID</code> set කරලා නෑ",
+                    "<i>Bot එකෙන්ම download/upload වෙනවා (fallback)</i>",
+                ],
+                "problems": list(self.problems),
+            }
         conns = self.connections_per_ub(len(self.ready)) if self.ready else config.UB_DL_CONNECTIONS
-        lines = [
-            f"👤 <b>Userbot relay: {'ON ✅' if self.enabled else 'OFF ❌'}</b>"
-            + (f"  (⚡ <code>{len(self.ready)}×{conns} = {len(self.ready) * conns}</code> conns)" if self.enabled else "")
-        ]
+        rows, problems = [], []
         for u in self.userbots:
             if u.ok:
-                st = f"⏸ cooldown {max(0, u.cooldown_until - time.monotonic()):.0f}s" if u.cooling else "🟢 ready"
-                lines.append(f"• {u.label} — {st} • floods {u.floods}")
+                if u.cooling:
+                    left = max(0, u.cooldown_until - time.monotonic())
+                    rows.append(f"⏸ <b>{esc(u.label)}</b> · cooldown <code>{left:.0f}s</code> · floods <code>{u.floods}</code>")
+                else:
+                    rows.append(f"🟢 <b>{esc(u.label)}</b> · ready · floods <code>{u.floods}</code>")
             else:
-                lines.append(f"• ❌ {u.error}")
+                rows.append(f"🔴 <b>{esc(u.label)}</b> · <code>{esc(str(u.error)[:90])}</code>")
         for p in self.problems:
             if not any(p == u.error for u in self.userbots):
-                lines.append(f"⚠️ {p}")
-        return "\n".join(lines)
+                problems.append(f"⚠️ {esc(str(p)[:120])}")
+        return {
+            "on": bool(self.enabled),
+            "summary": f"{len(self.ready)}×{conns} = {len(self.ready) * conns} conns" if self.enabled else "configured • OFF",
+            "rows": rows + problems,
+            "problems": problems,
+        }
+
+    def status_text(self) -> str:
+        """Premium relay card (used by /check and the start-up notification)."""
+        st = self.status_rows()
+        d = Doc()
+        d.head("👤", "USERBOT RELAY", "ON" if st["on"] else "OFF")
+        d.quote([f"⚡ <code>{esc(st['summary'])}</code>"])
+        d.sec("📡", "Lanes")
+        d.extend(st["rows"] or [note("userbots configure කරලා නෑ")])
+        if not st["on"]:
+            d.add(note("Fallback: bot එකෙන්ම download/upload — jobs fail වෙන්නේ නෑ."))
+        return d.build()
