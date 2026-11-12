@@ -49,11 +49,13 @@ from settings_store import SettingsStore
 from transcoder import EncState, build_x265_extra, resolve_x265_pix_fmt, transcode
 import dist
 from ui import SpeedTracker
-from widgets import (Doc, cancelled_card, chips, clip, done_card, endwork_progress,
+from widgets import (BLUE, GREEN, ORANGE, PURPLE, YELLOW, Doc,
+                     cancelled_card, chips, clip, done_card, endwork_progress,
                      endwork_result, esc, event_card, failed_card, health_card,
                      home_card, human_age, human_size, human_size_short, human_time,
                      note, queue_card, queued_card, render_dist, render_encode,
-                     render_transfer, speed_txt, toast_card, to_plain, workflow_account)
+                     render_transfer, speed_txt, toast_card, to_plain,
+                     workflow_account)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
 logger = logging.getLogger("EncoderBot")
@@ -289,14 +291,14 @@ def _crf_panel(s: dict) -> str:
     tier, desc = CRF_INFO[cur]
     d = Doc()
     d.head("🎯", "CRF TUNING", "quality vs size")
-    d.quote([f"දැනට <b>CRF {cur} ({esc(tier)})</b>", f"<i>{esc(desc)}</i>"])
+    d.quote([f"දැනට {YELLOW} <b>CRF {cur} ({esc(tier)})</b>", f"<i>{esc(desc)}</i>"])
     rows = []
     for c in CRF_CHOICES:
         t, dd = CRF_INFO[c]
         rows.append(f"{'✅' if c == cur else '•'} <b>{c} — {esc(t)}</b>: {esc(dd)}")
-    d.sec("🎚", "CRF Choices")
+    d.sec("", "CRF Choices", accent=YELLOW)
     d.quote(rows, expandable=True)
-    d.add("💡 <b>Visually Lossless:</b> <code>CRF 18 – 20</code>")
+    d.add(f"{GREEN} <b>Visually Lossless</b> · <code>CRF 18 – 20</code>")
     d.add(note("අඩු CRF = ඉහළම quality · වැඩි CRF = තවත් කුඩා file size"))
     return d.build()
 
@@ -307,7 +309,8 @@ def _pix_panel(s: dict) -> str:
     enc_pf = resolve_x265_pix_fmt(cur)
     d = Doc()
     d.head("🎨", "PIXEL FORMAT", "bit-depth · chroma")
-    top = [f"දැනට <code>{esc(cur)}</code> <b>({esc(spec)})</b>", f"<i>{esc(desc)}</i>"]
+    top = [f"දැනට {PURPLE} <code>{esc(cur)}</code> <b>({esc(spec)})</b>",
+           f"<i>{esc(desc)}</i>"]
     if cur != enc_pf:
         top.append(f"ℹ️ HEVC උපරිම <code>{esc(enc_pf)}</code> ලෙස encode වේ")
     d.quote(top)
@@ -316,7 +319,7 @@ def _pix_panel(s: dict) -> str:
         pf_spec, pf_desc = PIX_FMT_INFO[pf]
         rows.append(f"{'✅' if pf == cur else '•'} <code>{esc(pf)}</code> "
                     f"<b>({esc(pf_spec)})</b>: {esc(pf_desc)}")
-    d.sec("🧪", "Choices")
+    d.sec("", "Choices", accent=PURPLE)
     d.quote(rows, expandable=True)
     d.add(note("සාමාන්‍ය phones/TV සියල්ලටම yuv420p හෝ yuv420p10le වඩාත්ම ගැලපේ."))
     return d.build()
@@ -326,7 +329,7 @@ def _cpre_panel(s: dict) -> str:
     d = Doc()
     d.head("🎚", "PRESET & x265", "advanced")
     d.quote([f"🎚 Preset <b>{esc(s['c_preset'])}</b>", f"<i>{esc(PRESET_INFO[s['c_preset']])}</i>"])
-    d.sec("🧬", "x265 toggles")
+    d.sec("", "x265 toggles", accent=PURPLE)
     for k, (t, desc) in X265_TOGGLE_INFO.items():
         d.add(f"{'✅' if s[k] else '❌'} <b>{esc(t)}</b> — <i>{esc(desc)}</i>")
     d.add(note("fast / medium / slow preset එකකින් Visually Lossless H.265 හොඳම compression ලැබේ."))
@@ -338,13 +341,16 @@ def _pipeline_rows(s: dict, *, compress: bool) -> list:
     wrk_key = "c_workers" if compress else "workers"
     auto = s.get("c_auto") if compress else s.get("qres")
     auto_lbl = (("auto" if auto == "auto" else "ask (button)") if compress else _queue_lbl(auto))
-    rows = [
-        f"🌐 Distributed <b>{esc(str(s[dist_key]))}</b> · 👷 Workers <b>{s[wrk_key]}</b> "
+    dist_lbl = str(s[dist_key]).lower()
+    dist_icon = GREEN if dist_lbl == "on" else (BLUE if dist_lbl == "auto" else "⚫")
+    auto_icon = GREEN if auto_lbl.startswith("smart") else (YELLOW if "ask" in auto_lbl else BLUE)
+    relay_icon = GREEN if relay.enabled else "⚫"
+    return [
+        f"{dist_icon} Distributed <b>{esc(dist_lbl)}</b> · 👷 Workers <b>{s[wrk_key]}</b> "
         f"<i>({min(WORKER_CHOICES)}–{max(WORKER_CHOICES)})</i>",
-        f"👤 Relay <b>{_relay_short()}</b> · 📋 Auto-queue <b>{auto_lbl}</b>"
+        f"{auto_icon} Auto-queue <b>{auto_lbl}</b> · {relay_icon} Relay <b>{_relay_short()}</b>"
         + ("" if dist.available() else " · <i>dist n/a</i>"),
     ]
-    return rows
 
 
 def settings_text(uid: int, sub: str = "") -> str:
@@ -362,42 +368,46 @@ def settings_text(uid: int, sub: str = "") -> str:
         crf_tier, crf_desc = CRF_INFO[crf]
         pf = s["c_pix_fmt"]
         pf_spec, pf_desc = PIX_FMT_INFO[pf]
+        toggles = " · ".join(
+            f"{'✅' if s[k] else '❌'} <b>{short}</b>"
+            for k, short in (("c_bframes", "BF"), ("c_sao", "SAO"),
+                             ("c_lookahead", "LA"), ("c_aq", "AQ"))
+        )
         d = Doc()
-        d.head("⚙️", "ENCODE SETTINGS", "🗜 size-reduce · live")
+        d.head("⚙️", "ENCODE SETTINGS", "size-reduce · live")
         d.quote([
-            "🗜 <b>Size-Reduce (H.265)</b> · visually lossless",
+            f"{PURPLE} <b>Size-Reduce (H.265)</b> · visually lossless",
             chips(f"CRF {crf}", pf, s["c_preset"], f"{s['c_workers']}w"),
             f"🌐 dist <code>{esc(str(s['c_dist']))}</code> · 📋 queue "
             f"<code>{'auto' if s['c_auto'] == 'auto' else 'ask'}</code>",
         ])
-        d.sec("🎯", "Quality")
+        d.sec("", "Quality", accent=BLUE)
         d.add(f"🎯 CRF <b>{crf} ({esc(crf_tier)})</b> — <i>{esc(crf_desc)}</i>")
         d.add(f"🎨 Pixel <code>{esc(pf)}</code> <b>({esc(pf_spec)})</b> — <i>{esc(pf_desc)}</i>")
         d.add(f"🎚 Preset <code>{esc(s['c_preset'])}</code> — <i>{esc(PRESET_INFO[s['c_preset']])}</i>")
-        d.sec("🧬", "x265")
-        d.add("🧬 <code>B-Frames:%s · SAO:%s · LA:%s · AQ:%s</code>" % (
-            "ON" if s["c_bframes"] else "OFF", "ON" if s["c_sao"] else "OFF",
-            "ON" if s["c_lookahead"] else "OFF", "ON" if s["c_aq"] else "OFF"))
-        d.sec("🚀", "Pipeline")
+        d.sec("", "x265", accent=PURPLE)
+        d.add(toggles)
+        d.sec("", "Pipeline", accent=ORANGE)
         d.extend(_pipeline_rows(s, compress=True))
         d.add(_cloud_line())
         d.add(note("Original resolution එලෙසම තබා H.264 ➜ H.265 ලෙස size අඩු කරයි."))
         return d.build(tail=note("මාරු කරන්න mode / preset / CRF buttons භාවිත කරන්න."))
 
+    toggles = ""
     d = Doc()
-    d.head("⚙️", "ENCODE SETTINGS", "📐 resolution · live")
+    d.head("⚙️", "ENCODE SETTINGS", "resolution · live")
     d.quote([
-        "📐 <b>Resolution Mode</b> · 1080p → 144p",
+        f"{BLUE} <b>Resolution Mode</b> · 1080p → 144p",
         chips(s["preset"], _codec_short(s["codec"]), f"{s['workers']}w"),
         f"🌐 dist <code>{esc(str(s['dist']))}</code> · 📋 queue <code>{esc(_queue_lbl(s['qres']))}</code>",
     ])
-    d.sec("🎛", "Encoder")
+    d.sec("", "Encoder", accent=BLUE)
     d.add(f"🎚 Preset <code>{esc(s['preset'])}</code> — <i>{esc(PRESET_INFO[s['preset']])}</i>")
-    d.add(f"🎞 Codec <code>{esc(s['codec'])}</code> — <i>{esc(CODECS.get(s['codec'], ''))}</i>")
-    d.sec("🚀", "Pipeline")
+    d.add(f"🎞 Codec <code>{esc(_codec_short(s['codec']))}</code> <i>({esc(s['codec'])})</i>")
+    d.sec("", "Pipeline", accent=ORANGE)
     d.extend(_pipeline_rows(s, compress=False))
     d.add(_cloud_line())
-    d.sec("📝", "Notes")
+    d.sec("", "Notes", accent=GREEN)
     d.add(note("ultrafast → වේගවත්ම · veryslow → අඩුම size"))
     d.add(note("H.265 → size අඩුයි, encode වෙන්න වැඩි වෙලාවක් යනවා"))
     return d.build(tail=note("Download එක යන අතරේත් workers වෙනස් කරන්න පුළුවන්."))
@@ -531,8 +541,8 @@ async def cmd_start(event):
             f"🗂 Accounts <b>{1 + len(dist.HELPERS)}</b> · ☁️ Settings auto-save",
         ],
         modes=[
-            ("📐 <b>Resolution Mode</b>", "1080p → 144p"),
-            ("🗜 <b>Size-Reduce Mode</b>", "H.265 lossless"),
+            (f"{BLUE} <b>Resolution Mode</b>", "1080p → 144p"),
+            (f"{PURPLE} <b>Size-Reduce Mode</b>", "H.265 lossless"),
         ],
         commands=[
             ("⚙️ /settings", "mode · preset · CRF"),
@@ -621,7 +631,16 @@ async def cmd_check(event):
 
 
 # ───────────────────────── 🌐 /workflow  &  🛑 /End_Work ─────────────────────────
-_STATUS_ICON = {"in_progress": "▶️", "queued": "⏳", "waiting": "⏳", "requested": "⏳", "pending": "⏳"}
+_STATUS_ICON = {
+    "in_progress": "🔵", "queued": "🟡", "waiting": "🟡",
+    "requested": "🟡", "pending": "🟡",
+    "completed": "✅", "success": "✅",
+    "failure": "🔴", "timed_out": "🔴", "cancelled": "⚫",
+}
+
+
+def _acct_name(i: int) -> str:
+    return "Main" if i == 0 else f"Helper #{i}"
 end_work_lock = asyncio.Lock()
 
 
@@ -682,11 +701,11 @@ async def cmd_workflow(event):
 
     total_runs = total_workers = 0
     d = Doc()
-    d.head("🌐", "WORKER WORKFLOWS", "live")
+    d.head("🌐", "WORKER WORKFLOWS", "GitHub Actions · live")
     d.quote([
-        f"⚙️ Mode <b>{'🗜 Size-Reduce' if cfg['mode'] == 'compress' else '📐 Resolution'}</b> · "
-        f"👷 <b>{act_wrk}</b> · 🌐 dist <b>{esc(str(act_dst))}</b>",
-        f"🧠 Pool <b>{'ACTIVE' if pool.active else 'idle'}</b>"
+        f"⚙️ Mode <b>{'🟪 Size-Reduce' if cfg['mode'] == 'compress' else '🟦 Resolution'}</b> · "
+        f"👷 <b>{act_wrk}</b> · 🟦 dist <b>{esc(str(act_dst))}</b>",
+        f"{GREEN if pool.active else '⚪'} Pool <b>{'ACTIVE' if pool.active else 'idle'}</b>"
         + (" · 🛑 halted (/End_Work)" if pool.halted else "") + f" · 🧮 capacity <b>{dist.capacity()}</b>",
         f"📋 Queue <b>{len(queue)}</b> waiting" + (f" · ▶️ <code>{esc(clip(cur.meta.name, 24))}</code>" if cur else ""),
     ])
@@ -704,20 +723,23 @@ async def cmd_workflow(event):
             rows.append(note("Active workflow runs නෑ — pool idle"))
         for r in runs[:6]:
             jobs = r.get("jobs", [])
+            run_st = str(r.get("status") or "")
             run_n = sum(1 for j in jobs if j.get("status") == "in_progress")
             que_n = sum(1 for j in jobs if j.get("status") in ("queued", "waiting", "pending", "requested"))
             total_workers += run_n
             idx = [int(x) for j in jobs for x in re.findall(r"\((\d+)\)", j.get("name", ""))]
             rows.append(
-                f"{_STATUS_ICON.get(r['status'], '•')} <code>#{r['databaseId']}</code> "
-                f"<b>{esc(str(r['status']).replace('_', ' '))}</b> · {_age(r.get('createdAt'))}\n"
-                f"    👷 run <b>{run_n}</b> · ⏳ queue <b>{que_n}</b> · 🧩 [{_parts_str(idx)}]"
+                f"{_STATUS_ICON.get(run_st, '⚪')} <code>#{r['databaseId']}</code> "
+                f"<b>{esc(run_st.replace('_', ' '))}</b> · {_age(r.get('createdAt'))}"
             )
+            if run_st in ("in_progress", "queued", "waiting", "requested", "pending"):
+                rows.append(f"    👷 running <b>{run_n}</b> · ⏳ queued <b>{que_n}</b> · 🧩 [{_parts_str(idx)}]")
         if len(runs) > 6:
             rows.append(note(f"… තව runs {len(runs) - 6} ක්"))
         if pos:
             d.gap()
-        d.extend(workflow_account(label=_acct_label(a["idx"]), repo=a["repo"], rows=rows))
+        d.extend(workflow_account(label=_acct_name(a["idx"]), repo=a["repo"], rows=rows,
+                                  accent=(BLUE if a["idx"] == 0 else PURPLE)))
     d.add(f"📊 Active runs <b>{total_runs}</b> · 👷 Running workers <b>{total_workers}</b>")
     d.add(note("🛑 සේරම kill කරන්න: /End_Work"))
     await edit_card(m, d.build())
@@ -1302,7 +1324,7 @@ async def run_job(job: Job, height: int):
                 pix_fmt=pix_fmt,
                 x265_extra=x265_extra,
             )
-            t_label = f"🗜 {meta.width}×{meta.height} (Original)" if meta.width else "🗜 Size-Reduce"
+            t_label = "Size-Reduce"
             extra_lbl = f"CRF {crf_val} • {pix_fmt}"
         else:
             est_size = estimate_size(meta, height, preset, codec)

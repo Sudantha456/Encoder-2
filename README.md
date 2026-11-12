@@ -66,8 +66,11 @@ Telegram **HTML parse mode** එකෙන් හදපු එකම widget langu
 **Design rules**
 
 - **Mobile first:** normal text is kept ~34 cells wide; wide/columnar data only lives inside `<pre>` and those blocks are ≤ 32 cells so nothing scrolls sideways on Android/iOS.
-- **Desktop friendly:** native `<blockquote>` cards + collapsible panels render the same on Desktop/Web; no custom emoji ids, no colours (Telegram has none), only real HTML entities.
-- **Premium look:** bold titles, `<code>` values, monospace gauges (`[██████░░░░░]  52.3%`), aligned stat grids (`DL/ENC/UP/TOTAL`), status pills (🟢/⏸/🔴).
+- **Desktop friendly:** native `<blockquote>` cards + collapsible panels render the same on Desktop/Web; no custom emoji ids, only real HTML entities.
+- **Colour system (no text colours in Telegram → emoji palette):** 🟦 info/settings · 🟪 encode/size-reduce · 🟩 success/done · 🟨 waiting/queue · 🟧 warning/pipeline · 🟥 error/cancel · ⬜ empty · ⚫ off/idle. Used for section accents, status dots, ON/OFF pills and keycap queue numbers (1️⃣…🔟) — always *outside* `<pre>` so alignment can never break.
+- **Coloured progress meter:** `🟩🟩🟩🟩🟩🟩🟩🟩🟩⬜ 88.2%` — 10 cells (≤27 display cells incl. percentage), colour shifts red → yellow → green as the job advances; replaces the old scrollbar-looking `[██░░]` gauge that rendered badly on phones.
+- **Adaptive worker board:** ≤10 workers → 1-column full detail · 11–20 → 2-column (pct + speed) · 21–50 → 3-column mini cells, so a 35-worker run shows 12 tidy rows instead of 18 (all ≤29 cells, ASCII only).
+- **Premium look:** bold titles, `<code>` values, aligned stat grids (`DL/ENC/UP/TOTAL`), size-delta pill (`🟩 −54%`), colour-coded run statuses (🔵 running · 🟡 queued · ✅ completed · 🔴 failure).
 - **Zero-error guarantee** (`widgets.sanitize()` → `truncate_html()` → `Doc.build()`):
   - only Telegram-supported tags are emitted; unknown tags are dropped, mis-nesting repaired, stray `&`/`<` escaped
   - every message is ≤ 3800 UTF-16 units (4096 hard limit), truncated at tag boundaries — never inside a tag, entity or surrogate pair

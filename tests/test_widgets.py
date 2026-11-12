@@ -265,6 +265,27 @@ validate("failed-huge", W.failed_card(name=LONG, error="E" * 5000))
 validate("cancelled", W.cancelled_card(name=HOSTILE))
 validate("cancelled-bare", W.cancelled_card())
 
+# ───────────────────────── 2b. coloured meters & palette ─────────────────────────
+check("meter starts red", W.meter(10).count(W.RED) > 0, W.meter(10))
+check("meter mid yellow", W.meter(50).count(W.YELLOW) > 0, W.meter(50))
+check("meter end green", W.meter(90).count(W.GREEN) > 0, W.meter(90))
+check("meter 0% empty", W.meter(0) == W.WHITE * 10, W.meter(0))
+check("meter 100% full", W.meter(100) == W.GREEN * 10, W.meter(100))
+
+for pct in (0, 0.4, 12.5, 33, 49.9, 66, 88.2, 99.99, 100, -5, 150, None):
+    line = W.meter_line(pct if pct is not None else 0)
+    check(f"meter-line-{pct} width", W.cells(line) <= 30, f"{W.cells(line)} cells: {line}")
+    validate(f"meter-{pct}", line)
+
+check("pack_parts budget", all(W.cells(l) <= 30 for l in
+                               W.pack_parts(["🎞 <code>H.265</code>", "⚙️ <code>veryfast</code>",
+                                             "👷 <code>35w</code>", "🎯 <code>CRF24</code>",
+                                             "🎨 <code>8b</code>"])))
+check("keycaps", W.num_badge(1) == "1️⃣" and W.num_badge(10) == "🔟" and W.num_badge(11) == "11.")
+check("badge colour", W.badge_icon("Size-Reduce (H.265 • CRF 18)") == W.PURPLE
+      and W.badge_icon("720p") == W.BLUE)
+check("onoff colour", W.RED in W.onoff(False) and W.GREEN in W.onoff(True))
+
 # ───────────────────────── 3. hardening ─────────────────────────
 # hostile content cannot inject markup
 out = W.done_card(name=SHORT_HOSTILE, before="1 MB", after="900 KB", saved_pct=10,

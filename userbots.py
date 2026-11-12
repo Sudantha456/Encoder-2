@@ -508,7 +508,7 @@ class Relay:
             if u.ok:
                 if u.cooling:
                     left = max(0, u.cooldown_until - time.monotonic())
-                    rows.append(f"⏸ <b>{esc(u.label)}</b> · cooldown <code>{left:.0f}s</code> · floods <code>{u.floods}</code>")
+                    rows.append(f"🟡 <b>{esc(u.label)}</b> · cooldown <code>{left:.0f}s</code> · floods <code>{u.floods}</code>")
                 else:
                     rows.append(f"🟢 <b>{esc(u.label)}</b> · ready · floods <code>{u.floods}</code>")
             else:
@@ -527,7 +527,7 @@ class Relay:
         """Premium relay card (used by /check and the start-up notification)."""
         st = self.status_rows()
         d = Doc()
-        d.head("👤", "USERBOT RELAY", "ON" if st["on"] else "OFF")
+        d.head("👤", "USERBOT RELAY", "ON" if st["on"] else "OFF", )
         d.quote([f"⚡ <code>{esc(st['summary'])}</code>"])
         d.sec("📡", "Lanes")
         d.extend(st["rows"] or [note("userbots configure කරලා නෑ")])

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import html as _html
 import re
+import unicodedata
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 # ───────────────────────── limits ─────────────────────────
@@ -136,9 +137,92 @@ def pct_txt(pct) -> str:
     return f"{min(100.0, max(0.0, pct)):5.1f}%"
 
 
-def gauge(pct, width: int = 14, suffix: str = "") -> str:
-    """Single-line monospace gauge used as a widget 'meter'."""
-    return f"[{bar(pct, width)}] {pct_txt(pct)}{(' ' + suffix) if suffix else ''}"
+# ── colour palette ───────────────────────────────────────────────
+# Telegram HTML has no text colours, so the palette is emoji: consistent,
+# colour-accurate on every client (Android / iOS / Desktop / Web) and it can
+# never break the layout because it is only used *outside* <pre> blocks.
+BLUE, PURPLE, GREEN, YELLOW, ORANGE, RED = "🟦", "🟪", "🟩", "🟨", "🟧", "🟥"
+WHITE, BLACK = "⬜", "⬛"
+
+_STATUS_ACCENT = {
+    "ok": GREEN, "done": GREEN, "ready": GREEN, "warn": YELLOW, "wait": YELLOW,
+    "busy": BLUE, "run": BLUE, "cloud": BLUE, "error": RED, "fail": RED,
+    "off": BLACK, "idle": WHITE,
+}
+
+
+def _cells_plain(text: str) -> int:
+    """Display width in terminal-ish cells (emoji/CJK = 2, VS16 = 0)."""
+    width = 0
+    for ch in str(text):
+        if ch == "\ufe0f" or unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
+
+
+def cells(html_text: str) -> int:
+    """Display width of an HTML fragment (tags stripped)."""
+    return _cells_plain(to_plain(html_text))
+
+
+def pack_parts(parts, budget: int = 30, sep: str = " · "):
+    """Pack `chips` into lines that never exceed *budget* display cells."""
+    lines, cur = [], ""
+    for part in parts:
+        part = (part or "").strip()
+        if not part:
+            continue
+        candidate = part if not cur else f"{cur}{sep}{part}"
+        if cur and cells(candidate) > budget:
+            lines.append(cur)
+            cur = part
+        else:
+            cur = candidate
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def meter_color(pct) -> str:
+    """Green when nearly done, yellow mid-way, red at the start."""
+    try:
+        p = float(pct or 0.0)
+    except (TypeError, ValueError):
+        p = 0.0
+    if p >= 66:
+        return GREEN
+    if p >= 33:
+        return YELLOW
+    return RED
+
+
+def meter(pct, width: int = 10) -> str:
+    """`🟩🟩🟩🟩🟩🟩🟩🟩🟩⬜` — colourful 10-cell gauge (20 display cells)."""
+    try:
+        p = float(pct or 0.0)
+    except (TypeError, ValueError):
+        p = 0.0
+    p = min(100.0, max(0.0, p))
+    width = max(3, int(width))
+    filled = int(round(width * p / 100.0))
+    return meter_color(p) * filled + WHITE * (width - filled)
+
+
+def meter_line(pct, width: int = 10, extra: str = "") -> str:
+    """One-line meter + bold percentage (never wraps: ≤ 27 display cells)."""
+    try:
+        p = float(pct or 0.0)
+    except (TypeError, ValueError):
+        p = 0.0
+    p = min(100.0, max(0.0, p))
+    line = f"{meter(p, width)} <b>{p:.1f}%</b>"
+    return f"{line} · {extra}" if extra else line
+
+
+def gauge(pct, width: int = 10, suffix: str = "") -> str:
+    """Backwards-compatible alias for :func:`meter_line`."""
+    return meter_line(pct, width, suffix)
 
 
 # ───────────────────────── HTML sanitiser ─────────────────────────
@@ -293,8 +377,13 @@ def title(icon: str, text: str, hint: str = "") -> str:
     return f"{head} · <i>{esc(hint)}</i>" if hint else head
 
 
-def section(icon: str, label: str, hint: str = "") -> str:
-    head = f"{SECTION_MARK}{icon} <b>{esc(label)}</b>" if icon else f"{SECTION_MARK}<b>{esc(label)}</b>"
+def section(icon: str, label: str, hint: str = "", accent: str = "") -> str:
+    """Section header. `accent` (a coloured square) gives the card its palette."""
+    if accent:
+        head = f"{accent} <b>{esc(label)}</b>"
+    else:
+        head = (f"{SECTION_MARK}{icon} <b>{esc(label)}</b>" if icon
+                else f"{SECTION_MARK}<b>{esc(label)}</b>")
     return f"{head} · <i>{esc(hint)}</i>" if hint else head
 
 
@@ -327,11 +416,30 @@ def chips(*items) -> str:
 
 
 def onoff(flag, on: str = "ON", off: str = "OFF") -> str:
-    return f"{'✅' if flag else '❌'} <b>{esc(on if flag else off)}</b>"
+    """Coloured ON/OFF pill (green / red)."""
+    return f"{GREEN if flag else RED} <b>{esc(on if flag else off)}</b>"
 
 
 def status_dot(ok: bool) -> str:
-    return "🟢" if ok else "🔴"
+    return GREEN if ok else RED
+
+
+_KEYCAPS = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣",
+            6: "6️⃣", 7: "7️⃣", 8: "8️⃣", 9: "9️⃣", 10: "🔟"}
+
+
+def num_badge(i) -> str:
+    """Colourful queue numbering (1️⃣ … 🔟, then `11.`)."""
+    try:
+        return _KEYCAPS.get(int(i), f"{int(i)}.")
+    except (TypeError, ValueError):
+        return "•"
+
+
+def badge_icon(badge) -> str:
+    """Purple for H.265 size-reduce targets, blue for resolution targets."""
+    badge = str(badge or "")
+    return PURPLE if ("Size-Reduce" in badge or "H.265" in badge) else BLUE
 
 
 def note(text: str) -> str:
@@ -370,8 +478,8 @@ class Doc:
     def head(self, icon: str, text: str, hint: str = "") -> "Doc":
         return self.add(title(icon, text, hint))
 
-    def sec(self, icon: str, label: str, hint: str = "") -> "Doc":
-        return self.add(section(icon, label, hint))
+    def sec(self, icon: str, label: str, hint: str = "", accent: str = "") -> "Doc":
+        return self.add(section(icon, label, hint, accent))
 
     def kv(self, icon: str, label: str, value, mono: bool = True) -> "Doc":
         return self.add(kv(icon, label, value, mono))
@@ -385,8 +493,11 @@ class Doc:
     def mono(self, lines) -> "Doc":
         return self.add(mono(lines))
 
-    def gauge(self, pct, width: int = 14) -> "Doc":
-        return self.add(mono([gauge(pct, width)]))
+    def meter(self, pct, width: int = 10, extra: str = "") -> "Doc":
+        return self.add(meter_line(pct, width, extra))
+
+    def gauge(self, pct, width: int = 10) -> "Doc":      # back-compat
+        return self.meter(pct, width)
 
     def build(self, tail: Optional[str] = None) -> str:
         blocks = list(self.blocks)
@@ -406,26 +517,6 @@ class Doc:
 
 
 # ───────────────────────── job progress widgets ─────────────────────────
-def render_transfer(kind: str, tr, name: str, badge: str = "") -> str:
-    """Live download / upload card (drop-in replacement for the old renderer)."""
-    up = str(kind).lower().startswith("u")
-    icon, word = ("📤", "UPLOAD") if up else ("📥", "DOWNLOAD")
-    pct = getattr(tr, "percent", 0.0) or 0.0
-    cur = getattr(tr, "current", 0) or 0
-    tot = getattr(tr, "total", 0) or 0
-    d = Doc()
-    d.head(icon, word, badge)
-    d.quote(f"📄 <code>{esc(clip(name, 44))}</code>")
-    d.mono([gauge(pct, 14)])
-    d.add(f"📦 <code>{human_size(cur)}</code> / <code>{human_size(tot)}</code>")
-    d.add(f"⚡ <code>{human_speed(getattr(tr, 'speed', 0))}</code> · avg <code>{human_speed(getattr(tr, 'avg_speed', 0))}</code>")
-    peak = getattr(tr, "peak_speed", 0.0) or 0.0
-    if peak > 0 and (getattr(tr, "elapsed", 0.0) or 0) >= 1.5:
-        d.add(f"📈 peak <code>{human_speed(peak)}</code>")
-    d.add(f"⏳ <code>{human_time(getattr(tr, 'eta', 0))}</code> · ⏱ <code>{human_time(getattr(tr, 'elapsed', 0))}</code>")
-    return d.build()
-
-
 _CODEC_SHORT = {"libx265": "H.265", "libx264": "H.264"}
 
 
@@ -456,29 +547,69 @@ def _extra_short(extra_info: str) -> str:
     return s
 
 
-def _cfg_line(preset: str, codec: str, extra: str, workers: Optional[int] = None) -> str:
-    parts = [_codec_txt(codec), preset]
-    ex = _extra_short(extra)
-    if ex:
-        parts.append(ex)
+_CFG_ICONS = ("🎯", "🎨", "🧩")
+
+
+def _cfg_lines(preset: str, codec: str, extra: str, workers: Optional[int] = None,
+               meta: str = "") -> List[str]:
+    """
+    Colour-coded configuration chips, auto-wrapped into ≤30-cell lines so the
+    card never breaks on a phone: `🎞 H.265 · ⚙️ veryfast · 👷 35w`.
+    """
+    chips_ = []
+    if codec:
+        chips_.append(f"🎞 <code>{esc(_codec_txt(codec))}</code>")
+    if preset:
+        chips_.append(f"⚙️ <code>{esc(preset)}</code>")
     if workers:
-        parts.append(f"{workers}w")
-    return " · ".join(p for p in parts if p)
+        chips_.append(f"👷 <code>{workers}w</code>")
+    if meta:
+        chips_.append(f"📐 <code>{esc(meta)}</code>")
+    for i, piece in enumerate(p.strip() for p in re.split(r"\s*[•·]\s*", _extra_short(extra))):
+        if piece:
+            icon = _CFG_ICONS[min(i, len(_CFG_ICONS) - 1)]
+            chips_.append(f"{icon} <code>{esc(piece)}</code>")
+    return pack_parts(chips_, budget=30)
+
+
+def render_transfer(kind: str, tr, name: str, badge: str = "") -> str:
+    """Live download / upload card (drop-in replacement for the old renderer)."""
+    up = str(kind).lower().startswith("u")
+    icon, word = ("📤", "UPLOAD") if up else ("📥", "DOWNLOAD")
+    pct = getattr(tr, "percent", 0.0) or 0.0
+    cur = getattr(tr, "current", 0) or 0
+    tot = getattr(tr, "total", 0) or 0
+    d = Doc()
+    d.head(icon, word, badge)
+    d.quote([f"📄 <code>{esc(clip(name, 44))}</code>"])
+    d.add(meter_line(pct, 10))
+    d.add(f"📦 <code>{human_size(cur)}</code> / <code>{human_size(tot)}</code>")
+    d.add(f"⚡ <code>{human_speed(getattr(tr, 'speed', 0))}</code>"
+          f" · <i>avg</i> <code>{human_speed(getattr(tr, 'avg_speed', 0))}</code>")
+    peak = getattr(tr, "peak_speed", 0.0) or 0.0
+    if peak > 0 and (getattr(tr, "elapsed", 0.0) or 0) >= 1.5:
+        d.add(f"📈 <code>{human_speed(peak)}</code> <i>peak</i>")
+    d.add(f"⏳ <code>{human_time(getattr(tr, 'eta', 0))}</code>"
+          f" · ⏱ <code>{human_time(getattr(tr, 'elapsed', 0))}</code>")
+    return d.build()
 
 
 def render_encode(st, name: str, height: int, preset: str, codec: str, *,
-                  target_label: str = "", extra_info: str = "") -> str:
+                  target_label: str = "", extra_info: str = "", meta_line: str = "") -> str:
     """Live single-runner encode card."""
     pct = getattr(st, "percent", 0.0) or 0.0
     t_lbl = (target_label or (f"{height}p" if height else "Original")).replace(" (Original)", "")
     d = Doc()
     d.head("🎬", "ENCODE", t_lbl)
-    d.quote([f"📄 <code>{esc(clip(name, 40))}</code>",
-             f"⚙️ <code>{esc(_cfg_line(preset, codec, extra_info))}</code>"])
-    d.mono([gauge(pct, 14)])
-    d.add(f"🎞 <code>{human_time(getattr(st, 'out_time', 0))}</code> / <code>{human_time(getattr(st, 'duration', 0))}</code>")
-    d.add(f"🚀 <code>{speed_txt(getattr(st, 'speed', 0))}</code> · <code>{int(getattr(st, 'fps', 0) or 0)} fps</code>")
-    d.add(f"⏳ <code>{human_time(getattr(st, 'eta', 0))}</code> · ⏱ <code>{human_time(getattr(st, 'elapsed', 0))}</code>")
+    d.quote([f"📄 <code>{esc(clip(name, 40))}</code>"]
+            + _cfg_lines(preset, codec, extra_info, meta=meta_line))
+    d.add(meter_line(pct, 10))
+    d.add(f"🎞 <code>{human_time(getattr(st, 'out_time', 0))}</code>"
+          f" / <code>{human_time(getattr(st, 'duration', 0))}</code>")
+    d.add(f"🚀 <code>{speed_txt(getattr(st, 'speed', 0))}</code>"
+          f" · <code>{int(getattr(st, 'fps', 0) or 0)} fps</code>")
+    d.add(f"⏳ <code>{human_time(getattr(st, 'eta', 0))}</code>"
+          f" · ⏱ <code>{human_time(getattr(st, 'elapsed', 0))}</code>")
     size = f"📦 <code>{human_size(getattr(st, 'out_size', 0))}</code>"
     est = getattr(st, "est_final_size", 0) or 0
     if est:
@@ -499,7 +630,7 @@ _PART_STATE_ROWS = {
 
 
 def _part_cell(p, compact: bool = False) -> str:
-    """ASCII-only cell for the <pre> worker board (never wider than 13 chars)."""
+    """ASCII-only cell for the <pre> worker board (never wider than 14 chars)."""
     try:
         num = f"{(int(getattr(p, 'idx', 0)) + 1) % 100:02d}"
     except (TypeError, ValueError):
@@ -521,25 +652,54 @@ def _part_cell(p, compact: bool = False) -> str:
     return f"{num} [░░░░░░░░] {word:>10s}"
 
 
+def _part_cell_mini(p) -> str:
+    """Exact 7-char ASCII cell for the 3-column board (>20 workers)."""
+    try:
+        num = f"{(int(getattr(p, 'idx', 0)) + 1) % 100:02d}"
+    except (TypeError, ValueError):
+        num = "??"
+    status = str(getattr(p, "status", "") or "")
+    if status == "running":
+        try:
+            pct_v = max(0, min(100, int(round(float(getattr(p, "pct", 0) or 0)))))
+        except (TypeError, ValueError):
+            pct_v = 0
+        return f"{num} {pct_v:3d}%"
+    mini = {"ready": "DONE", "uploading": "save", "remote_done": "pull",
+            "downloading": "load", "waiting": "wait", "held": "held",
+            "failed": "rtry"}
+    word = mini.get(status, status[:4] or "?")
+    return f"{num} {word:>4}"
+
+
 def _worker_board(parts: Sequence) -> List[str]:
-    """1-column for ≤10 workers, 2-column for 11…50 (both ≤29 cells wide)."""
+    """
+    Adaptive ASCII board (no emoji — they would break <pre> alignment):
+      ≤10  → 1 column, full detail      (24 cells)
+      ≤20  → 2 columns, pct + speed     (31 cells)
+      >20  → 3 columns, mini cells      (26 cells)
+    """
     parts = list(parts or [])
     if not parts:
         return ["no parts yet"]
     if len(parts) <= 10:
         return [_part_cell(p) for p in parts]
-    cells = [_part_cell(p, compact=True) for p in parts]
+    if len(parts) <= 20:
+        cells_ = [_part_cell(p, compact=True) for p in parts]
+        rows = []
+        for i in range(0, len(cells_), 2):
+            rows.append(f"{cells_[i]} │ {cells_[i + 1]}" if i + 1 < len(cells_) else cells_[i])
+        return rows
+    cells_ = [_part_cell_mini(p) for p in parts]
     rows = []
-    for i in range(0, len(cells), 2):
-        if i + 1 < len(cells):
-            rows.append(f"{cells[i]} │ {cells[i + 1]}")
-        else:
-            rows.append(cells[i])
+    for i in range(0, len(cells_), 3):
+        chunk = cells_[i:i + 3]
+        rows.append(" │ ".join(chunk))
     return rows
 
 
 def render_dist(st, name: str, height: int, preset: str, codec: str, *,
-                target_label: str = "", extra_info: str = "") -> str:
+                target_label: str = "", extra_info: str = "", meta_line: str = "") -> str:
     """Live distributed (GitHub Actions) encode card + worker board."""
     t_lbl = (target_label or (f"{height}p" if height else "Original")).replace(" (Original)", "")
     try:
@@ -547,55 +707,64 @@ def render_dist(st, name: str, height: int, preset: str, codec: str, *,
     except (TypeError, ValueError):
         n_workers = 0
     d = Doc()
-    d.head("🌐", "DIST ENCODE", t_lbl)
-    d.quote([f"📄 <code>{esc(clip(name, 40))}</code>",
-             f"⚙️ <code>{esc(_cfg_line(preset, codec, extra_info, n_workers))}</code>"])
-    phase = str(getattr(st, "phase", "") or "")
+    d.head("🌐", "DIST ENCODE", t_lbl or "GitHub Actions")
+    d.quote([f"📄 <code>{esc(clip(name, 40))}</code>"]
+            + _cfg_lines(preset, codec, extra_info, workers=n_workers, meta=meta_line))
 
+    phase = str(getattr(st, "phase", "") or "")
     parts = list(getattr(st, "parts", []) or [])
+
     if phase == "split":
-        d.mono([gauge(0, 14)])
-        d.add("✂️ Keyframes අනුව video එක කොටස් වලට කඩනවා…")
+        d.add(f"{YELLOW} <b>Splitting</b> · keyframes අනුව කොටස් කඩනවා…")
         d.add(f"🧩 parts <b>{len(parts)}</b> · 👷 workers <b>{n_workers}</b>")
         return d.build()
 
     if phase == "upload":
-        d.mono([gauge(0, 14)])
-        d.add(f"☁️ කොටස් <b>{len(parts)}</b> Release එකට upload කරනවා…")
+        d.add(f"{BLUE} <b>Uploading parts</b> · Release එකට යවනවා…")
+        d.add(f"🧩 parts <b>{len(parts)}</b> · 👷 workers <b>{n_workers}</b>")
         return d.build()
 
     if phase == "merge":
-        d.mono([gauge(getattr(st, "merge_pct", 0), 14)])
         step = str(getattr(st, "merge_step", "") or "")
+        d.add(f"{ORANGE} <b>Merging</b> · " + ("🔊 audio track සකසනවා" if step == "audio"
+                                              else "🔗 parts concat වෙනවා"))
         if step == "audio":
-            d.add(f"🔊 Audio track සකසනවා… <code>{human_time(getattr(st, 'merge_elapsed', 0))}</code>")
+            d.add(f"⏱ <code>{human_time(getattr(st, 'merge_elapsed', 0))}</code>")
             return d.build()
-        d.add(f"🎞 <code>{human_time(getattr(st, 'merge_out', 0))}</code> / <code>{human_time(getattr(st, 'duration', 0))}</code>")
-        d.add(f"🚀 <code>{speed_txt(getattr(st, 'merge_speed', 0))}</code> · 📦 <code>{human_size(getattr(st, 'merge_size', 0))}</code>")
+        d.add(meter_line(getattr(st, "merge_pct", 0), 10))
+        d.add(f"🎞 <code>{human_time(getattr(st, 'merge_out', 0))}</code>"
+              f" / <code>{human_time(getattr(st, 'duration', 0))}</code>")
+        d.add(f"🚀 <code>{speed_txt(getattr(st, 'merge_speed', 0))}</code>"
+              f" · 📦 <code>{human_size(getattr(st, 'merge_size', 0))}</code>")
         m_left = 0.0
         if getattr(st, "merge_speed", 0) and getattr(st, "duration", 0):
             m_left = max(0.0, st.duration - (getattr(st, "merge_out", 0) or 0)) / st.merge_speed
-        d.add(f"⏳ <code>{human_time(m_left)}</code> · ⏱ <code>{human_time(getattr(st, 'merge_elapsed', 0))}</code>")
-        d.add(f"🔗 parts <b>{len(parts)}</b> merge වෙනවා…")
+        d.add(f"⏳ <code>{human_time(m_left)}</code>"
+              f" · ⏱ <code>{human_time(getattr(st, 'merge_elapsed', 0))}</code>")
         return d.build()
 
-    n_done = sum(1 for p in parts if getattr(p, "ready", False))
-    n_run = sum(1 for p in parts if getattr(p, "status", "") == "running" and not getattr(p, "ready", False))
+    def_ok = lambda p: bool(getattr(p, "ready", False)) or str(getattr(p, "status", "")) == "ready"
+    n_done = sum(1 for p in parts if def_ok(p))
+    n_run = sum(1 for p in parts if getattr(p, "status", "") == "running" and not def_ok(p))
     n_cloud = sum(1 for p in parts if getattr(p, "status", "") in ("downloading", "uploading", "remote_done")
-                  and not getattr(p, "ready", False))
-    n_wait = max(0, len(parts) - n_done - n_run - n_cloud)
+                  and not def_ok(p))
+    n_fail = sum(1 for p in parts if getattr(p, "status", "") == "failed" and not def_ok(p))
+    n_wait = max(0, len(parts) - n_done - n_run - n_cloud - n_fail)
 
-    d.mono([gauge(getattr(st, "percent", 0), 14)])
-    d.add(f"🎞 <code>{human_time(getattr(st, 'out_time', 0))}</code> / <code>{human_time(getattr(st, 'duration', 0))}</code>")
-    d.add(f"🚀 <code>{speed_txt(getattr(st, 'speed', 0))}</code> · <code>{int(getattr(st, 'fps', 0) or 0)} fps</code>")
-    d.add(f"⏳ <code>{human_time(getattr(st, 'eta', 0))}</code> · ⏱ <code>{human_time(getattr(st, 'elapsed', 0))}</code>")
+    d.add(meter_line(getattr(st, "percent", 0), 10))
+    d.add(f"🎞 <code>{human_time(getattr(st, 'out_time', 0))}</code>"
+          f" / <code>{human_time(getattr(st, 'duration', 0))}</code>")
+    d.add(f"🚀 <code>{speed_txt(getattr(st, 'speed', 0))}</code>"
+          f" · <code>{int(getattr(st, 'fps', 0) or 0)} fps</code>")
+    d.add(f"⏳ <code>{human_time(getattr(st, 'eta', 0))}</code>"
+          f" · ⏱ <code>{human_time(getattr(st, 'elapsed', 0))}</code>")
     size = f"📦 <code>{human_size(getattr(st, 'out_size', 0))}</code>"
     est = getattr(st, "est_final_size", 0) or 0
     if est:
         size += f" / ≈<code>{human_size(est)}</code>"
     d.add(size)
-    bits = [f"✅<b>{n_done}/{len(parts)}</b>"]
-    for icon, n in (("▶️", n_run), ("☁️", n_cloud), ("⏳", n_wait)):
+    bits = [f"✅<b>{n_done}</b>/{len(parts)}"]
+    for icon, n in ((f"{BLUE}", n_run), ("☁️", n_cloud), (f"{YELLOW}", n_wait), (f"{RED}", n_fail)):
         if n:
             bits.append(f"{icon}{n}")
     d.add("👷 " + " · ".join(bits))
@@ -617,10 +786,10 @@ def home_card(*, name: str = "VIDEO ENCODER", subtitle: str = "premium HTML UI",
         for label, desc in modes:
             d.add(f"• {label} — {desc}")
     if commands:
-        d.sec("⌨️", "Commands")
+        d.sec("", "Commands", accent=YELLOW)
         d.quote([f"{cmd} — {desc}" for cmd, desc in commands], expandable=len(commands) > 4)
     if tip:
-        d.sec("💡", "Tip")
+        d.sec("", "Tip", accent=GREEN)
         d.add(note(tip))
     return d.build(tail=footer or None)
 
@@ -650,13 +819,13 @@ def health_card(*, relay_on: bool, relay_summary: str, relay_rows: Sequence[str]
     if helper_summary:
         top.append(helper_summary)
     d.quote(top)
-    d.sec("👤", "Userbot lanes")
+    d.sec("", "Userbot lanes", accent=BLUE)
     d.extend(list(relay_rows) or [note("userbots configure කරලා නෑ")])
     if helper_rows:
-        d.sec("🤝", "Helper accounts")
+        d.sec("", "Helper accounts", accent=PURPLE)
         d.quote(list(helper_rows), expandable=len(helper_rows) > 4)
     if extra:
-        d.sec("🌐", "Runner pool")
+        d.sec("", "Runner pool", accent=ORANGE)
         d.extend(extra)
     return d.build(tail=footer or None)
 
@@ -665,16 +834,15 @@ def queued_card(*, index: int, total: int, name: str, badge: str,
                 ahead: Sequence[Tuple[int, str, str]] = ()) -> str:
     """Queue position card with a mini pipeline of the jobs ahead."""
     d = Doc()
-    d.head("⏳", "QUEUED", f"#{index}/{total}")
+    d.head("🟨", "QUEUED", f"#{index}/{total}")
     d.quote([f"🎬 <code>{esc(clip(name, 40))}</code>",
-             f"🎯 <b>{esc(badge)}</b>"])
+             f"{badge_icon(badge)} <b>{esc(badge)}</b>"])
     if ahead:
-        rows = [f"<b>{i:02d}</b> · <code>{esc(clip(n, 30))}</code>\n"
-                f"      🎯 {esc(clip(b, 20))}" for i, n, b in ahead[:3]]
-        d.sec("⏫", "ඉස්සරහ", f"{len(ahead)} jobs")
+        rows = [f"{num_badge(i)} <code>{esc(clip(n, 28))}</code>\n"
+                f"      {badge_icon(b)} {esc(clip(b, 20))}" for i, n, b in ahead[:3]]
+        d.sec("", "ඉස්සරහ", f"{len(ahead)} jobs", accent=ORANGE)
         d.quote(rows)
     d.add("⚡ Jobs ඉවර වුණාම auto start වෙයි")
-    d.sec("💡", "Tip")
     d.add(note("❌ Cancel එකෙන් job එක queue එකෙන් අයින් කරන්න."))
     return d.build()
 
@@ -686,27 +854,30 @@ def queue_card(*, running: Optional[dict] = None,
     d.head("📋", "QUEUE", f"{total}/{cap}" if cap else f"{total}")
     if not running and not items:
         d.quote(["📭 Queue එක හිස්", "Video එකක් එවන්න — වහාම queue වෙයි."])
-        d.sec("💡", "Tip")
+        d.add(f"{GREEN} <b>Idle</b> · workers free — video එකක් එවන්න")
         d.add(note("/settings වලින් mode, preset, workers තෝරන්න."))
         return d.build()
     if running:
-        d.quote(["▶️ <b>Running</b>",
-                 f"🎬 <code>{esc(clip(running.get('name'), 40))}</code>",
-                 f"🎯 <b>{esc(running.get('badge') or '—')}</b>"
+        badge = running.get("badge") or "—"
+        d.sec("", "Running", accent=GREEN)
+        d.quote([f"🎬 <code>{esc(clip(running.get('name'), 40))}</code>",
+                 f"{badge_icon(badge)} <b>{esc(badge)}</b>"
                  + (f" · <code>{esc(running.get('pct'))}</code>" if running.get("pct") else "")])
     if items:
         rows = []
         for i, it in enumerate(items, 1):
-            rows.append(f"<b>{i:02d}</b> · <code>{esc(clip(it.get('name'), 34))}</code>\n"
-                        f"      🎯 <b>{esc(it.get('badge') or '—')}</b>")
-        d.sec("⏳", "Waiting", f"{len(items)}")
+            badge = it.get("badge") or "—"
+            rows.append(f"{num_badge(i)} <code>{esc(clip(it.get('name'), 32))}</code>\n"
+                        f"      {badge_icon(badge)} <b>{esc(badge)}</b>")
+        d.sec("", "Waiting", f"{len(items)}", accent=YELLOW)
         d.quote(rows, expandable=len(rows) > 3)
     return d.build(tail=note("Queue එකේ job එකක් ඉවත් කරන්න: /clear"))
 
 
-def workflow_account(*, label: str, repo: str, rows: Sequence[str]) -> List[str]:
-    """Blocks for one GitHub account inside /workflow."""
-    blocks = [section("", label, repo)]
+def workflow_account(*, label: str, repo: str, rows: Sequence[str],
+                     accent: str = "") -> List[str]:
+    """Blocks for one GitHub account inside /workflow (coloured accent per account)."""
+    blocks = [section("", label, repo, accent=accent)]
     blocks.extend(rows)
     return blocks
 
@@ -717,7 +888,7 @@ def endwork_progress(*, round_no: int, total: int, counts: Sequence[Tuple[str, i
     rows = [f"{label} · <b>{n}</b> run" for label, n in counts if n]
     if rows:
         d.quote(rows)
-    d.mono([gauge((round_no / max(total, 1)) * 100, 14, "sent")])
+    d.add(meter_line((round_no / max(total, 1)) * 100, 10, "<i>sent</i>"))
     return d.build(tail=note("Workers kill වෙනකන් තත්පර කීපයක් ඉන්න…"))
 
 
@@ -735,9 +906,10 @@ def endwork_result(*, accounts: Sequence[dict], left_total: int, rounds: int,
                  f"🔪 killed <b>{killed}</b> · 🔁 requests <b>{rounds}</b>"])
     for a in accounts:
         left = int(a.get("left") or 0)
-        d.sec("", str(a.get("label") or "account"), str(a.get("repo") or ""))
+        d.sec("", str(a.get("label") or "account"), str(a.get("repo") or ""),
+              accent=(RED if left else GREEN))
         d.add(f"🔪 killed <b>{int(a.get('killed') or 0)}</b> · "
-              + ("⚠️ තව <b>%d</b> ඉතුරුයි" % left if left else "✅ clean"))
+              + ("⚠️ තව <b>%d</b> ඉතුරුයි" % left if left else f"{GREEN} clean"))
     if busy:
         d.add(note("Distributed job එක worker pool නැවැත්තුව නිසා fallback නොවී stop වෙයි."))
     if left_total:
@@ -764,7 +936,7 @@ def event_card(*, icon: str, title_text: str, lines: Sequence[str] = (),
     if lines:
         d.quote(list(lines))
     if gauge_pct is not None:
-        d.mono([gauge(gauge_pct, 14)])
+        d.add(meter_line(gauge_pct, 10))
     if hint:
         d.add(note(hint))
     return d.build()
@@ -789,7 +961,9 @@ def done_card(*, name: str, before: str, after: str, saved_pct: Optional[float],
     d.head("✅", "JOB COMPLETE", "uploaded")
     delta = ""
     if saved_pct is not None:
-        delta = f" · <b>{'−' if saved_pct >= 0 else '+'}{abs(saved_pct):.0f}%</b>"
+        good = saved_pct >= 0
+        delta = (f" · {GREEN if good else RED} <b>{'−' if good else '+'}"
+                 f"{abs(saved_pct):.0f}%</b>")
     d.quote([f"🎬 <code>{esc(clip(name, 42))}</code>",
              f"📦 <code>{esc(before)}</code> → <code>{esc(after)}</code>{delta}"])
     if stats:
@@ -836,6 +1010,10 @@ __all__ = [
     # helpers
     "esc", "clip", "text_len", "human_size", "human_size_short", "human_speed",
     "human_time", "human_age", "speed_txt", "bar", "pct_txt", "gauge",
+    # colour palette + coloured meters
+    "BLUE", "PURPLE", "GREEN", "YELLOW", "ORANGE", "RED", "WHITE", "BLACK",
+    "meter", "meter_color", "meter_line", "cells", "pack_parts", "num_badge",
+    "badge_icon", "status_dot",
     # primitives
     "sanitize", "truncate_html", "to_plain", "title", "section", "kv", "bullet", "rule",
     "quote", "mono", "chips", "onoff", "status_dot", "note", "Doc",
