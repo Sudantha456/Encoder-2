@@ -18,6 +18,7 @@ import logging
 import os
 import random
 import re
+import subprocess
 import threading
 import time
 from typing import Any, Callable, Deque, Dict, List, Optional
@@ -174,7 +175,48 @@ class FastUploader:
     async def cleanup(self, upload_id: str):
         self._cancel_flags.pop(upload_id, None)
 
-    async def get_video_info(self, filepath: str) -> Dict:
+    async def get_video_info(self, filepath: str, hint: Optional[Dict] = None) -> Dict:
+        """Probe output dimensions for the Telegram video attributes.
+
+        ffprobe is not part of every static ffmpeg download, so fall back to
+        `ffmpeg -i` output; without correct width/height Telegram sizes the
+        player box wrongly (`hint` carries the bot's own known dimensions).
+        """
+        info = await self._probe(filepath)
+        video_stream = next(
+            (s for s in info.get("streams", []) if s.get("codec_type") == "video"), None
+        )
+        if not video_stream:
+            try:
+                video_stream = await asyncio.to_thread(_probe_with_ffmpeg, filepath)
+            except Exception as e:
+                logger.warning(f"ffmpeg fallback probe failed: {e!r}")
+                video_stream = None
+        try:
+            duration = float(info.get("format", {}).get("duration", 0))
+        except (TypeError, ValueError):
+            duration = 0.0
+        width = int(video_stream.get("width", 0)) if video_stream else 0
+        height = int(video_stream.get("height", 0)) if video_stream else 0
+        # Anamorphic video (SAR != 1:1) must be reported at display size,
+        # otherwise Telegram draws the player in the wrong aspect box.
+        sar = (video_stream or {}).get("sample_aspect_ratio") or "1:1"
+        try:
+            num, den = (int(x) for x in str(sar).split(":"))
+            if num and den and num != den:
+                width = int(round(width * num / den))
+        except (ValueError, TypeError):
+            pass
+        hint = hint or {}
+        if not width or not height:
+            width, height = int(hint.get("width") or 0), int(hint.get("height") or 0)
+        if not duration:
+            duration = float(hint.get("duration") or 0)
+        if not width or not height:
+            logger.warning(f"video dimensions unknown for {filepath} — Telegram metadata may be wrong")
+        return {"duration": int(duration), "width": width, "height": height}
+
+    async def _probe(self, filepath: str) -> Dict:
         cmd = [
             "ffprobe", "-v", "quiet", "-print_format", "json",
             "-show_format", "-show_streams", filepath,
@@ -186,31 +228,18 @@ class FastUploader:
                 stderr=asyncio.subprocess.PIPE,
                 env=ffmpeg_env(),
             )
+        except FileNotFoundError:
+            return {}
+        try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20.0)
-            info = json.loads(stdout.decode("utf-8", errors="replace"))
-            video_stream = next(
-                (s for s in info.get("streams", []) if s.get("codec_type") == "video"), None
-            )
-            duration = float(info.get("format", {}).get("duration", 0))
-            width = int(video_stream.get("width", 0)) if video_stream else 0
-            height = int(video_stream.get("height", 0)) if video_stream else 0
-            # Anamorphic video (SAR != 1:1) must be reported at display size,
-            # otherwise Telegram draws the player in the wrong aspect box.
-            sar = (video_stream or {}).get("sample_aspect_ratio") or "1:1"
-            try:
-                num, den = (int(x) for x in str(sar).split(":"))
-                if num and den and num != den:
-                    width = int(round(width * num / den))
-            except ValueError:
-                pass
-            return {
-                "duration": int(duration),
-                "width": width,
-                "height": height,
-            }
-        except Exception as e:
-            logger.warning(f"ffprobe failed: {e}")
-            return {"duration": 0, "width": 0, "height": 0}
+        except Exception:
+            with contextlib.suppress(Exception):
+                proc.kill()
+            return {}
+        try:
+            return json.loads(stdout.decode("utf-8", errors="replace") or "{}")
+        except ValueError:
+            return {}
 
     async def generate_thumbnail(self, filepath: str) -> Optional[str]:
         thumb_path = filepath + "_thumb.jpg"
@@ -582,6 +611,7 @@ class FastUploader:
         use_main: bool = True,
         caption: str = "",
         workers_per_conn: Optional[int] = None,
+        video_hint: Optional[Dict] = None,
     ):
         self._cancel_flags[upload_id] = False
         if not os.path.exists(filepath):
@@ -602,7 +632,7 @@ class FastUploader:
         if is_video:
             # Probe metadata & extract thumbnail in parallel!
             video_info, thumb_path = await asyncio.gather(
-                self.get_video_info(filepath),
+                self.get_video_info(filepath, hint=video_hint),
                 self.generate_thumbnail(filepath),
             )
 
@@ -777,3 +807,25 @@ async def close_upload_engine():
     if pool is not None:
         pool.shutdown(wait=False)
     _uploader = None
+
+
+def _probe_with_ffmpeg(path: str) -> Dict:
+    """Minimal video-stream probe using `ffmpeg -i` (no ffprobe on the host)."""
+    r = subprocess.run([ "ffmpeg", "-hide_banner", "-i", path],
+                       capture_output=True, text=True, errors="replace", env=ffmpeg_env())
+    for line in r.stderr.splitlines():
+        line = line.strip()
+        if not (line.startswith("Stream #") and "Video:" in line):
+            continue
+        codec = re.search(r"Video: (\w+)", line)
+        dims = re.findall(r"(\d{2,5})x(\d{2,5})", line)
+        if not codec or not dims:
+            continue
+        w, h = dims[-1]
+        stream = {"codec_type": "video", "codec_name": codec.group(1),
+                  "width": int(w), "height": int(h)}
+        sar = re.search(r"SAR (\d+:\d+)", line)
+        if sar:
+            stream["sample_aspect_ratio"] = sar.group(1)
+        return stream
+    return {}

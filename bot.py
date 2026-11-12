@@ -44,7 +44,7 @@ from userbots import Relay
 from media import (VideoMeta, telegram_meta, probe_remote, ffprobe, apply_probe,
                    offered_targets, estimate_size, estimate_compress_size,
                    render_preview, render_compress_preview, res_label,
-                   short_side, guard_kbps, compress_guard_kbps)
+                   short_side, guard_kbps, compress_guard_kbps, target_dims)
 from settings_store import SettingsStore
 from transcoder import EncState, build_x265_extra, resolve_x265_pix_fmt, transcode
 import dist
@@ -1258,8 +1258,23 @@ async def run_job(job: Job, height: int):
             out_info = await ffprobe(str(dst))
         except Exception:
             out_info = {}
-        if not any(s.get("codec_type") == "video" for s in out_info.get("streams", [])):
+        out_v = next((s for s in out_info.get("streams", []) if s.get("codec_type") == "video"), None)
+        if not out_v:
             raise RuntimeError("Encoded output එකේ valid video stream එකක් නෑ.")
+        # Telegram sizes the player box from these values, so send the real
+        # output geometry (display pixels, SAR applied) instead of guessing.
+        # The expected size is computed first and used as a fallback; without
+        # it Telegram receives 0x0 and draws a wrongly shaped player.
+        exp_w, exp_h = target_dims(meta, enc_opts["target"] if enc_opts["scale"] else 0)
+        out_w = int(out_v.get("width") or 0) or exp_w
+        out_h = int(out_v.get("height") or 0) or exp_h
+        try:
+            sar_n, sar_d = (int(x) for x in str(out_v.get("sample_aspect_ratio") or "1:1").split(":"))
+            if sar_n and sar_d and sar_n != sar_d:
+                out_w = int(round(out_w * sar_n / sar_d))
+        except ValueError:
+            pass
+        video_hint = {"width": out_w, "height": out_h, "duration": meta.duration}
         with contextlib.suppress(OSError):
             os.remove(src)
 
@@ -1298,7 +1313,8 @@ async def run_job(job: Job, height: int):
         sent = None
         if use_relay:
             try:
-                ub, ch_msg = await relay.upload(ul, str(dst), job.id, ul_cb)       # userbot → channel
+                ub, ch_msg = await relay.upload(ul, str(dst), job.id, ul_cb,
+                                                video_hint=video_hint)           # userbot → channel
                 ch_out[0], ch_out[1] = ch_msg, ub
                 stats["ul_via"] = ub.name
                 stats["ul_avg"], stats["ul_time"] = tr2.avg_speed, tr2.elapsed
@@ -1315,7 +1331,8 @@ async def run_job(job: Job, height: int):
                 tr2 = SpeedTracker(total=out_size)
                 sent = None
         if sent is None:
-            sent = await ul.upload_file(client, job.chat_id, str(dst), job.id, ul_cb)
+            sent = await ul.upload_file(client, job.chat_id, str(dst), job.id, ul_cb,
+                                        video_hint=video_hint)
             stats["ul_avg"], stats["ul_time"] = tr2.avg_speed, tr2.elapsed
             with contextlib.suppress(Exception):
                 await client.edit_message(sent, caption)

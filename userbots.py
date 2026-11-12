@@ -461,7 +461,7 @@ class Relay:
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
 
-    async def upload(self, up, path: str, job_id: str, progress_cb):
+    async def upload(self, up, path: str, job_id: str, progress_cb, video_hint=None):
         """(userbot, channel message). Flood වුණොත් ඊළඟ userbot එකෙන්."""
         last: Optional[BaseException] = None
         cands = self._order()
@@ -472,7 +472,8 @@ class Relay:
                 logger.info(f"📤 relay upload via {ub.name}")
                 msg = await up.upload_file(ub.client, ub.entity, path, job_id, progress_cb,
                                            connections=config.UB_UL_CONNECTIONS,
-                                           max_flood_wait=config.UB_MAX_FLOOD_WAIT, use_main=False)
+                                           max_flood_wait=config.UB_MAX_FLOOD_WAIT, use_main=False,
+                                           video_hint=video_hint)
                 return ub, msg
             except LongFloodWait as e:
                 ub.flood(e.seconds)
