@@ -1172,7 +1172,6 @@ class DistRun:
                 "report_url": report_url, "report_token": report_tok,
                 "durations": [p.duration for p in s.parts], "fps": meta.fps,
                 "target": o["target"], "scale": o["scale"], "portrait": o["portrait"],
-                "size": list(o.get("size") or []),
                 "preset": o["preset"], "codec": o["codec"], "crf": o["crf"],
                 "maxrate": o["maxrate_kbps"], "interval": PROGRESS_UPDATE_INTERVAL,
                 "pix_fmt": o.get("pix_fmt", "yuv420p"),

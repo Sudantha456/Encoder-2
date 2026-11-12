@@ -134,7 +134,6 @@ def build_cmd(
     target=0,
     scale=False,
     portrait=False,
-    size=None,
     preset="ultrafast",
     codec="libx264",
     crf=23,
@@ -147,19 +146,10 @@ def build_cmd(
 ):
     """audio_mode: aac | copy | none     container: mp4 | mkv
 
-    size=(w, h) pins the output frame exactly. Distributed parts each start a
-    fresh encoder, so any part whose aspect ratio differs from the main feature
-    would otherwise get a different width; concatenating such parts makes the
-    player change frame size mid-video. A pinned frame keeps every part equal.
     """
     req_pix = (pix_fmt or "yuv420p").strip()
     vf = []
-    if size and size[0] >= 2 and size[1] >= 2:
-        vf.append(f"scale={int(size[0])}:{int(size[1])}:force_original_aspect_ratio=decrease:"
-                  "force_divisible_by=2:flags=lanczos")
-        vf.append(f"pad={int(size[0])}:{int(size[1])}:(ow-iw)/2:(oh-ih)/2")
-        vf.append("setsar=1")
-    elif scale and target:
+    if scale and target:
         # Scale the *displayed* geometry: anamorphic input is stretched to
         # square pixels first, then resized, so the result has exactly the
         # source's aspect ratio (1920x1080 -> 854x480 would otherwise keep
