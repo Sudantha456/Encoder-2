@@ -103,6 +103,8 @@ async def reply_card(event, text: str, buttons=None):
     """Reply with an HTML widget; degrade to plain text if entities are rejected."""
     try:
         return await event.reply(text, buttons=buttons)
+    except FloodWaitError:
+        raise                                   # no duplicate send while rate-limited
     except Exception as e:
         logger.warning(f"widget reply failed ({e!r}) → plain fallback")
         return await event.reply(to_plain(text), buttons=buttons, parse_mode=None)
@@ -112,8 +114,8 @@ async def edit_card(msg, text: str, buttons=None):
     """Edit a widget message; never raise on parse/entity problems."""
     try:
         await msg.edit(text, buttons=buttons)
-    except MessageNotModifiedError:
-        pass
+    except (MessageNotModifiedError, FloodWaitError):
+        pass                                    # nothing to do / back off quietly
     except Exception as e:
         logger.warning(f"widget edit failed ({e!r}) → plain fallback")
         with contextlib.suppress(Exception):
