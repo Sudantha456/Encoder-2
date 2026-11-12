@@ -15,7 +15,7 @@
     "mode": "res",
     "preset": "veryfast",
     "qres": "ask",
-    "workers": 35
+    "workers": 45
   },
   "5190918746": {
     "c_aq": true,
