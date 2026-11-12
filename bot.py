@@ -1139,6 +1139,7 @@ async def run_job(job: Job, height: int):
                 target=0,
                 scale=False,
                 portrait=meta.height > meta.width,
+                anamorphic=abs((meta.sar or 1.0) - 1.0) > 0.01,
                 preset=preset,
                 codec="libx265",
                 crf=crf_val,
@@ -1162,6 +1163,7 @@ async def run_job(job: Job, height: int):
                 target=height,
                 scale=short_side(meta) > height,
                 portrait=meta.height > meta.width,
+                anamorphic=abs((meta.sar or 1.0) - 1.0) > 0.01,
                 preset=preset,
                 codec=codec,
                 crf=crf_val,
@@ -1240,6 +1242,7 @@ async def run_job(job: Job, height: int):
                 await transcode(
                     str(src), str(dst), st, job,
                     target=enc_opts["target"], scale=enc_opts["scale"], portrait=enc_opts["portrait"],
+                    anamorphic=enc_opts["anamorphic"],
                     preset=preset, codec=codec, crf=crf_val, abitrate=ab,
                     maxrate_kbps=enc_opts["maxrate_kbps"], audio_mode=enc_opts["audio_mode"],
                     pix_fmt=enc_opts["pix_fmt"], x265_extra=enc_opts["x265_extra"],

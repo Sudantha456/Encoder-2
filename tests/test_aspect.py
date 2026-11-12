@@ -40,7 +40,7 @@ class AspectTests(unittest.TestCase):
                "-vf", "setsar=16/15", "-c:v", "libx264", "-pix_fmt", "yuv420p", src)
             out = work / "out.mp4"
             cmd = build_cmd(str(src), str(out), target=480, scale=True, portrait=False,
-                            preset="ultrafast", codec="libx265", crf=24)
+                            anamorphic=True, preset="ultrafast", codec="libx265", crf=24)
             subprocess.run(cmd[:1] + cmd[1:-1] + [str(out)], check=True, capture_output=True)
             sar, dar, w, h = sar_of(out)
             self.assertEqual(sar, "1:1")

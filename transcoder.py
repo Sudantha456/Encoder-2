@@ -134,6 +134,7 @@ def build_cmd(
     target=0,
     scale=False,
     portrait=False,
+    anamorphic=False,
     preset="ultrafast",
     codec="libx264",
     crf=23,
@@ -150,13 +151,15 @@ def build_cmd(
     req_pix = (pix_fmt or "yuv420p").strip()
     vf = []
     if scale and target:
-        # Scale the *displayed* geometry: anamorphic input is stretched to
-        # square pixels first, then resized, so the result has exactly the
-        # source's aspect ratio (1920x1080 -> 854x480 would otherwise keep
-        # SAR 1280:1281 and render slightly differently from the source).
-        vf.append("scale=trunc(iw*sar/2)*2:ih")
-        vf.append(f"scale={target}:-2:flags=lanczos,setsar=1" if portrait
-                  else f"scale=-2:{target}:flags=lanczos,setsar=1")
+        # setsar=1 keeps the display aspect exact: scaling 1920x1080 to 854x480
+        # would otherwise leave SAR 1280:1281, so players render a slightly
+        # different frame than the source. Only anamorphic input needs the
+        # extra stretch pass first; everything else scales in one step to keep
+        # encoding as fast as before.
+        if anamorphic:
+            vf.append("scale=trunc(iw*sar/2)*2:ih")
+        vf.append(f"scale={target}:-2,setsar=1" if portrait
+                  else f"scale=-2:{target},setsar=1")
     elif "444" not in req_pix:
         # Ensure even dimensions for 4:2:0 / 4:2:2 chroma subsampling without altering even resolutions
         vf.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
