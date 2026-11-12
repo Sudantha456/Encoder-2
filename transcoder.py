@@ -1,5 +1,6 @@
 """FFmpeg runner with live -progress parsing (stdlib-only — runs on main & GitHub workers)."""
 import asyncio
+import contextlib
 import logging
 import subprocess
 import time
@@ -181,6 +182,32 @@ def build_cmd(
         cmd += ["-movflags", "+faststart"]
     cmd += ["-progress", "pipe:1", "-nostats", dst]
     return cmd
+
+
+async def verify_output(path: str, job):
+    """Decode the entire output before upload; file size alone cannot prove integrity."""
+    if job.cancelled:
+        raise asyncio.CancelledError("cancelled")
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-hide_banner", "-v", "error", "-nostdin", "-xerror",
+        "-err_detect", "explode", "-i", path, "-map", "0:v:0", "-map", "0:a?",
+        "-f", "null", "-", stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    job.proc = proc
+    try:
+        _, err = await proc.communicate()
+    finally:
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            await proc.wait()
+        job.proc = None
+    if job.cancelled:
+        raise asyncio.CancelledError("cancelled")
+    if proc.returncode:
+        raise RuntimeError("Encoded video failed playback verification: " +
+                           err.decode(errors="replace")[-600:].strip())
 
 
 def _num(v, cast=float):

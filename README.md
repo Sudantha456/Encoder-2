@@ -45,5 +45,10 @@ Setup වැරදි නම් `ALLOWED_USERS` ට හේතුව සහිත
 ## ☁️ GitHub JSON Persistent Settings (`user_settings.json`)
 - `/settings` හි Resolution Mode සහ Size-Reduce Mode දෙකටම අදාළ සියලුම user selections `user_settings.json` ගොනුවේ වෙන වෙනම තැන්පත් වන අතර GitHub REST API හරහා repo එකේ `user_settings.json` වෙත ස්වයංක්‍රීයව sync වේ — bot එක restart වුණත් settings කිසිවක් reset නොවේ.
 
+## Playback reliability
+- Distributed workers encode parts independently, so each part can have different codec headers. Before MP4 assembly, parts are remuxed to MPEG-TS with their own in-band H.264/H.265 headers; distributed HEVC uses the `hev1` MP4 tag. This does not re-encode the video, but needs extra temporary disk space. Some players support `hvc1` but not `hev1`; try another player or single-runner encoding if needed.
+- Before upload, FFmpeg decodes the whole output (video and audio) and fails the job if it detects an error. This takes extra time and does not guarantee compatibility with every device or detect every possible problem after upload.
+- Playback also depends on the chosen HEVC pixel format and the device. For widest compatibility use H.264 or H.265 `yuv420p` (8-bit, 4:2:0).
+
 ## Workers
 `/settings → 👷 Workers`: 5, 10, 15, 20, 25, 30, 35, 40, 45, 50.

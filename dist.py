@@ -997,6 +997,8 @@ class DistRun:
         self._rlock = asyncio.Lock()
 
     async def _ff(self, *args, on_progress=None, track=True):
+        if self.job.cancelled:
+            raise asyncio.CancelledError()
         cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y"]
         if on_progress:
             cmd += ["-progress", "pipe:1", "-nostats"]
@@ -1487,8 +1489,23 @@ class DistRun:
         s.merge_step = "audio"                      # audio extract තාම ඉවර නැත්නම් මෙතන තමයි බලාගෙන ඉන්නේ
         audio = await audio_task if audio_task else None
         s.merge_step, s.merge_out, s.merge_size = "mux", 0.0, 0
+        # Each worker starts a new encoder with its own codec parameter sets.
+        # A straight MKV -> MP4 concat only keeps the first part's extradata;
+        # later parts can then freeze in players even though the file is complete.
+        # Remux each part to Annex B in MPEG-TS first, so its own headers are
+        # present in-band at the join. No video is re-encoded here.
+        segments = []
+        bsf = "hevc_mp4toannexb" if self.opts["codec"] == "libx265" else "h264_mp4toannexb"
+        for p in s.parts:
+            segment = self.work / f"merge_part_{p.idx}.ts"
+            await self._ff("-i", str(p.path), "-map", "0:v:0", "-c:v", "copy",
+                           "-bsf:v", bsf, "-f", "mpegts", str(segment))
+            segments.append(segment)
         lst = self.work / "concat.txt"
-        lst.write_text("".join(f"file '{Path(p.path).resolve()}'\n" for p in s.parts))
+        # concat demuxer uses single quotes and backslash escapes, not shell quoting.
+        def concat_path(path):
+            return str(path.resolve()).replace("'", "'\\''")
+        lst.write_text("".join(f"file '{concat_path(p)}'\n" for p in segments))
         args = ["-f", "concat", "-safe", "0", "-i", str(lst)]
         if audio:
             args += ["-i", audio]
@@ -1497,7 +1514,9 @@ class DistRun:
             args += ["-map", "1:a"]
         args += ["-c", "copy"]
         if self.opts["codec"] == "libx265":
-            args += ["-tag:v", "hvc1"]
+            # hev1 permits in-band VPS/SPS/PPS changes at part boundaries;
+            # hvc1 requires all parameter sets in the MP4 sample entry.
+            args += ["-tag:v", "hev1"]
         args += ["-movflags", "+faststart", self.dst]
 
         def cb(t, size, sp):
