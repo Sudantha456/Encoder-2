@@ -1173,6 +1173,15 @@ async def run_job(job: Job, height: int):
             )
             t_label = f"{height}p"
             extra_lbl = ""
+        # Every distributed part is encoded by its own ffmpeg process, so pin an
+        # exact output frame. A part whose aspect ratio differs (promo/letterbox
+        # sections) would otherwise produce a different width and the merged
+        # video would change frame size mid-playback.
+        if enc_opts["scale"] or enc_opts["target"]:
+            exp_w, exp_h = target_dims(meta, enc_opts["target"] if enc_opts["scale"] else 0)
+            enc_opts["size"] = (exp_w, exp_h) if exp_w >= 2 and exp_h >= 2 else None
+        else:
+            enc_opts["size"] = None
         encoded = False
 
         # 3a) Distributed (GitHub Actions workers) ─
@@ -1240,6 +1249,7 @@ async def run_job(job: Job, height: int):
                 await transcode(
                     str(src), str(dst), st, job,
                     target=enc_opts["target"], scale=enc_opts["scale"], portrait=enc_opts["portrait"],
+                    size=enc_opts.get("size"),
                     preset=preset, codec=codec, crf=crf_val, abitrate=ab,
                     maxrate_kbps=enc_opts["maxrate_kbps"], audio_mode=enc_opts["audio_mode"],
                     pix_fmt=enc_opts["pix_fmt"], x265_extra=enc_opts["x265_extra"],
@@ -1265,7 +1275,7 @@ async def run_job(job: Job, height: int):
         # output geometry (display pixels, SAR applied) instead of guessing.
         # The expected size is computed first and used as a fallback; without
         # it Telegram receives 0x0 and draws a wrongly shaped player.
-        exp_w, exp_h = target_dims(meta, enc_opts["target"] if enc_opts["scale"] else 0)
+        exp_w, exp_h = enc_opts.get("size") or target_dims(meta, 0)
         out_w = int(out_v.get("width") or 0) or exp_w
         out_h = int(out_v.get("height") or 0) or exp_h
         try:
