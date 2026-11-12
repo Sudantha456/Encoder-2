@@ -78,6 +78,26 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
                 if codec == "libx265":
                     self.assertIn(b"hev1", out.read_bytes())
 
+    async def test_many_distributed_parts(self):
+        import dist
+        with tempfile.TemporaryDirectory() as d:
+            work = Path(d)
+            part = work / "part.mkv"
+            ff("-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10:duration=0.5",
+               "-c:v", "libx265", "-preset", "ultrafast", "-x265-params",
+               "log-level=error:pools=1:frame-threads=1", part)
+            state = dist.DistState(20, 10, 40)
+            state.parts = [dist.Part(i, i * 0.5, 0.5, path=str(part)) for i in range(40)]
+            job = types.SimpleNamespace(proc=None, cancelled=False, id="test")
+            out = work / "many.mp4"
+            run = dist.DistRun(client=None, job=job, src="", dst=out, meta=None,
+                               state=state, opts={"codec": "libx265"}, workdir=work,
+                               pool=None, n_workers=40)
+            await run._merge(None)
+            await verify_output(str(out), job)
+            self.assertEqual(count_frames(out), 40 * count_frames(part))
+            self.assertEqual(list(work.glob("merge_part_*.ts")), [])
+
     async def test_validation_rejects_corruption_without_size_change(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "broken.mp4"

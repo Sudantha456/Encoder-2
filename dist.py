@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import time
 import types
 from dataclasses import dataclass, field
@@ -996,7 +997,7 @@ class DistRun:
         self.stats = {"workers": 0, "local_parts": 0, "reassigned_parts": 0}
         self._rlock = asyncio.Lock()
 
-    async def _ff(self, *args, on_progress=None, track=True):
+    async def _ff(self, *args, on_progress=None, track=True, stage="processing"):
         if self.job.cancelled:
             raise asyncio.CancelledError()
         cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y"]
@@ -1008,7 +1009,19 @@ class DistRun:
             stderr=asyncio.subprocess.PIPE)
         if track:                       # split/merge → Cancel button එකෙන් kill වෙන්න; audio (සමාන්තරව) වෙනම handle කරනවා
             self.job.proc = proc
-        err_task = asyncio.create_task(proc.stderr.read())
+        async def stderr_tail():
+            # Timestamp warnings can be numerous on long files. Keep a bounded
+            # diagnostic tail while continuously draining the pipe.
+            tail = bytearray()
+            while True:
+                chunk = await proc.stderr.read(8192)
+                if not chunk:
+                    return bytes(tail)
+                tail.extend(chunk)
+                if len(tail) > 16000:
+                    del tail[:-16000]
+
+        err_task = asyncio.create_task(stderr_tail())
 
         async def pump():
             t = size = sp = 0.0
@@ -1033,8 +1046,10 @@ class DistRun:
             err = await err_task
         except BaseException:
             if proc.returncode is None:
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(ProcessLookupError):
                     proc.kill()
+            await proc.wait()
+            await err_task
             raise
         finally:
             if track:
@@ -1042,7 +1057,23 @@ class DistRun:
         if self.job.cancelled:
             raise asyncio.CancelledError()
         if proc.returncode != 0:
-            raise DistError("ffmpeg failed: " + err.decode(errors="ignore")[-400:])
+            code = proc.returncode
+            status = f"exit code {code}"
+            if code < 0:
+                try:
+                    status += f" ({signal.Signals(-code).name})"
+                except ValueError:
+                    pass
+            detail = err.decode(errors="replace").strip()
+            try:
+                free = shutil.disk_usage(self.work).free
+                disk = f", free disk {free // (1024 * 1024)} MiB"
+            except OSError:
+                disk = ""
+            logger.error("FFmpeg %s failed (%s%s). stderr:\n%s",
+                         stage, status, disk, detail or "<empty>")
+            raise DistError(f"ffmpeg {stage} failed ({status}{disk}): " +
+                            (detail[-600:] if detail else "no stderr output"))
 
     async def run(self) -> dict:
         return await self._run()
@@ -1149,6 +1180,13 @@ class DistRun:
             for p in s.parts:
                 p.last_change = time.monotonic()
             await self._monitor()
+
+            # The original source is still available, and every encoded part
+            # is now local. Free the (often very large) split input files before
+            # creating temporary transport streams and the final MP4.
+            for f in files:
+                with contextlib.suppress(OSError):
+                    f.unlink()
 
             # 5) MERGE
             s.phase = "merge"
@@ -1496,34 +1534,40 @@ class DistRun:
         # present in-band at the join. No video is re-encoded here.
         segments = []
         bsf = "hevc_mp4toannexb" if self.opts["codec"] == "libx265" else "h264_mp4toannexb"
-        for p in s.parts:
-            segment = self.work / f"merge_part_{p.idx}.ts"
-            await self._ff("-i", str(p.path), "-map", "0:v:0", "-c:v", "copy",
-                           "-bsf:v", bsf, "-f", "mpegts", str(segment))
-            segments.append(segment)
         lst = self.work / "concat.txt"
-        # concat demuxer uses single quotes and backslash escapes, not shell quoting.
-        def concat_path(path):
-            return str(path.resolve()).replace("'", "'\\''")
-        lst.write_text("".join(f"file '{concat_path(p)}'\n" for p in segments))
-        args = ["-f", "concat", "-safe", "0", "-i", str(lst)]
-        if audio:
-            args += ["-i", audio]
-        args += ["-map", "0:v:0"]
-        if audio:
-            args += ["-map", "1:a"]
-        args += ["-c", "copy"]
-        if self.opts["codec"] == "libx265":
-            # hev1 permits in-band VPS/SPS/PPS changes at part boundaries;
-            # hvc1 requires all parameter sets in the MP4 sample entry.
-            args += ["-tag:v", "hev1"]
-        args += ["-movflags", "+faststart", self.dst]
+        try:
+            for p in s.parts:
+                segment = self.work / f"merge_part_{p.idx}.ts"
+                segments.append(segment)  # also clean up a partially written segment
+                await self._ff("-i", str(p.path), "-map", "0:v:0", "-c:v", "copy",
+                               "-bsf:v", bsf, "-f", "mpegts", str(segment),
+                               stage=f"prepare part {p.idx}")
+            # concat demuxer uses single quotes and backslash escapes, not shell quoting.
+            def concat_path(path):
+                return str(path.resolve()).replace("'", "'\\''")
+            lst.write_text("".join(f"file '{concat_path(p)}'\n" for p in segments))
+            args = ["-f", "concat", "-safe", "0", "-i", str(lst)]
+            if audio:
+                args += ["-i", audio]
+            args += ["-map", "0:v:0"]
+            if audio:
+                args += ["-map", "1:a"]
+            args += ["-c", "copy"]
+            if self.opts["codec"] == "libx265":
+                # hev1 permits in-band VPS/SPS/PPS changes at part boundaries;
+                # hvc1 requires all parameter sets in the MP4 sample entry.
+                args += ["-tag:v", "hev1"]
+            args += ["-movflags", "+faststart", self.dst]
 
-        def cb(t, size, sp):
-            s.merge_out, s.merge_size, s.merge_speed = t, size, sp
+            def cb(t, size, sp):
+                s.merge_out, s.merge_size, s.merge_speed = t, size, sp
 
-        await self._ff(*args, on_progress=cb)
-        s.merge_out = s.duration
+            await self._ff(*args, on_progress=cb, stage="final merge")
+            s.merge_out = s.duration
+        finally:
+            for path in [*segments, lst]:
+                with contextlib.suppress(OSError):
+                    path.unlink()
 
 
 def helpers_status() -> str:
