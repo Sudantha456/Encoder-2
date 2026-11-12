@@ -46,7 +46,7 @@ from media import (VideoMeta, telegram_meta, probe_remote, ffprobe, apply_probe,
                    render_preview, render_compress_preview, res_label,
                    short_side, guard_kbps, compress_guard_kbps)
 from settings_store import SettingsStore
-from transcoder import EncState, build_x265_extra, resolve_x265_pix_fmt, transcode, verify_output
+from transcoder import EncState, build_x265_extra, resolve_x265_pix_fmt, transcode
 import dist
 from ui import (SpeedTracker, render_transfer, render_encode, human_size,
                 human_size_short, human_time, human_speed, esc, render_dist)
@@ -1250,10 +1250,16 @@ async def run_job(job: Job, height: int):
                     await ticker
             stats["enc_time"], stats["enc_speed"] = st.elapsed, st.avg_speed
 
-        # A complete-sized file can still contain undecodable data. Check the
-        # whole output before deleting the source or delivering it to Telegram.
-        await live.set("🔍 <b>Encoded video එකේ playback පරීක්ෂා කරනවා…</b>", force=True)
-        await verify_output(str(dst), job)
+        # A whole-file decode check used to run here, but on long videos it
+        # roughly doubled the time between "encode finished" and upload. The
+        # output is instead probed for a valid video stream below, which is
+        # cheap and catches an unplayable/empty file.
+        try:
+            out_info = await ffprobe(str(dst))
+        except Exception:
+            out_info = {}
+        if not any(s.get("codec_type") == "video" for s in out_info.get("streams", [])):
+            raise RuntimeError("Encoded output එකේ valid video stream එකක් නෑ.")
         with contextlib.suppress(OSError):
             os.remove(src)
 

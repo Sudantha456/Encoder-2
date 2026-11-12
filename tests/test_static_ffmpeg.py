@@ -15,7 +15,7 @@ import unittest
 
 import dist
 from ffenv import ffmpeg_env
-from transcoder import verify_output
+from ffcheck import full_decode_ok
 
 FFMPEG = shutil.which("ffmpeg")
 ENV = ffmpeg_env()
@@ -52,7 +52,7 @@ class StaticTsDemuxerTests(unittest.IsolatedAsyncioTestCase):
                                state=state, opts={"codec": "libx265"}, workdir=work,
                                pool=None, n_workers=4)
             await run._merge(None)
-            await verify_output(str(out), job)
+            assert full_decode_ok(out)
             self.assertEqual(frames(out), expected)
             # Transport streams are the input the demuxer used to crash on.
             await run._ff("-i", str(work / "merged.mp4"), "-map", "0:v:0", "-c", "copy",

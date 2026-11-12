@@ -7,7 +7,7 @@ import tempfile
 import types
 import unittest
 
-from transcoder import verify_output
+from ffcheck import full_decode_ok, probe
 
 FFMPEG = shutil.which("ffmpeg")
 
@@ -67,7 +67,7 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
                         return str(audio)
                     audio_task = audio_ready()
                 await run._merge(audio_task)
-                await verify_output(str(out), job)
+                assert full_decode_ok(out)
                 if audio_task:
                     self.assertTrue(ff("-i", out, "-map", "0:a:0", "-f", "s16le", "-").stdout)
                 self.assertEqual(count_frames(out), sum(count_frames(p.path) for p in parts))
@@ -94,7 +94,7 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
                                state=state, opts={"codec": "libx265"}, workdir=work,
                                pool=None, n_workers=40)
             await run._merge(None)
-            await verify_output(str(out), job)
+            assert full_decode_ok(out)
             self.assertEqual(count_frames(out), 40 * count_frames(part))
             self.assertEqual(list(work.glob("merge_part_*.ts")), [])
 
@@ -111,18 +111,14 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
             data[start:end] = b"\0" * (end - start)
             path.write_bytes(data)
             self.assertEqual(len(data), len(original))
-            job = types.SimpleNamespace(proc=None, cancelled=False)
-            with self.assertRaisesRegex(RuntimeError, "playback verification"):
-                await verify_output(str(path), job)
+            self.assertFalse(full_decode_ok(path))
 
     async def test_validation_rejects_invalid_file(self):
         with tempfile.TemporaryDirectory() as d:
             bad = Path(d) / "bad.mp4"
             bad.write_bytes(b"not a video")
-            job = types.SimpleNamespace(proc=None, cancelled=False)
-            with self.assertRaisesRegex(RuntimeError, "playback verification"):
-                await verify_output(str(bad), job)
-            self.assertIsNone(job.proc)
+            self.assertEqual(probe(bad).get("streams", []), [])
+            self.assertFalse(full_decode_ok(bad))
 
 
 if __name__ == "__main__":

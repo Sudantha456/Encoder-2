@@ -47,9 +47,10 @@ Setup වැරදි නම් `ALLOWED_USERS` ට හේතුව සහිත
 
 ## Playback reliability
 - Distributed workers encode parts independently, so each part can have different codec headers. Before MP4 assembly, parts are remuxed to MPEG-TS with their own in-band H.264/H.265 headers; distributed HEVC uses the `hev1` MP4 tag. This does not re-encode the video, but needs extra temporary disk space. Some players support `hvc1` but not `hev1`; try another player or single-runner encoding if needed.
-- Before upload, FFmpeg decodes the whole output (video and audio) and fails the job if it detects an error. This takes extra time and does not guarantee compatibility with every device or detect every possible problem after upload.
+- A whole-file decode check is no longer run after encoding: on long videos it took almost as long as the encode itself. The output is instead probed for a valid video stream (cheap) before the source is deleted and the file is uploaded.
 - The static FFmpeg builds used by the workflows crash with `SIGSEGV` (exit `-11`, empty stderr) on *any* MPEG-TS input on some hosts: their statically linked glibc `dlopen()`s the host gconv module for the ISO-6937 service name. `ffenv.py` points `GCONV_PATH` at an empty directory for every ffmpeg/ffprobe subprocess, which avoids the crash. This affects the whole bot (metadata probing, thumbnails, verification and merge), not only distributed mode.
 - Once all distributed parts are ready, their temporary raw splits are removed before merging to reduce peak disk use. If FFmpeg fails, the bot reports the merge stage, exit code/signal and free disk space; the Actions log also contains the stderr tail. A `SIGKILL` can indicate a resource limit, but is not by itself proof of an out-of-memory failure.
+- Scaled output forces square pixels (`setsar=1`) with Lanczos resampling, so the frame geometry matches the source instead of drifting (e.g. 1920×1080 → 854×480 would otherwise carry `SAR 1280:1281`). The Telegram video attributes use the real output dimensions, so the player box matches the file.
 - Playback also depends on the chosen HEVC pixel format and the device. For widest compatibility use H.264 or H.265 `yuv420p` (8-bit, 4:2:0).
 
 ## Workers

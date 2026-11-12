@@ -194,6 +194,15 @@ class FastUploader:
             duration = float(info.get("format", {}).get("duration", 0))
             width = int(video_stream.get("width", 0)) if video_stream else 0
             height = int(video_stream.get("height", 0)) if video_stream else 0
+            # Anamorphic video (SAR != 1:1) must be reported at display size,
+            # otherwise Telegram draws the player in the wrong aspect box.
+            sar = (video_stream or {}).get("sample_aspect_ratio") or "1:1"
+            try:
+                num, den = (int(x) for x in str(sar).split(":"))
+                if num and den and num != den:
+                    width = int(round(width * num / den))
+            except ValueError:
+                pass
             return {
                 "duration": int(duration),
                 "width": width,
