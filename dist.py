@@ -97,7 +97,11 @@ async def _bootstrap_inner(token: str, st: list) -> tuple:
     else:
         logger.info(f"🤝 repo exists: {repo} — නැවත හදන්නේ නෑ")
     root = _P(__file__).resolve().parent
+    # Every module the worker imports must be listed here: the helper repo is
+    # populated only from this mapping, and worker.py/transcoder.py import
+    # these files directly.
     files = {"worker.py": root / "worker.py", "transcoder.py": root / "transcoder.py",
+             "ffenv.py": root / "ffenv.py",
              ".github/workflows/encode-worker.yml": root / ".github/workflows/encode-worker.yml"}
     for path, src in files.items():
         st[0] = f"push {path} (token එකට 'workflow' scope ඕනේ)"
