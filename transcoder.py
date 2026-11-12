@@ -148,9 +148,11 @@ def build_cmd(
     req_pix = (pix_fmt or "yuv420p").strip()
     vf = []
     if scale and target:
-        # setsar=1 keeps the display aspect exact: scaling 1920x1080 to 854x480
-        # would otherwise leave SAR=1280:1281, so players render a slightly
-        # different frame than the source.
+        # Scale the *displayed* geometry: anamorphic input is stretched to
+        # square pixels first, then resized, so the result has exactly the
+        # source's aspect ratio (1920x1080 -> 854x480 would otherwise keep
+        # SAR 1280:1281 and render slightly differently from the source).
+        vf.append("scale=trunc(iw*sar/2)*2:ih")
         vf.append(f"scale={target}:-2:flags=lanczos,setsar=1" if portrait
                   else f"scale=-2:{target}:flags=lanczos,setsar=1")
     elif "444" not in req_pix:

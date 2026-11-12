@@ -42,6 +42,7 @@ class VideoMeta:
     achannels: int = 0
     abitrate: int = 0
     container: str = ""
+    sar: float = 1.0                 # sample aspect ratio (1.0 = square pixels)
     probed: bool = False
 
 
@@ -109,6 +110,13 @@ def apply_probe(m: VideoMeta, info: dict) -> bool:
         w, h = h, w
     if w and h:
         m.width, m.height = w, h
+    # Display size decides the output aspect: anamorphic sources (e.g. 720x576
+    # with SAR 16:15) must not be treated as their coded size.
+    try:
+        num, den = (int(x) for x in str(v.get("sample_aspect_ratio") or "1:1").split(":"))
+        m.sar = num / den if num and den else 1.0
+    except ValueError:
+        m.sar = 1.0
 
     try:
         dur = float(fmt.get("duration") or v.get("duration") or 0)
@@ -193,7 +201,9 @@ BASE_BPP = 0.075   # bits / pixel / frame  (x264, CRF 23, medium)
 
 
 def short_side(m: VideoMeta) -> int:
-    return min(m.width, m.height)
+    """Short side of the *displayed* frame (SAR applied to width)."""
+    w = m.width * (m.sar or 1.0)
+    return int(round(min(w, m.height)))
 
 
 def res_label(m: VideoMeta) -> str:
@@ -213,9 +223,10 @@ def offered_targets(m: VideoMeta):
 
 
 def target_dims(m: VideoMeta, t: int):
-    w, h = m.width, m.height
+    w, h = m.width * (m.sar or 1.0), m.height
     if not w or not h:
         return 0, 0
+    w = int(round(w))
     s = min(w, h)
     if t <= 0 or s <= t or not s:
         return w - w % 2, h - h % 2
