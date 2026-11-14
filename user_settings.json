@@ -45,7 +45,7 @@
     "c_pix_fmt": "yuv420p",
     "c_preset": "veryslow",
     "c_sao": true,
-    "c_workers": 10,
+    "c_workers": 40,
     "codec": "libx265",
     "dist": "on",
     "mode": "compress",
