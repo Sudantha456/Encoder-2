@@ -39,7 +39,7 @@
     "c_aq": true,
     "c_auto": "ask",
     "c_bframes": true,
-    "c_crf": 18,
+    "c_crf": 24,
     "c_dist": "auto",
     "c_lookahead": true,
     "c_pix_fmt": "yuv420p",
