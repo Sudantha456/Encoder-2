@@ -51,6 +51,6 @@
     "mode": "res",
     "preset": "ultrafast",
     "qres": "ask",
-    "workers": 10
+    "workers": 40
   }
 }
