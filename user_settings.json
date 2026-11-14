@@ -34,5 +34,23 @@
     "preset": "ultrafast",
     "qres": "360",
     "workers": 20
+  },
+  "8887656397": {
+    "c_aq": true,
+    "c_auto": "ask",
+    "c_bframes": true,
+    "c_crf": 18,
+    "c_dist": "auto",
+    "c_lookahead": true,
+    "c_pix_fmt": "yuv420p",
+    "c_preset": "fast",
+    "c_sao": true,
+    "c_workers": 10,
+    "codec": "libx264",
+    "dist": "auto",
+    "mode": "res",
+    "preset": "ultrafast",
+    "qres": "ask",
+    "workers": 10
   }
 }
